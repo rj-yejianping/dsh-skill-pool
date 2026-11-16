@@ -1,0 +1,1037 @@
+/**
+ * Browser-facing API for the resource-pool settings page (§6).
+ *
+ * The routes live on their own `webServer` prefix (`/dsh-skill-pool`) and
+ * admit every request through `connection.admit`, which inherits the
+ * deployment's trusted-origin checks and browser credential. The prefix effect
+ * is owned by the plugin context (not the inject-derived scope): a service
+ * restart re-runs an inject callback and would otherwise dispose the route.
+ *
+ * v3 has no "resource library -> pool" step: importing a skill or an MCP server
+ * writes its pool membership in the same request. Every write is atomic
+ * (state file first), then re-applies the document to live Agents, then returns
+ * the new document. MCP imports return before the mount because an unreachable
+ * server can block for a long time; readiness is observed as `mcp__<server>__*`
+ * tools appearing within the probe window.
+ *
+ * @module dsh-skill-pool/web-api
+ */
+
+import {
+  applySettingsPatch,
+  excludeSourceSkill,
+  newId,
+  normalizeItemName,
+  removeItem,
+  removeSource,
+  upsertGroup,
+  upsertItem,
+  upsertSource,
+} from './store.js'
+import { buildInventory } from './inventory.js'
+import { resolvePool } from './rules.js'
+import { DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS, mountServer } from './mount.js'
+import {
+  buildMcpConfig,
+  createMountTracker,
+  normalizeMcpImport,
+  removeMcpServer,
+} from './uploads.js'
+import {
+  checkGitSource,
+  installFromFiles,
+  installFromGit,
+  installFromZip,
+  librarySkillsRoot,
+  removeSkillDir,
+  removeSourceSkills,
+  updateGitSource,
+} from './library.js'
+
+/** Route prefix below the origin root. */
+export const ROUTE_PREFIX = '/dsh-skill-pool'
+
+/** Credential-name prefix for Git tokens (only the name is stored in `state`). */
+const GIT_TOKEN_PREFIX = 'RESOURCE_POOL_GIT_'
+
+/** Body cap for panel writes. */
+// 64MB archive cap in base64 plus JSON overhead; see library.MAX_ARCHIVE_BYTES.
+const MAX_BODY_BYTES = 96 * 1024 * 1024
+
+/** JSON response helper. */
+function json(value, status = 200) {
+  return Response.json(value, { status, headers: { 'cache-control': 'no-store' } })
+}
+
+/** Failure response helper. */
+function failure(code, message, status = 400) {
+  return json({ ok: false, error: { code, message } }, status)
+}
+
+/** Whether a value is a plain object (not an array, not null). */
+function isObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/** Trim one optional string, returning '' when absent. */
+function textOf(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/** Parse a JSON body without throwing on empty or malformed input. */
+async function readBody(request) {
+  try {
+    const value = await request.json()
+    return isObject(value) ? value : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * Register the panel's HTTP routes.
+ *
+ * @param {object} options - registration options.
+ * @param {object} options.ctx - plugin context.
+ * @param {object} options.store - state store.
+ * @param {object} options.meta - static metadata returned to the panel.
+ * @param {() => Promise<void>} [options.onChanged] - called after a committed mutation.
+ * @param {{ debug?: Function, warn?: Function, info?: Function }} [options.logger] - logger.
+ * @param {{ timeoutMs?: number, intervalMs?: number }} [options.mountProbe] - MCP readiness window.
+ * @param {object} [options.mounts] - shared mount tracker (boot re-mounts land here too).
+ */
+export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe, mounts = createMountTracker() } = {}) {
+  const debug = logger?.debug ?? (() => {})
+  // "ready" means the server's tools are actually registered, not merely that a
+  // Loader row exists: an unreachable server creates the row and never connects.
+  const probeTimeoutMs = Number.isFinite(mountProbe?.timeoutMs) ? mountProbe.timeoutMs : DEFAULT_PROBE_TIMEOUT_MS
+  const probeIntervalMs = Number.isFinite(mountProbe?.intervalMs) ? mountProbe.intervalMs : DEFAULT_PROBE_INTERVAL_MS
+
+  const readState = () => store.read()
+  const skillsRoot = () => librarySkillsRoot()
+
+  /** Committed mutation response: file is already on disk, re-apply, then answer. */
+  const committed = async (state, extra = {}) => {
+    try {
+      await onChanged?.()
+    } catch (error) {
+      logger?.warn?.(`[resource-pool] re-application failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    return json({ ok: true, state, ...extra })
+  }
+
+  /** Resolve one stored Git token from the credential store. */
+  const gitToken = async (credentialName) => {
+    if (typeof credentialName !== 'string' || credentialName.length === 0) return ''
+    const credentials = ctx.get('credentials')
+    if (credentials === undefined || typeof credentials.resolve !== 'function') return ''
+    try {
+      const resolved = await credentials.resolve(credentialName)
+      return typeof resolved?.value === 'string' ? resolved.value : ''
+    } catch {
+      return ''
+    }
+  }
+
+  /** Store one provided token under a source-scoped credential name. */
+  const storeGitToken = async (sourceId, token) => {
+    if (typeof token !== 'string' || token.trim().length === 0) return undefined
+    const credentials = ctx.get('credentials')
+    if (credentials === undefined || typeof credentials.set !== 'function') return undefined
+    const name = `${GIT_TOKEN_PREFIX}${sourceId.toUpperCase().replace(/[^A-Z0-9_]/g, '_')}`
+    try {
+      await credentials.set(name, token.trim())
+      return name
+    } catch (error) {
+      logger?.warn?.(`[resource-pool] token not stored: ${error instanceof Error ? error.message : String(error)}`)
+      return undefined
+    }
+  }
+
+  // ------------------------------------------------------------- validation
+
+  /** Read one `scope` object (`{modes, workspaces}`); undefined when absent. */
+  const readScope = (value) => {
+    if (value === undefined || value === null) return undefined
+    if (!isObject(value)) throw new Error('scope 必须是 {modes, workspaces} 对象')
+    const scope = {}
+    if (value.modes !== undefined) {
+      if (!Array.isArray(value.modes)) throw new Error('scope.modes 必须是数组')
+      scope.modes = value.modes
+    }
+    if (value.workspaces !== undefined) {
+      if (!Array.isArray(value.workspaces)) throw new Error('scope.workspaces 必须是字符串数组')
+      scope.workspaces = value.workspaces
+    }
+    return scope
+  }
+
+  /** Read the `/item` condition patch (`{enabled?, modes?, workspaces?}`). */
+  const readItemPatch = (body) => {
+    const patch = {}
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') throw new Error('enabled 必须是布尔值')
+      patch.enabled = body.enabled
+    }
+    if (body.modes !== undefined) {
+      if (!Array.isArray(body.modes)) throw new Error('modes 必须是数组')
+      patch.modes = body.modes
+    }
+    if (body.workspaces !== undefined) {
+      if (!Array.isArray(body.workspaces)) throw new Error('workspaces 必须是字符串数组')
+      patch.workspaces = body.workspaces
+    }
+    for (const key of ['modesFrom', 'workspacesFrom']) {
+      if (body[key] === undefined) continue
+      if (body[key] !== 'group' && body[key] !== 'self') throw new Error(`${key} 必须是 'group' 或 'self'`)
+      patch[key] = body[key]
+    }
+    return patch
+  }
+
+  /** Merge a condition patch over the stored member (or defaults for a new one). */
+  const itemScope = (state, kind, name, patch = {}) => {
+    const bucket = kind === 'skill' ? state.skills : state.mcp
+    const existing = isObject(bucket) ? bucket[name] : undefined
+    return {
+      enabled: patch.enabled !== undefined ? patch.enabled : (existing?.enabled ?? true),
+      modes: patch.modes !== undefined ? patch.modes : (existing?.modes ?? []),
+      workspaces: patch.workspaces !== undefined ? patch.workspaces : (existing?.workspaces ?? []),
+    }
+  }
+
+  /**
+   * Add freshly installed skills to the pool, keeping a member's previous
+   * conditions when the import did not specify new ones.
+   */
+  const installItems = (state, names, { scope, sourceId, digests, installedAt }) => {
+    let next = state
+    for (const name of names) {
+      const extra = { installedAt }
+      if (typeof sourceId === 'string' && sourceId.length > 0) extra.sourceId = sourceId
+      const digest = isObject(digests) ? digests[name] : undefined
+      if (typeof digest === 'string' && digest.length > 0) extra.digest = digest
+      next = upsertItem(next, 'skill', name, itemScope(next, 'skill', name, scope ?? {}), extra)
+    }
+    return next
+  }
+
+  /** Assert an install result has the §7 shape; a mismatch is an integration bug. */
+  const installResult = (result) => {
+    if (!isObject(result) || !Array.isArray(result.installed)) {
+      throw new Error('library.js 返回值缺少 installed[]（请确认其实现符合契约 §7）')
+    }
+    return {
+      installed: result.installed.filter((name) => typeof name === 'string' && name.length > 0),
+      failures: Array.isArray(result.failures) ? result.failures : [],
+      digests: isObject(result.digests) ? result.digests : {},
+      source: isObject(result.source) ? result.source : undefined,
+    }
+  }
+
+  /** Label for one import-created source record. */
+  const importLabel = (kind, names, providedLabel) => {
+    const label = textOf(providedLabel)
+    if (label.length > 0) return label
+    if (names.length === 1) return names[0]
+    if (kind === 'zip') return `ZIP（${names.length} 个技能）`
+    return `上传的 ${names.length} 个技能`
+  }
+
+  /** Decode panel upload files to the library's `{path, content}` shape. */
+  const uploadFiles = (raw) => {
+    const list = Array.isArray(raw) ? raw : []
+    const out = []
+    for (const file of list) {
+      if (!isObject(file)) continue
+      const path = typeof file.path === 'string' ? file.path : ''
+      if (typeof file.contentBase64 === 'string' && file.contentBase64.length > 0) {
+        const data = Buffer.from(file.contentBase64, 'base64')
+        // `installFromFiles` currently filters on `content`; carry both so the
+        // decoded bytes are also available to the library.
+        out.push({ path, content: data.toString('utf8'), data })
+        continue
+      }
+      if (typeof file.content === 'string') {
+        out.push({ path, content: file.content, data: Buffer.from(file.content, 'utf8') })
+      }
+    }
+    return out
+  }
+
+  /** Normalize one check outcome status (§2.1). */
+  const checkStatus = (status, current, remote) => {
+    if (status === 'up-to-date' || status === 'update-available' || status === 'error') return status
+    if (current.length > 0 && remote.length > 0) return current === remote ? 'up-to-date' : 'update-available'
+    return 'error'
+  }
+
+  /** Names other sources still list (used to avoid deleting a shared skill). */
+  const sharedNames = (state, exceptId) => {
+    const shared = new Set()
+    for (const [id, source] of Object.entries(state.sources)) {
+      if (id === exceptId) continue
+      for (const name of Array.isArray(source.skills) ? source.skills : []) shared.add(name)
+    }
+    return shared
+  }
+
+  // ---------------------------------------------------------------- handlers
+
+  /** GET /dsh-skill-pool */
+  const overview = async () => {
+    try {
+      const state = await readState()
+      const inventory = await buildInventory(ctx, { state, libraryRoot: skillsRoot() })
+      return json({ ok: true, meta, state, inventory, mounts: mounts.status() })
+    } catch (error) {
+      logger?.warn?.(`[resource-pool] overview failed: ${error instanceof Error ? error.message : String(error)}`)
+      return failure('resource-pool/read-failed', '无法读取技能池状态', 500)
+    }
+  }
+
+  /** GET /dsh-skill-pool/mounts */
+  const mountsRoute = async () => json({ ok: true, mounts: mounts.status() })
+
+  /** POST /dsh-skill-pool/item — edit one member's conditions / enabled flag. */
+  const itemRoute = async (request) => {
+    const body = await readBody(request)
+    const kind = body.kind === 'skill' ? 'skill' : body.kind === 'mcp' ? 'mcp' : ''
+    if (kind === '') return failure('resource-pool/bad-kind', "kind 必须是 'skill' 或 'mcp'")
+    const name = normalizeItemName(body.name)
+    if (name.length === 0) return failure('resource-pool/bad-name', '缺少合法的 name')
+    let patch
+    try {
+      patch = readItemPatch(body)
+    } catch (error) {
+      return failure('resource-pool/bad-scope', error instanceof Error ? error.message : String(error))
+    }
+    try {
+      const state = await store.update((current) => {
+        const existing = kind === 'skill' ? current.skills[name] : current.mcp[name]
+        const extra = {
+          sourceId: existing?.sourceId,
+          digest: existing?.digest,
+          installedAt: existing?.installedAt,
+          modesFrom: patch.modesFrom !== undefined ? patch.modesFrom : existing?.modesFrom,
+          workspacesFrom: patch.workspacesFrom !== undefined ? patch.workspacesFrom : existing?.workspacesFrom,
+        }
+        return upsertItem(current, kind, name, itemScope(current, kind, name, patch), extra)
+      })
+      return committed(state)
+    } catch (error) {
+      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+    }
+  }
+
+  /**
+   * POST /dsh-skill-pool/item/remove — remove one pool member.
+   * Skills lose their library directory; MCP servers lose their Loader row.
+   */
+  const itemRemoveRoute = async (request) => {
+    const body = await readBody(request)
+    const kind = body.kind === 'skill' ? 'skill' : body.kind === 'mcp' ? 'mcp' : ''
+    if (kind === '') return failure('resource-pool/bad-kind', "kind 必须是 'skill' 或 'mcp'")
+    const name = normalizeItemName(body.name)
+    if (name.length === 0) return failure('resource-pool/bad-name', '缺少合法的 name')
+
+    const removed = { kind, name }
+    if (kind === 'skill') {
+      try {
+        removed.dir = (await removeSkillDir({ root: skillsRoot(), name })) === true
+      } catch (error) {
+        removed.dir = false
+        removed.warning = error instanceof Error ? error.message : String(error)
+      }
+      try {
+        const state = await store.update((current) => {
+          // Deleting is also an exclusion: the source remembers the name so an
+          // update never installs it again.
+          let next = excludeSourceSkill(removeItem(current, 'skill', name), name)
+          // A source with nothing left to install has nothing to update: drop it,
+          // and its group when it was the repository's last source.
+          for (const source of Object.values(next.sources)) {
+            if (Array.isArray(source.skills) && source.skills.length > 0) continue
+            const referenced = Object.values(next.skills).some((item) => item.sourceId === source.id)
+            if (!referenced) next = removeSource(next, source.id)
+          }
+          return next
+        })
+        return committed(state, { removed })
+      } catch (error) {
+        return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+      }
+    }
+
+    // MCP: drop the Loader row; a member whose row is already gone can still be
+    // removed from the pool (the panel shows the warning).
+    try {
+      const result = await removeMcpServer(ctx, name)
+      mounts.forget(result.serverName)
+      removed.mount = true
+    } catch (error) {
+      removed.mount = false
+      removed.warning = error instanceof Error ? error.message : String(error)
+    }
+    try {
+      const state = await store.update((current) => removeItem(current, 'mcp', name))
+      return committed(state, { removed })
+    } catch (error) {
+      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+    }
+  }
+
+  /** POST /dsh-skill-pool/settings */
+  const settingsRoute = async (request) => {
+    const body = await readBody(request)
+    const patch = isObject(body.patch) ? body.patch : isObject(body.settings) ? body.settings : null
+    if (patch === null) return failure('resource-pool/bad-settings', '缺少 patch 对象')
+    try {
+      const state = await store.update((current) => applySettingsPatch(current, patch))
+      return committed(state)
+    } catch (error) {
+      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+    }
+  }
+
+  /** POST /dsh-skill-pool/group — set the scope of one repository/import group. */
+  const groupRoute = async (request) => {
+    const body = await readBody(request)
+    const key = typeof body.key === 'string' ? body.key.trim() : ''
+    if (key.length === 0) return failure('resource-pool/bad-group', '缺少 group.key')
+    const patch = { key }
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') return failure('resource-pool/bad-group', 'enabled 必须是布尔值')
+      patch.enabled = body.enabled
+    }
+    if (body.modes !== undefined) {
+      if (!Array.isArray(body.modes)) return failure('resource-pool/bad-group', 'modes 必须是数组')
+      patch.modes = body.modes
+    }
+    if (body.workspaces !== undefined) {
+      if (!Array.isArray(body.workspaces)) return failure('resource-pool/bad-group', 'workspaces 必须是字符串数组')
+      patch.workspaces = body.workspaces
+    }
+    try {
+      const state = await store.update((current) => upsertGroup(current, patch))
+      return committed(state)
+    } catch (error) {
+      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+    }
+  }
+
+  /** GET /dsh-skill-pool/resolve?mode=&cwd=&allModes=&allWorkspaces= */
+  const resolveRoute = async (request) => {
+    const state = await readState()
+    const url = new URL(request.url)
+    const cwd = url.searchParams.get('cwd') ?? ''
+    const mode = url.searchParams.get('mode') ?? ''
+    const allModes = url.searchParams.get('allModes') === '1'
+    const allWorkspaces = url.searchParams.get('allWorkspaces') === '1'
+    return json({ ok: true, pool: resolvePool(state, { mode, cwd, allModes, allWorkspaces }) })
+  }
+
+  /**
+   * POST /dsh-skill-pool/mcp/import — returns immediately, mounts in background.
+   * Body: `{payload, scope?}` where `payload` is the parsed `mcpServers` object
+   * (a JSON string is tolerated).
+   */
+  const mcpImportRoute = async (request) => {
+    const body = await readBody(request)
+    let entries
+    try {
+      entries = normalizeMcpImport(body.payload !== undefined ? body.payload : body)
+    } catch (error) {
+      return failure('resource-pool/mcp-import-failed', error instanceof Error ? error.message : String(error), 400)
+    }
+    // Validate the shape up front so an unusable definition fails as a 400
+    // instead of mounting and then reporting "failed".
+    const configs = new Map()
+    try {
+      for (const [serverName, definition] of entries) configs.set(serverName, buildMcpConfig(serverName, definition))
+    } catch (error) {
+      return failure('resource-pool/mcp-import-failed', error instanceof Error ? error.message : String(error), 400)
+    }
+    let scope
+    try {
+      scope = readScope(body.scope)
+    } catch (error) {
+      return failure('resource-pool/bad-scope', error instanceof Error ? error.message : String(error))
+    }
+
+    // Membership plus its connection definition land first: the definition is
+    // what a later Host start re-mounts from, so persisting it before the row
+    // exists means a crash mid-mount still leaves a recoverable member.
+    let state
+    try {
+      state = await store.update((current) => {
+        let next = current
+        for (const [serverName, definition] of entries) {
+          next = upsertItem(
+            next,
+            'mcp',
+            serverName,
+            itemScope(next, 'mcp', serverName, scope ?? {}),
+            { definition: configs.get(serverName) ?? definition },
+          )
+        }
+        return next
+      })
+    } catch (error) {
+      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+    }
+
+    const servers = []
+    for (const [serverName, definition] of entries) {
+      servers.push({ server: serverName, state: 'mounting' })
+      mountServer({
+        ctx,
+        serverName,
+        definition: configs.get(serverName) ?? definition,
+        mounts,
+        timeoutMs: probeTimeoutMs,
+        intervalMs: probeIntervalMs,
+        logger,
+        origin: 'import',
+      })
+    }
+    return committed(state, { servers, mounts: mounts.status() })
+  }
+
+  /** POST /dsh-skill-pool/mcp/remove — `{server}`. */
+  const mcpRemoveRoute = async (request) => {
+    const body = await readBody(request)
+    const serverName = textOf(body.server)
+    if (serverName.length === 0) return failure('resource-pool/bad-server', '缺少 server')
+    let result
+    try {
+      result = await removeMcpServer(ctx, serverName)
+    } catch (error) {
+      return failure('resource-pool/mcp-remove-failed', error instanceof Error ? error.message : String(error), 400)
+    }
+    mounts.forget(result.serverName)
+    try {
+      const state = await store.update((current) => removeItem(current, 'mcp', result.serverName))
+      return committed(state)
+    } catch (error) {
+      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+    }
+  }
+
+  /** POST /dsh-skill-pool/skill/upload — install skill bundles from plain files. */
+  const skillUploadRoute = async (request) => {
+    const body = await readBody(request)
+    const files = uploadFiles(body.files)
+    if (files.length === 0) return failure('resource-pool/bad-files', '缺少 files（[{path, contentBase64}]）')
+    let scope
+    try {
+      scope = readScope(body.scope)
+    } catch (error) {
+      return failure('resource-pool/bad-scope', error instanceof Error ? error.message : String(error))
+    }
+    try {
+      const result = installResult(await installFromFiles({
+        files,
+        root: skillsRoot(),
+        overwrite: body.overwrite === true,
+        name: textOf(body.name),
+        description: textOf(body.description),
+      }))
+      const source = {
+        id: newId('src'),
+        kind: 'files',
+        label: importLabel('files', result.installed, ''),
+        skills: result.installed,
+        createdAt: new Date().toISOString(),
+      }
+      const state = await store.update((current) => {
+        let next = upsertSource(current, source)
+        next = installItems(next, result.installed, {
+          scope,
+          sourceId: source.id,
+          digests: result.digests,
+          installedAt: new Date().toISOString(),
+        })
+        return next
+      })
+      return committed(state, {
+        source: state.sources[source.id],
+        installed: result.installed,
+        failures: result.failures,
+      })
+    } catch (error) {
+      return failure('resource-pool/upload-failed', error instanceof Error ? error.message : String(error), 400)
+    }
+  }
+
+  /** POST /dsh-skill-pool/skill/zip — install skill bundles from a ZIP archive. */
+  const skillZipRoute = async (request) => {
+    const body = await readBody(request)
+    if (typeof body.archiveBase64 !== 'string' || body.archiveBase64.length === 0) {
+      return failure('resource-pool/bad-archive', '缺少 archiveBase64')
+    }
+    let scope
+    try {
+      scope = readScope(body.scope)
+    } catch (error) {
+      return failure('resource-pool/bad-scope', error instanceof Error ? error.message : String(error))
+    }
+    try {
+      const result = installResult(await installFromZip({
+        archiveBase64: body.archiveBase64,
+        root: skillsRoot(),
+        overwrite: body.overwrite === true,
+        label: textOf(body.label),
+      }))
+      const source = {
+        id: newId('src'),
+        kind: 'zip',
+        label: importLabel('zip', result.installed, body.label),
+        skills: result.installed,
+        createdAt: new Date().toISOString(),
+      }
+      const state = await store.update((current) => {
+        let next = upsertSource(current, source)
+        next = installItems(next, result.installed, {
+          scope,
+          sourceId: source.id,
+          digests: result.digests,
+          installedAt: new Date().toISOString(),
+        })
+        return next
+      })
+      return committed(state, {
+        source: state.sources[source.id],
+        installed: result.installed,
+        failures: result.failures,
+      })
+    } catch (error) {
+      return failure('resource-pool/zip-failed', error instanceof Error ? error.message : String(error), 400)
+    }
+  }
+
+  /** POST /dsh-skill-pool/source/git — install skills from GitHub/GitLab. */
+  const sourceGitRoute = async (request) => {
+    const body = await readBody(request)
+    const url = textOf(body.url)
+    if (url.length === 0) return failure('resource-pool/bad-url', '缺少仓库 URL')
+    // Empty branch/subdir lets the library fall back to what the pasted URL encodes
+    // (GitLab's '/-/tree/<branch>/<subdir>'), then to 'main'.
+    const branch = textOf(body.branch)
+    const subdir = textOf(body.subdir)
+    const token = typeof body.token === 'string' ? body.token : ''
+    const provider = body.provider === 'github' || body.provider === 'gitlab' ? body.provider : 'auto'
+    let scope
+    try {
+      scope = readScope(body.scope)
+    } catch (error) {
+      return failure('resource-pool/bad-scope', error instanceof Error ? error.message : String(error))
+    }
+    try {
+      const result = installResult(await installFromGit({
+        url,
+        branch,
+        subdir,
+        token,
+        provider,
+        label: textOf(body.label),
+        root: skillsRoot(),
+        overwrite: body.overwrite === true,
+      }))
+      const returned = isObject(result.source) ? result.source : {}
+      const source = {
+        ...returned,
+        id: typeof returned.id === 'string' && returned.id.length > 0 ? returned.id : newId('src'),
+        kind: 'git',
+        url,
+        host: typeof returned.host === 'string' ? returned.host : '',
+        branch: typeof returned.branch === 'string' && returned.branch.length > 0 ? returned.branch : branch || 'main',
+        subdir: typeof returned.subdir === 'string' ? returned.subdir : subdir,
+        skills: result.installed,
+        createdAt: typeof returned.createdAt === 'string' ? returned.createdAt : new Date().toISOString(),
+      }
+      const tokenCredential = await storeGitToken(source.id, token)
+      if (tokenCredential !== undefined) source.tokenCredential = tokenCredential
+      const state = await store.update((current) => {
+        let next = upsertSource(current, source)
+        next = installItems(next, result.installed, {
+          scope,
+          sourceId: source.id,
+          digests: result.digests,
+          installedAt: new Date().toISOString(),
+        })
+        return next
+      })
+      return committed(state, {
+        source: state.sources[source.id],
+        installed: result.installed,
+        failures: result.failures,
+      })
+    } catch (error) {
+      return failure('resource-pool/git-failed', error instanceof Error ? error.message : String(error), 400)
+    }
+  }
+
+  /**
+   * POST /dsh-skill-pool/source/check — compare each Git source's stored
+   * commit with the remote one *without downloading the archive*. One failing
+   * source is reported as `status: 'error'` in `results`; the route never 500s.
+   */
+  const sourceCheckRoute = async (request) => {
+    const body = await readBody(request)
+    let ids
+    if (body.ids !== undefined) {
+      if (!Array.isArray(body.ids)) return failure('resource-pool/bad-ids', 'ids 必须是字符串数组')
+      ids = body.ids.map((id) => textOf(id)).filter((id) => id.length > 0)
+    }
+    const current = await readState()
+    const targets = []
+    if (ids !== undefined) {
+      for (const id of ids) targets.push({ id, source: current.sources[id] })
+    } else {
+      for (const source of Object.values(current.sources)) {
+        if (source.kind === 'git') targets.push({ id: source.id, source })
+      }
+    }
+
+    const results = []
+    const checks = {}
+    const checkedAt = new Date().toISOString()
+    for (const { id, source } of targets) {
+      if (source === undefined) {
+        results.push({ id, label: '', status: 'error', current: '', remote: '', error: `来源 ${id} 不存在` })
+        continue
+      }
+      if (source.kind !== 'git') {
+        results.push({
+          id,
+          label: source.label,
+          status: 'error',
+          current: '',
+          remote: '',
+          error: '只有 Git 来源可以检查更新',
+        })
+        continue
+      }
+      try {
+        const token = await gitToken(source.tokenCredential)
+        const raw = await checkGitSource({ source, token })
+        const check = isObject(raw) ? raw : {}
+        const remote = textOf(check.remote)
+        const status = checkStatus(check.status, textOf(check.current), remote)
+        const result = {
+          id,
+          label: textOf(check.label) || source.label,
+          status,
+          current: textOf(check.current),
+          remote,
+        }
+        if (status === 'error') result.error = '无法确认远端提交'
+        results.push(result)
+        checks[id] = { at: checkedAt, status, remote, error: status === 'error' ? '无法确认远端提交' : '' }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        results.push({
+          id,
+          label: source.label,
+          status: 'error',
+          current: typeof source.sha === 'string' ? source.sha : '',
+          remote: '',
+          error: message,
+        })
+        checks[id] = { at: checkedAt, status: 'error', remote: '', error: message }
+      }
+    }
+
+    if (Object.keys(checks).length === 0) {
+      // Nothing to record (no Git sources): the document is unchanged, so the
+      // pool does not need re-applying.
+      return json({ ok: true, state: current, results })
+    }
+    try {
+      const state = await store.update((doc) => {
+        let next = doc
+        for (const [id, lastCheck] of Object.entries(checks)) {
+          const source = next.sources[id]
+          if (source === undefined) continue
+          // Only the check outcome is stored: `sha` keeps naming the commit that
+          // is actually installed, so update detection stays correct.
+          next = upsertSource(next, { ...source, lastCheck })
+        }
+        return next
+      })
+      return committed(state, { results })
+    } catch (error) {
+      return failure('resource-pool/check-failed', error instanceof Error ? error.message : String(error), 500)
+    }
+  }
+
+  /** POST /dsh-skill-pool/source/update — re-fetch one Git source. */
+  const sourceUpdateRoute = async (request) => {
+    const body = await readBody(request)
+    const id = textOf(body.id)
+    if (id.length === 0) return failure('resource-pool/bad-id', '缺少 id')
+    const current = await readState()
+    const source = current.sources[id]
+    if (source === undefined) return failure('resource-pool/unknown-source', `来源 ${id} 不存在`, 404)
+    if (source.kind !== 'git') return failure('resource-pool/bad-kind', '只有 Git 来源可以更新', 400)
+    try {
+      const token = await gitToken(source.tokenCredential)
+      // `restore` clears the exclusion list and forces a reinstall; `force` alone
+      // reinstall the current commit without clearing anything.
+      const restore = body.restore === true
+      const force = body.force === true || restore
+      const updated = await updateGitSource({
+        source: restore ? { ...source, excluded: [] } : source,
+        token,
+        root: skillsRoot(),
+        exclude: restore ? [] : source.excluded,
+        force,
+      })
+      const result = installResult(updated)
+      const changed = updated?.changed === true
+      const removed = Array.isArray(updated?.removed)
+        ? updated.removed.filter((name) => typeof name === 'string' && name.length > 0)
+        : []
+      const returned = isObject(updated?.source) ? updated.source : {}
+      const nextSource = {
+        ...source,
+        ...returned,
+        id,
+        kind: 'git',
+        skills: Array.isArray(returned.skills) ? returned.skills : source.skills,
+        excluded: restore
+          ? []
+          : Array.isArray(returned.excluded)
+            ? returned.excluded
+            : Array.isArray(source.excluded)
+              ? source.excluded
+              : [],
+        lastCheck: {
+          at: new Date().toISOString(),
+          status: 'up-to-date',
+          remote: typeof returned.sha === 'string' ? returned.sha : '',
+          error: '',
+        },
+      }
+      const state = await store.update((doc) => {
+        let next = upsertSource(doc, nextSource)
+        next = installItems(next, result.installed, {
+          scope: undefined,
+          sourceId: id,
+          digests: result.digests,
+          installedAt: new Date().toISOString(),
+        })
+        // Skills that disappeared upstream are gone from disk already.
+        const shared = sharedNames(next, id)
+        for (const name of removed) {
+          if (shared.has(name)) continue
+          next = removeItem(next, 'skill', name)
+        }
+        // An update that leaves the source with nothing installed turns it into
+        // a dead tree row: drop it (and its group) like a delete would.
+        const after = next.sources[id]
+        if (after !== undefined && (!Array.isArray(after.skills) || after.skills.length === 0)) {
+          const referenced = Object.values(next.skills).some((item) => item.sourceId === id)
+          if (!referenced) next = removeSource(next, id)
+        }
+        return next
+      })
+      return committed(state, {
+        source: state.sources[id],
+        installed: result.installed,
+        failures: result.failures,
+        changed,
+      })
+    } catch (error) {
+      return failure('resource-pool/update-failed', error instanceof Error ? error.message : String(error), 400)
+    }
+  }
+
+  /** POST /dsh-skill-pool/source/delete — remove a source and its skills. */
+  const sourceDeleteRoute = async (request) => {
+    const body = await readBody(request)
+    const id = textOf(body.id)
+    if (id.length === 0) return failure('resource-pool/bad-id', '缺少 id')
+    const current = await readState()
+    const source = current.sources[id]
+    if (source === undefined) return failure('resource-pool/unknown-source', `来源 ${id} 不存在`, 404)
+    try {
+      // A skill may be claimed by more than one source (same name from a ZIP and
+      // a repo); only delete the ones no other source still lists.
+      const shared = sharedNames(current, id)
+      const skipSkills = (Array.isArray(source.skills) ? source.skills : []).filter((name) => shared.has(name))
+      const result = await removeSourceSkills({ source, root: skillsRoot(), skipSkills })
+      const removed = Array.isArray(result?.removed) ? result.removed : []
+      const skipped = Array.isArray(result?.skipped) ? result.skipped : skipSkills
+      const state = await store.update((doc) => {
+        let next = removeSource(doc, id)
+        for (const name of removed) next = removeItem(next, 'skill', name)
+        // Shared skills stay installed; their dangling sourceId is cleared.
+        for (const name of skipped) {
+          const member = next.skills[name]
+          if (member === undefined || member.sourceId !== id) continue
+          next = upsertItem(next, 'skill', name, member, { sourceId: '' })
+        }
+        return next
+      })
+      return committed(state, { removed, skipped })
+    } catch (error) {
+      return failure('resource-pool/delete-failed', error instanceof Error ? error.message : String(error), 400)
+    }
+  }
+
+  const routes = [
+    ['', ['GET'], overview],
+    ['/item', ['POST'], itemRoute],
+    ['/item/remove', ['POST'], itemRemoveRoute],
+    ['/settings', ['POST'], settingsRoute],
+    ['/group', ['POST'], groupRoute],
+    ['/resolve', ['GET'], resolveRoute],
+    ['/skill/upload', ['POST'], skillUploadRoute],
+    ['/skill/zip', ['POST'], skillZipRoute],
+    ['/source/git', ['POST'], sourceGitRoute],
+    ['/source/check', ['POST'], sourceCheckRoute],
+    ['/source/update', ['POST'], sourceUpdateRoute],
+    ['/source/delete', ['POST'], sourceDeleteRoute],
+    ['/mcp/import', ['POST'], mcpImportRoute],
+    ['/mcp/remove', ['POST'], mcpRemoveRoute],
+    ['/mounts', ['GET'], mountsRoute],
+  ]
+
+  // ------------------------------------------------------------- transport
+
+  const readNodeBody = (request) => new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    request.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('request body too large'))
+        request.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    request.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    request.on('error', reject)
+  })
+
+  const writeNodeResponse = async (response, res) => {
+    const headers = {}
+    response.headers.forEach((value, key) => {
+      headers[key] = value
+    })
+    res.writeHead(response.status, headers)
+    res.end(Buffer.from(await response.arrayBuffer()))
+  }
+
+  const refuse = (res, status) => {
+    res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' })
+    res.end(status === 401 ? 'unauthorized' : 'forbidden')
+  }
+
+  const handleNodeRequest = async (connection, req, res) => {
+    const admission = typeof connection?.admit === 'function' ? connection.admit(req) : undefined
+    if (admission === undefined || admission === null) {
+      refuse(res, 401)
+      return
+    }
+    if ('rejection' in admission) {
+      refuse(res, admission.rejection === 403 ? 403 : 401)
+      return
+    }
+    const url = new URL(req.url ?? '/', 'http://dsh.invalid')
+    const method = req.method ?? 'GET'
+    const route = routes.find(([suffix, methods]) => `${ROUTE_PREFIX}${suffix}` === url.pathname && methods.includes(method))
+    if (route === undefined) {
+      await writeNodeResponse(json({ ok: false, error: { code: 'resource-pool/not-found', message: 'unknown resource-pool route' } }, 404), res)
+      return
+    }
+    const headers = {}
+    for (const [key, value] of Object.entries(req.headers)) {
+      if (value === undefined) continue
+      headers[key] = Array.isArray(value) ? value.join(', ') : value
+    }
+    let body
+    try {
+      body = method === 'GET' || method === 'HEAD' ? undefined : await readNodeBody(req)
+    } catch (error) {
+      await writeNodeResponse(failure('resource-pool/too-large', error instanceof Error ? error.message : String(error), 413), res)
+      return
+    }
+    let request
+    try {
+      request = new Request(url.toString(), {
+        method,
+        headers,
+        ...(body === undefined || body.length === 0 ? {} : { body }),
+      })
+    } catch (error) {
+      await writeNodeResponse(failure('resource-pool/bad-request', error instanceof Error ? error.message : String(error), 400), res)
+      return
+    }
+    await writeNodeResponse(await route[2](request), res)
+  }
+
+  ctx.inject(['webServer', 'connection'], (webCtx) => {
+    const webServer = webCtx.get('webServer')
+    const connection = webCtx.get('connection')
+    if (webServer === undefined || typeof webServer.register !== 'function' || typeof connection?.admit !== 'function') {
+      registerFetchRoutes(webCtx, connection)
+      return
+    }
+    // Owned by the plugin context: a webServer/connection restart re-runs this
+    // inject callback and would dispose a scope-owned route.
+    ctx.effect(
+      () =>
+        webServer.register({
+          kind: 'prefix',
+          path: ROUTE_PREFIX,
+          handler: (req, res) => {
+            handleNodeRequest(connection, req, res).catch((error) => {
+              logger?.warn?.(`[resource-pool] request failed: ${error instanceof Error ? error.message : String(error)}`)
+              if (res.headersSent) {
+                try {
+                  res.destroy()
+                } catch {
+                  /* already gone */
+                }
+                return
+              }
+              try {
+                res.writeHead(500, { 'content-type': 'application/json' })
+                res.end(JSON.stringify({ ok: false, error: { code: 'resource-pool/internal', message: 'request failed' } }))
+              } catch {
+                /* response already closed */
+              }
+            })
+          },
+        }),
+      'resource-pool.http',
+    )
+    debug(`registered ${routes.length} resource pool routes under ${ROUTE_PREFIX} (webServer prefix)`)
+  })
+
+  /** Fallback for compositions without a webServer: exact-Fetch routes. */
+  function registerFetchRoutes(targetCtx, connection) {
+    const register = connection?.fetch?.register
+    if (typeof register !== 'function') {
+      debug('neither webServer nor connection.fetch is available; resource pool API disabled')
+      return
+    }
+    for (const [suffix, methods, handler] of routes) {
+      targetCtx.effect(
+        () =>
+          register({
+            path: `${ROUTE_PREFIX}${suffix}`,
+            methods,
+            requestBody: 'buffered',
+            fetch: handler,
+          }),
+        `resource-pool.route.${suffix.length > 0 ? suffix.slice(1).replaceAll('/', '.') : 'overview'}`,
+      )
+    }
+    debug(`registered ${routes.length} resource pool routes under ${ROUTE_PREFIX} (exact fetch)`)
+  }
+}

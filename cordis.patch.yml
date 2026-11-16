@@ -1,0 +1,6 @@
+# dsh-skill-pool —— 技能池（skill / MCP）按 Agent 模式与工作区激活。
+# 作为 bundle 合入 profile 时插入一行 Host 插件；面板只出现在「设置」中。
+- insert:
+    - id: skill-pool
+      name: 'dsh-skill-pool'
+      config: {}

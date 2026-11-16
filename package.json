@@ -1,0 +1,64 @@
+{
+  "name": "dsh-skill-pool",
+  "version": "0.3.7",
+  "type": "module",
+  "description": "One pool for all your DSH skills: import from files, ZIP, GitHub or GitLab, then scope each skill to Agent modes and workspaces from the Settings panel — no code editing required.",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "skill",
+    "skills",
+    "skill-pool",
+    "skill-manager",
+    "mcp",
+    "agent-preset",
+    "workspace"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rj-yejianping/dsh-skill-pool.git"
+  },
+  "homepage": "https://github.com/rj-yejianping/dsh-skill-pool#readme",
+  "bugs": {
+    "url": "https://github.com/rj-yejianping/dsh-skill-pool/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src/**/*.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "CONTRACTS-v3.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "lint": "node --check index.js && node --check client.js && node --check src/store.js && node --check src/rules.js && node --check src/inventory.js && node --check src/activation.js && node --check src/provider.js && node --check src/skill-content.js && node --check src/web-api.js && node --check src/uploads.js && node --check src/mount.js && node --check src/remount.js && node --check src/library.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
