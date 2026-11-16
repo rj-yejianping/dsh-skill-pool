@@ -114,7 +114,7 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
 
 ```bash
 # npm（公开发布后）
-dsh plugin add dsh-skill-pool
+dsh plugin --profile web add dsh-skill-pool
 
 # 本地开发：先从源码目录打包，再装真实包
 npm pack                      # → dsh-skill-pool-0.3.7.tgz

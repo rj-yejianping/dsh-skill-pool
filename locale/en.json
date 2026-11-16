@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Resource Pool",
-    "description": "One global pool where importing a resource adds it immediately; every skill and MCP server activates by its own Agent-mode and workspace conditions. Imports from files, ZIP or Git, mounts MCP from JSON, and Git sources can check for updates."
+    "title": "Skill Pool",
+    "description": "One global pool where importing a skill adds it immediately; every skill and MCP server activates by its own Agent-mode and workspace conditions. Imports from files, ZIP or Git, mounts MCP from JSON, and Git sources can check for updates."
   }
 }

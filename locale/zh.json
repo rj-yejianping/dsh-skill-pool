@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "资源池",
-    "description": "单一全局资源池：导入即入池，每个技能与 MCP 单独按 Agent 模式与工作区条件生效；支持文件 / ZIP / Git 导入与 MCP JSON 挂载，Git 来源可检查更新。"
+    "title": "技能池",
+    "description": "单一全局技能池：导入即入池，每个技能与 MCP 单独按 Agent 模式与工作区条件生效；支持文件 / ZIP / Git 导入与 MCP JSON 挂载，Git 来源可检查更新。"
   }
 }
