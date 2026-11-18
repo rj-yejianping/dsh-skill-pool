@@ -14,8 +14,13 @@
  *   - OBSERVED FAIL: the assertion describes current behaviour that violates a
  *     Task 3 requirement. Such a test passes by pinning the observed failure;
  *     it does not skip the truth or turn the failure into a success claim.
- *   - UNVERIFIED: the package/DSh path was not exercised (reported in
+ *   - UNVERIFIED: the package/DSH path was not exercised (reported in
  *     docs/mcp-feasibility-results.md), never a silent skip inside a check.
+ *
+ * If the installed runtime/version is absent, every test is explicitly skipped
+ * with an "unverified" reason so the default npm test stays portable. Set
+ * DSH_FEASIBILITY_REQUIRED=1 (npm run verify:feasibility) to turn that absence
+ * into a nonzero failure.
  *
  * Run with: node --test test/mcp-feasibility.test.mjs
  */
@@ -44,6 +49,8 @@ const RESOURCE_TOOL_NAMES = new Set([
 
 const DSH_ROOT = process.env.DSH_FEASIBILITY_ROOT
   ?? '/opt/dsh/lib/node_modules/@deepseek-ai/dsh'
+/** Required mode makes an absent host runtime fail the command instead of skipping. */
+const REQUIRE_FEASIBILITY = process.env.DSH_FEASIBILITY_REQUIRED === '1'
 
 const ALPHA_TOOLS = [
   'search',
@@ -254,6 +261,9 @@ try {
 function feasibilityTest(name, fn) {
   test(name, async t => {
     if (dshError !== undefined) {
+      if (REQUIRE_FEASIBILITY) {
+        assert.fail(`feasibility runtime unavailable (required mode): ${dshError.message}`)
+      }
       t.skip(`unverified — ${dshError.message}`)
       return
     }
@@ -308,6 +318,15 @@ function textOf(result) {
     .filter(block => block.type === 'text')
     .map(block => block.text)
     .join('\n')
+}
+
+/** Canonical denial a tools/execute waterfall listener can return without next(). */
+function dispatchDenial(reason) {
+  return {
+    isError: true,
+    content: [{ type: 'text', text: `Error: ${reason}` }],
+    error: { message: reason },
+  }
 }
 
 function mcpPublicNames(root) {
@@ -989,6 +1008,10 @@ feasibilityTest('resources/instructions: hiding business tools leaves resource a
   assert.equal(list.isError, false)
   assert.ok(textOf(list).includes('alpha://secret'))
 
+  const templates = await callTool(h.root, 'list_mcp_resource_templates', { server: 'alpha' }, { agent: scopes.a })
+  assert.equal(templates.isError, false, 'the shared template-list tool is callable for the filtered server')
+  assert.ok(textOf(templates).includes('resourceTemplates'))
+
   // Hiding the three shared resource tools is all-or-nothing and still does
   // not remove the server instruction section.
   const resourceDeny = scopes.scopeA.ctx.tools.restrict({
@@ -1039,6 +1062,12 @@ feasibilityTest('offline: failed connection leaves stale schemas and server inst
   const read = await callTool(h.root, 'read_mcp_resource', { server: 'alpha', uri: 'alpha://secret' })
   assert.equal(read.isError, true)
   assert.ok(textOf(read).includes('disconnected'))
+  const list = await callTool(h.root, 'list_mcp_resources', { server: 'alpha' })
+  assert.equal(list.isError, true, 'offline resource listing fails')
+  assert.ok(textOf(list).includes('disconnected'))
+  const templates = await callTool(h.root, 'list_mcp_resource_templates', { server: 'alpha' })
+  assert.equal(templates.isError, true, 'offline resource template listing fails')
+  assert.ok(textOf(templates).includes('disconnected'))
 
   // Status says failed with no toolCount, while the registry still lists tools.
   assert.equal(Object.hasOwn(h.status('alpha'), 'toolCount'), false)
@@ -1117,4 +1146,318 @@ feasibilityTest('manager/probe: status and probe expose no current-generation se
   // names. It is therefore not evidence for mapping the live generation.
   assert.deepEqual(mcpPublicNames(h.root), namesBefore)
   assert.equal(h.root.mcpManager.list().find(view => view.name === 'alpha').status.connectedAt, connectedAtBefore)
+})
+
+feasibilityTest('shutdown: tools/execute denial stops prepared A/B/agent-less MCP calls; allowed calls continue', async t => {
+  const h = await createHarness(t, {
+    servers: [
+      { serverName: 'alpha', rawTools: ['search', 'feasibility_echo'] },
+      { serverName: 'beta', rawTools: ['search', 'feasibility_echo'] },
+    ],
+  })
+  const scopes = await createAgentScopes(t, h.root)
+  const echo = expectedPublicName('alpha', 'feasibility_echo')
+  let closed = false
+  let executeVisits = 0
+  const off = h.root.on('tools/execute', async (exec, next) => {
+    executeVisits++
+    if (closed && exec.name === echo) return dispatchDenial('switch closed after prepare')
+    return next()
+  })
+
+  const pipeline = new dsh.ToolExecutionPipeline(h.root)
+  const prepared = []
+  for (const agent of [scopes.a, scopes.b, undefined]) {
+    const call = await pipeline.prepare({
+      callId: `feasibility-dispatch-${prepared.length}`,
+      name: echo,
+      arguments: {},
+      ...agent === undefined ? {} : { agent },
+      signal: new AbortController().signal,
+    })
+    assert.equal(call.kind, 'dispatch')
+    prepared.push(call)
+  }
+
+  const countCalls = async () => (await h.readEvents()).filter(line => line.startsWith('call ')).length
+  const before = await countCalls()
+  closed = true
+  for (const call of prepared) {
+    const dispatched = await pipeline.dispatch(call.exec)
+    const result = await pipeline.complete(call.exec, dispatched)
+    assert.equal(result.isError, true)
+    assert.ok(textOf(result).includes('switch closed after prepare'))
+  }
+  await delay(50)
+  assert.equal(await countCalls(), before, 'denied prepared calls never reached the MCP body')
+
+  // A tools/execute listener that calls next() leaves ordinary calls working.
+  closed = false
+  for (const agent of [scopes.a, scopes.b, undefined]) {
+    const result = await callTool(h.root, echo, {}, { agent })
+    assert.equal(result.isError, false, 'allowed call executes through next()')
+  }
+  assert.equal(await countCalls(), before + 3)
+  assert.ok(executeVisits >= 6)
+  off()
+})
+
+feasibilityTest('shutdown: dispatch-stage path preserves approval and cancellation behaviour', async t => {
+  const h = await createHarness(t, {
+    servers: [
+      { serverName: 'alpha', rawTools: ['search', 'feasibility_echo'] },
+      { serverName: 'beta', rawTools: ['search', 'feasibility_echo'] },
+    ],
+  })
+  const scopes = await createAgentScopes(t, h.root)
+  const echo = expectedPublicName('alpha', 'feasibility_echo')
+  let approvalOutcome = 'allowed-once'
+  let approvalRequests = 0
+  h.root.provide('approval', {
+    request: async () => {
+      approvalRequests++
+      return approvalOutcome
+    },
+  })
+  let ask = true
+  const offPre = h.root.on('tools/pre-execute', async (exec, next) => {
+    if (exec.name === echo && ask) return { kind: 'ask', reason: 'feasibility approval' }
+    return next()
+  })
+  let executeVisits = 0
+  const offExec = h.root.on('tools/execute', async (_exec, next) => {
+    executeVisits++
+    return next()
+  })
+  const countCalls = async () => (await h.readEvents()).filter(line => line.startsWith('call ')).length
+
+  const before = await countCalls()
+  const allowed = await callTool(h.root, echo, {}, { agent: scopes.a })
+  assert.equal(allowed.isError, false)
+  assert.equal(approvalRequests, 1)
+  assert.equal(await countCalls(), before + 1)
+  assert.ok(executeVisits >= 1)
+
+  approvalOutcome = 'rejected'
+  const rejected = await callTool(h.root, echo, {}, { agent: scopes.a })
+  assert.equal(rejected.isError, true)
+  assert.ok(textOf(rejected).includes('rejected'))
+  assert.equal(await countCalls(), before + 1, 'a rejected approval does not reach the body')
+
+  approvalOutcome = 'cancelled'
+  const cancelled = await callTool(h.root, echo, {}, { agent: scopes.a })
+  assert.equal(cancelled.isError, true)
+  assert.ok(textOf(cancelled).includes('cancelled'))
+  assert.equal(await countCalls(), before + 1)
+
+  // Cancellation between prepare and dispatch still wins through the wrapper.
+  ask = false
+  const controller = new AbortController()
+  const pipeline = new dsh.ToolExecutionPipeline(h.root)
+  const prepared = await pipeline.prepare({
+    callId: 'feasibility-cancel-between',
+    name: echo,
+    arguments: {},
+    agent: scopes.a,
+    signal: controller.signal,
+  })
+  assert.equal(prepared.kind, 'dispatch')
+  controller.abort('feasibility-stop')
+  const dispatched = await pipeline.dispatch(prepared.exec)
+  const aborted = await pipeline.complete(prepared.exec, dispatched)
+  assert.equal(aborted.isError, true)
+  assert.ok(textOf(aborted).includes('aborted before dispatch'))
+  assert.equal(await countCalls(), before + 1, 'cancelled-before-dispatch never reaches the body')
+  assert.equal(approvalRequests, 3)
+  offPre()
+  offExec()
+})
+
+feasibilityTest('shutdown: post-prepare agent restriction blocks dispatch with and without a step set', async t => {
+  const h = await createHarness(t, {
+    servers: [
+      { serverName: 'alpha', rawTools: ['search', 'feasibility_echo'] },
+      { serverName: 'beta', rawTools: ['search', 'feasibility_echo'] },
+    ],
+  })
+  const scopes = await createAgentScopes(t, h.root)
+  const echo = expectedPublicName('alpha', 'feasibility_echo')
+  const pipeline = new dsh.ToolExecutionPipeline(h.root)
+  const countCalls = async () => (await h.readEvents()).filter(line => line.startsWith('call ')).length
+  const before = await countCalls()
+
+  // No step set: dispatch re-resolves through tools.executable() and sees the
+  // restriction added after prepare.
+  const noSet = await pipeline.prepare({
+    callId: 'feasibility-restrict-no-set',
+    name: echo,
+    arguments: {},
+    agent: scopes.a,
+    signal: new AbortController().signal,
+  })
+  assert.equal(noSet.kind, 'dispatch')
+  const layerNoSet = scopes.scopeA.ctx.tools.restrict({ deny: [echo] })
+  assert.equal(h.root.tools.schemas(scopes.a).some(schema => schema.name === echo), false, 'changed status is visible immediately')
+  const noSetOutcome = await pipeline.complete(noSet.exec, await pipeline.dispatch(noSet.exec))
+  assert.equal(noSetOutcome.isError, true)
+  assert.ok(textOf(noSetOutcome).includes('unknown tool'))
+  layerNoSet()
+
+  // With a step set: the set itself now excludes the restricted name at
+  // dispatch, even though the set was resolved before the restriction.
+  const set = await resolveFor(h.root, scopes.a)
+  assert.equal(set.view(scopes.a).has(echo), true)
+  const withSet = await pipeline.prepare({
+    callId: 'feasibility-restrict-with-set',
+    name: echo,
+    arguments: {},
+    agent: scopes.a,
+    toolSet: set,
+    signal: new AbortController().signal,
+  })
+  assert.equal(withSet.kind, 'dispatch')
+  const layerWithSet = scopes.scopeA.ctx.tools.restrict({ deny: [echo] })
+  assert.equal(set.view(scopes.a).has(echo), false, 'the resolved set observes the new restriction')
+  const withSetOutcome = await pipeline.complete(withSet.exec, await pipeline.dispatch(withSet.exec))
+  assert.equal(withSetOutcome.isError, true)
+  assert.ok(textOf(withSetOutcome).includes('unknown tool'))
+  layerWithSet()
+
+  await delay(50)
+  assert.equal(await countCalls(), before, 'neither restriction path reached the MCP body')
+})
+
+feasibilityTest('scoping: per-agent restrict disclosure layer reveals the original MCP tool; ancestor deny remains', async t => {
+  const h = await createHarness(t, {
+    servers: [
+      { serverName: 'alpha', rawTools: ['search', 'feasibility_echo'] },
+      { serverName: 'beta', rawTools: ['search', 'feasibility_echo'] },
+    ],
+  })
+  const scopes = await createAgentScopes(t, h.root, { withPreset: true })
+  const alphaAll = ['search', 'feasibility_echo'].map(raw => expectedPublicName('alpha', raw))
+  const alphaSearch = expectedPublicName('alpha', 'search')
+  const betaSearch = expectedPublicName('beta', 'search')
+  const betaEcho = expectedPublicName('beta', 'feasibility_echo')
+
+  const presetDeny = scopes.presetScope.ctx.tools.restrict({ deny: [betaSearch] })
+  const alphaLayer = scopes.scopeA.ctx.tools.restrict({ deny: alphaAll })
+  const betaEchoLayer = scopes.scopeA.ctx.tools.restrict({ deny: [betaEcho] })
+  let switchClosed = true
+  const switchDisposer = h.root.tools.guard(exec => (
+    exec.name === betaEcho && switchClosed ? { reason: 'independent switch closed' } : undefined
+  ))
+
+  const visible = agent => h.root.tools.schemas(agent).map(schema => schema.name)
+  assert.equal(visible(scopes.a).some(name => alphaAll.includes(name)), false)
+  assert.equal(visible(scopes.a).includes(betaEcho), false)
+  assert.equal(visible(scopes.a).includes(betaSearch), false)
+  assert.equal(visible(scopes.b).some(name => alphaAll.includes(name)), true)
+  assert.equal(visible(scopes.b).includes(betaEcho), true)
+  assert.equal(visible(scopes.b).includes(betaSearch), false, 'ancestor deny applies to both agents')
+
+  const oldSet = await resolveFor(h.root, scopes.a)
+  assert.equal(oldSet.view(scopes.a).has(alphaSearch), false)
+  alphaLayer()
+  assert.equal(visible(scopes.a).some(name => alphaAll.includes(name)), true, 'disposing the A layer reveals the original global MCP names')
+  assert.equal(oldSet.view(scopes.a).has(alphaSearch), false, 'the step resolved before disposal stays closed')
+  const nextSet = await resolveFor(h.root, scopes.a)
+  assert.equal(nextSet.view(scopes.a).has(alphaSearch), true, 'the next step sees the revealed tool')
+  assert.equal(visible(scopes.a).includes(betaEcho), false, 'the second service layer is still independent')
+  assert.equal(visible(scopes.a).includes(betaSearch), false, 'disposing the A layer cannot release the ancestor deny')
+  assert.equal(visible(scopes.b).includes(betaEcho), true, 'B is unaffected')
+
+  const alphaCall = await callTool(h.root, alphaSearch, {}, { agent: scopes.a })
+  assert.equal(alphaCall.isError, false)
+  assert.ok(textOf(alphaCall).includes('alpha raw=search'), 'the original MCP body, not a shadow, executed')
+  const hiddenBetaEcho = await callTool(h.root, betaEcho, {}, { agent: scopes.a })
+  assert.equal(hiddenBetaEcho.isError, true, 'A cannot call beta echo through either the scope layer or the switch')
+
+  // A separate global switch (guard) is not released by the A disclosure
+  // disposal, and B's visible tool is still denied before its body.
+  const countCalls = async () => (await h.readEvents()).filter(line => line.startsWith('call ')).length
+  const beforeSwitch = await countCalls()
+  const switchedB = await callTool(h.root, betaEcho, {}, { agent: scopes.b })
+  assert.equal(switchedB.isError, true)
+  assert.ok(textOf(switchedB).includes('independent switch closed'))
+  assert.equal(await countCalls(), beforeSwitch)
+  switchClosed = false
+  const openB = await callTool(h.root, betaEcho, {}, { agent: scopes.b })
+  assert.equal(openB.isError, false)
+  assert.equal(await countCalls(), beforeSwitch + 1)
+  switchDisposer()
+
+  const [setA, setB] = await Promise.all([resolveFor(h.root, scopes.a), resolveFor(h.root, scopes.b)])
+  assert.equal(setA.view(scopes.a).has(alphaSearch), true)
+  assert.equal(setA.view(scopes.a).has(betaEcho), false)
+  assert.equal(setA.view(scopes.a).has(betaSearch), false)
+  assert.equal(setB.view(scopes.b).has(alphaSearch), true)
+  assert.equal(setB.view(scopes.b).has(betaEcho), true)
+  assert.equal(setB.view(scopes.b).has(betaSearch), false)
+
+  presetDeny()
+  betaEchoLayer()
+})
+
+feasibilityTest('scoping: deny-list disclosure layer does not hide MCP tools registered after it (observed gap)', async t => {
+  const h = await createHarness(t, {
+    servers: [
+      { serverName: 'alpha', rawTools: ['search', 'feasibility_echo', 'feasibility_change_tools'] },
+      { serverName: 'beta', rawTools: ['search', 'feasibility_echo'] },
+    ],
+  })
+  const scopes = await createAgentScopes(t, h.root)
+  const existing = ['search', 'feasibility_echo', 'feasibility_change_tools']
+    .map(raw => expectedPublicName('alpha', raw))
+  const newName = expectedPublicName('alpha', 'new.tool')
+  const layer = scopes.scopeA.ctx.tools.restrict({ deny: existing })
+  const visible = agent => h.root.tools.schemas(agent).map(schema => schema.name)
+  assert.equal(visible(scopes.a).some(name => existing.includes(name)), false)
+
+  // B (unrestricted for alpha) triggers a dynamic list change.
+  const changed = await callTool(h.root, expectedPublicName('alpha', 'feasibility_change_tools'), {}, { agent: scopes.b })
+  assert.equal(changed.isError, false)
+  await waitFor(
+    () => h.root.tools.definitions().some(definition => definition.name === newName),
+    'new alpha tool registration',
+  )
+  assert.equal(visible(scopes.a).includes(newName), true, 'observed: a name added after the deny layer is visible before disclosure')
+  assert.equal(visible(scopes.a).some(name => existing.includes(name)), false)
+  const newCall = await callTool(h.root, newName, {}, { agent: scopes.a })
+  assert.equal(newCall.isError, false, 'the dynamically added tool is callable before expansion')
+
+  // Removal/reload while the layer is active: same names stay hidden for A.
+  await h.unmount('alpha')
+  await h.mount({ serverName: 'alpha', rawTools: ['search', 'feasibility_echo', 'feasibility_change_tools'] })
+  assert.equal(visible(scopes.a).some(name => existing.includes(name)), false, 'the layer still hides the same names after remount')
+  assert.equal(visible(scopes.b).some(name => existing.includes(name)), true)
+  const [setA, setB] = await Promise.all([resolveFor(h.root, scopes.a), resolveFor(h.root, scopes.b)])
+  assert.equal(setA.view(scopes.a).has(expectedPublicName('alpha', 'search')), false)
+  assert.equal(setB.view(scopes.b).has(expectedPublicName('alpha', 'search')), true)
+
+  layer()
+  assert.equal(visible(scopes.a).some(name => existing.includes(name)), true, 'disposing the layer reveals the original names')
+})
+
+feasibilityTest('dynamic sync: tools/change observers see a partial generation during a swap (observed)', async t => {
+  const h = await createHarness(t, {
+    servers: [{ serverName: 'alpha', rawTools: ['search', 'feasibility_echo', 'feasibility_change_tools'] }],
+  })
+  const alphaCount = () => h.root.tools.definitions()
+    .filter(definition => definition.name.startsWith('mcp__alpha__')).length
+  const snapshots = []
+  const off = h.root.on('tools/change', () => snapshots.push(alphaCount()))
+  const changed = await callTool(h.root, expectedPublicName('alpha', 'feasibility_change_tools'))
+  assert.equal(changed.isError, false)
+  const newName = expectedPublicName('alpha', 'new.tool')
+  await waitFor(
+    () => h.root.tools.definitions().some(definition => definition.name === newName)
+      && !h.root.tools.definitions().some(definition => definition.name === expectedPublicName('alpha', 'search')),
+    'alpha resync',
+  )
+  off()
+  const finalCount = alphaCount()
+  assert.equal(finalCount, 3)
+  assert.equal(snapshots.includes(0), true, 'observers can see the fully disposed intermediate state')
+  assert.equal(snapshots.some(count => count > 0 && count < finalCount), true, 'observers can see a partial new generation')
 })

@@ -44,7 +44,9 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "lint": "node --check index.js && node --check client.js && node --check src/store.js && node --check src/rules.js && node --check src/inventory.js && node --check src/activation.js && node --check src/provider.js && node --check src/skill-content.js && node --check src/web-api.js && node --check src/uploads.js && node --check src/mount.js && node --check src/remount.js && node --check src/library.js"
+    "lint": "node --check index.js && node --check client.js && node --check src/store.js && node --check src/rules.js && node --check src/inventory.js && node --check src/activation.js && node --check src/provider.js && node --check src/skill-content.js && node --check src/web-api.js && node --check src/uploads.js && node --check src/mount.js && node --check src/remount.js && node --check src/library.js",
+    "test:feasibility": "node --test test/mcp-feasibility.test.mjs",
+    "verify:feasibility": "DSH_FEASIBILITY_REQUIRED=1 node --test test/mcp-feasibility.test.mjs"
   },
   "dsh": {
     "bundle": {

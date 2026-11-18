@@ -1,12 +1,13 @@
 # MCP Disclosure Feasibility Results (Task 3)
 
 Date: 2026-11-18 (Asia/Shanghai)
-Status: experiments complete — **do not implement Tasks 4/5 as described**
+Status: experiments complete — **Tasks 4/5 are not implemented; the tested
+alternatives are not yet sufficient to enable them**
 
 This document records only what the installed DSH runtime actually did. It does
 not describe a proposed design as if it existed. The automated evidence is
-`test/mcp-feasibility.test.mjs` (15 tests, all passing, including tests that
-pin observed failures).
+`test/mcp-feasibility.test.mjs` (21 tests, all passing, including tests that pin
+observed failures and gaps).
 
 ## Environment and isolation
 
@@ -39,7 +40,9 @@ Interfaces were confirmed from the live Inspect providers before testing:
   registrations remain visible.”
 * host Service `mcpManager`: `list`, `restart`, `probe`; status types expose
   only `toolCount`/`connectedAt`, never tool names.
-* host Event `tools/change`: unfiltered `emit` with no payload.
+* host Event `tools/change`: unfiltered `emit` with no payload; host Event
+  contracts also define `tools/pre-execute`, `tools/execute`, `tools/post-execute`
+  and `tools/result`.
 * source read: `dsh-tools/src/pipeline.ts`, `dsh-mcp-client/src/tools.ts`,
   `connection.ts`, `dsh-mcp-resources/src/index.ts`,
   `dsh-system-prompt/src/index.ts`.
@@ -49,21 +52,23 @@ Interfaces were confirmed from the live Inspect providers before testing:
 | # | Requirement | Result | Test |
 | --- | --- | --- | --- |
 | 1 | Current-generation `(server, raw)` → public name is deterministic for normal, delimiter, normalized and long names | **PROVEN (forward only)** | `identity: live registration yields deterministic public names...` |
-| 2 | Public name → `(server, raw)` origin is uniquely recoverable from a supported current-generation API | **OBSERVED FAIL** | same test + `identity: delimiter-bearing server names...` |
+| 2 | Public name → `(server, raw)` origin is uniquely recoverable from the tested public current-generation surfaces | **OBSERVED FAIL** | same test + `identity: delimiter-bearing server names...` |
 | 3 | Normalization preserves distinct identities via the 12-hex hash; 64-char truncation keeps them distinct | **PROVEN** | identity test |
-| 4 | Registration collision is all-or-none; an invalid duplicate list preserves the previous generation | **PROVEN** | `collision: a foreign registration rolls back...` |
+| 4 | Rejected registration collision is all-or-none; an invalid duplicate list preserves the previous generation | **PROVEN after rejection** | `collision: a foreign registration rolls back...` |
 | 5 | Restrictions intersect across two scope layers; one agent’s restrictions do not affect another | **PROVEN** | `scoping: agent restrictions intersect...` |
-| 6 | Per-agent expansion cannot expand another agent or a second service, and cannot release other restrictions | **PARTIAL / OBSERVED FAIL** | `scoping: per-agent expansion canaries...` (passes for restrictions/canaries), `scoping: a same-name agent shadow...` (fails for shadow bypass) |
-| 7 | MCP business tools can be progressively disclosed through confirmed interfaces | **UNTESTED / NOT SAFELY FEASIBLE** | no official API; shadow workaround is unsafe (see #6) |
-| 8 | Synchronous `tools/change` re-entry, addition and replacement | **PROVEN with a caller guard; naive re-entry is hazardous** | `dynamic registration: a synchronous tools/change listener...` |
-| 9 | Tools added after a step starts appear only in the next step | **PROVEN, with a full-generation caveat** | `dynamic sync: a tool added between steps...` |
-| 10 | Guard denies before dispatch for all agents and for agent-less calls; a scoped guard only covers its scope | **PROVEN (pre-dispatch only)** | `shutdown: guard runs before dispatch...` |
-| 11 | A close committed after the guard but before body dispatch prevents the body | **OBSERVED FAIL** | `shutdown: guard runs before dispatch...` |
-| 12 | Old step snapshots and removed registrations cannot execute | **PROVEN** | `shutdown: old step snapshots...` |
-| 13 | Already-dispatched work is not forcibly interrupted; it drains and reports abort | **PROVEN** | `shutdown: old step snapshots...` |
-| 14 | Hiding business tools hides the same server’s resources and server instructions | **OBSERVED FAIL** | `resources/instructions: hiding business tools...` |
-| 15 | Offline status and registered schema stay consistent | **OBSERVED FAIL** | `offline: failed connection leaves stale schemas...` |
-| 16 | `mcpManager.probe` can establish live-generation identity | **OBSERVED FAIL / not evidence** | `manager/probe: status and probe...` |
+| 6 | Per-agent disclosure can expand one original MCP service without affecting B, a second service, an independent ancestor deny, or an independent global switch | **PROVEN for the static restrict-dispose layer; not for dynamic additions** | `scoping: per-agent restrict disclosure layer...`; `scoping: deny-list disclosure layer...` |
+| 7 | A scoped shadow is a safe way to bypass a restriction | **OBSERVED FAIL (unsafe)** | `scoping: a same-name agent shadow...` |
+| 8 | A post-prepare switch closes prepared calls at the dispatch stage | **PROVEN in the native pipeline via `tools/execute` denial; guard-only still fails** | `shutdown: tools/execute denial...`; `shutdown: guard runs before dispatch...` |
+| 9 | Post-prepare agent restriction is re-checked with and without a step set | **PROVEN in the tested pipeline (both deny)** | `shutdown: post-prepare agent restriction...` |
+| 10 | Approval and cancellation continue to work with a dispatch-stage wrapper | **PROVEN with a stub answerer and pipeline-level cancellation; real approval service/UI unverified** | `shutdown: dispatch-stage path preserves approval...` |
+| 11 | Synchronous `tools/change` re-entry, addition and replacement | **PROVEN with a caller guard; naive re-entry is hazardous** | `dynamic registration: a synchronous tools/change listener...` |
+| 12 | Tools added after a step starts appear only in the next step | **PROVEN, with a full-generation caveat** | `dynamic sync: a tool added between steps...` |
+| 13 | A generation swap is atomic to every observer | **OBSERVED FAIL for synchronous `tools/change` observers** | `dynamic sync: tools/change observers see a partial generation...` |
+| 14 | Old step snapshots and removed registrations cannot execute | **PROVEN** | `shutdown: old step snapshots...` |
+| 15 | Already-dispatched work is not forcibly interrupted; it drains and reports abort | **PROVEN** | `shutdown: old step snapshots...` |
+| 16 | Hiding business tools hides the same server’s resources and server instructions | **OBSERVED FAIL** | `resources/instructions: hiding business tools...` |
+| 17 | Offline status and registered schema stay consistent | **OBSERVED FAIL** | `offline: failed connection leaves stale schemas...` |
+| 18 | `mcpManager.probe` can establish live-generation identity | **OBSERVED FAIL / not evidence** | `manager/probe: status and probe...` |
 
 ## Evidence by area
 
@@ -78,18 +83,18 @@ suffix:
 * `a__x` → `mcp__alpha__a__x`
 * `a.b` and `a/b` → distinct `mcp__alpha__a_b_<hash>` names (different hashes)
 * `工具 名` → underscores plus hash
-* two 71-character raw names sharing a long prefix → two distinct 64-character names,
-  each ending in its own hash
+* two 71-character raw names sharing a long prefix → two distinct 64-character
+  names, each ending in its own hash
 
 Calling each observed public name reached the controlled server with the correct
 raw name, so dispatch never re-parses the public name. This part is proven.
 
-**Reverse mapping is absent and ambiguous.** The live registry exposes only
-`name`, `description`, `parameters`, `output`, `execute` and `projectContent`;
-it exposes no server, raw-name or source metadata. The client package does not
-export its `publicToolName` helper. `connectionStatusOf()` status has only
-`state`, `toolCount`, `connectedAt` (or failure fields). The manager status type
-from live Inspect is the same shape.
+**No supported reverse mapping was found in the tested surfaces.** The live
+registry exposes only `name`, `description`, `parameters`, `output`, `execute`
+and `projectContent`; it exposes no server, raw-name or source metadata. The
+client package does not export its `publicToolName` helper. `connectionStatusOf()`
+status has only `state`, `toolCount`, `connectedAt` (or failure fields). The
+manager status type from live Inspect is the same shape.
 
 Server names may themselves contain `__`, so the public name is not even
 parseable into a prefix:
@@ -99,21 +104,28 @@ parseable into a prefix:
   is ambiguous.
 
 **Conclusion:** the live generation supports a one-way, deterministic
-`(server, raw) → public` mapping when the caller already knows both values. It
-does **not** provide a supported `public → (server, raw)` identity, and public
-names alone cannot recover origin. A manager `probe` does return raw names, but
-it opens an independent connection; the test proves it does not touch the live
-registry or the live `connectedAt`, so it cannot prove what the live generation
-is running.
+`(server, raw) → public` mapping when the caller already knows both values. The
+tested public surfaces do not provide a `public → (server, raw)` identity, and
+public names alone cannot recover origin. This is an observed absence in the
+tested surfaces, not a proof that no unsupported/private mapping could be
+constructed. A manager `probe` returns raw names, but it opens an independent
+connection; the test proves it does not touch the live registry or the live
+`connectedAt`, so it cannot prove what the live generation is running.
 
 ### 2. Collisions and generation swaps
 
 * A foreign global tool occupying `mcp__alpha__search` made the initial
-  `mcp-client` activation reject; no partial alpha generation was published.
-* A server that listed `dup.raw` twice caused the client to reject the entire
-  fetched list; the previous generation stayed registered and executable.
-* Generation swaps are atomic at the API boundary: there is no observed
-  half-registered generation after a rejected sync.
+  `mcp-client` activation reject; no partial alpha generation was observed after
+  the rejection.
+* A server that listed `dup.raw` twice caused the client to reject the fetched
+  list; the previous generation stayed registered and executable after the
+  notification plus a 300 ms observation window. No timing guarantee is claimed.
+* A **successful** swap is not atomic to synchronous `tools/change` observers:
+  a listener recorded a fully disposed count (`0`) and partial counts between
+  `0` and the final count while the new generation was being registered. This
+  does not prove an async model request can interleave on one thread, but
+  reentrant listeners and other synchronous observers can see a partial set.
+  Rejected syncs left no partial set in the tests.
 
 ### 3. Scoping and per-agent disclosure
 
@@ -130,21 +142,37 @@ is running.
 * `ResolvedToolSet.view(scope)` only admits its exact requesting agent; an A set
   never returns B’s tools.
 
-**Observed failure for the actual disclosure goal:** the only path found that
-can expose a real MCP business tool per agent is a same-name registration in the
-agent scope whose body delegates to the captured global definition. That shadow:
+**Restrict-dispose disclosure layer (no scoped shadow).** A separate
+agent-scoped `tools.restrict({ deny })` layer for one service can be disposed to
+reveal the **original global MCP tool**, with no local re-registration:
 
-* is exempt from `tools.restrict` (“scoped registrations remain visible”), so
-  it executed a tool that A’s own restriction denied;
-* is visible to `definitions()`/`schemas()` even when its `when` is false
-  (only `resolve()` is condition-aware), so non-step inspection surfaces can
-  disclose a not-yet-expanded tool;
-* relies on capturing the global definition by public name before the step, not
-  on any server/raw identity API;
-* would need refresh handling when the MCP generation replaces the definition.
+* disposing A’s alpha deny layer revealed alpha’s original MCP names in A;
+  calling the revealed name executed the real MCP body and reached the controlled
+  server with `raw=search`;
+* an independent ancestor deny (beta search) remained in force for A and B;
+* a second A-only deny layer (beta echo) remained in force;
+* an independent global guard (a “switch” on beta echo) still denied B’s visible
+  beta-echo call before its body after A’s alpha layer was disposed; opening the
+  guard let it execute;
+* B’s alpha/beta visibility was unaffected;
+* a step set resolved before the disposal stayed closed; the next step admitted
+  the revealed tool;
+* two concurrent `resolve()` calls (A and B) after disposal observed their own
+  agent-specific sets.
 
-The plan explicitly forbids using scoped shadow to bypass restrictions. This test
-pins that the bypass works and is therefore **not a safe implementation path**.
+**Dynamic gap in the deny-list layer:** a tool registered by a later
+`tools/change`/re-sync was visible to A **before** any disclosure expansion,
+because the existing deny list did not contain the new name. The new tool was
+also callable before expansion. After unmount/remount with the layer active, the
+same names were hidden again for A and visible for B. An allow-list design might
+avoid the new-name window but was not tested.
+
+**Scoped shadow (unsafe alternative).** A same-name registration in the agent
+scope whose body delegates to the captured global definition executed a tool
+that A’s own restriction denied. It is exempt from `tools.restrict` (“scoped
+registrations remain visible”), and it is visible to `definitions()`/`schemas()`
+even when its `when` is false. The plan explicitly forbids using scoped shadow to
+bypass restrictions; this path is not acceptable.
 
 ### 4. Dynamic registration, steps and `tools/change`
 
@@ -164,26 +192,43 @@ pins that the bypass works and is therefore **not a safe implementation path**.
   registration error. A caller must set a re-entry guard before registering.
   Replacement of a same-name tool after disposal works as one definition.
 
-### 5. Guard / close timing
+### 5. Guard / close timing and dispatch-stage policy
 
 * With a global guard active, agent-less calls and calls from agents A and B were
   all denied before the body ran.
 * A guard registered through A’s scope denied A only; B and agent-less calls
   were allowed.
-* The guard is evaluated in the pipeline’s `prepare()` stage. When it was
-  allowed, the pipeline `prepare()` returned a dispatch, the guard state was
-  then flipped to “closed”, and `dispatch()` ran the body successfully. The
-  guard is not checked again between prepare and body dispatch.
-* If prepare happened after the close, it returned a denial and the body did not
-  run.
+* Guard-only close **fails the race**: after `prepare()` returned a dispatch
+  while allowed, flipping the guard state and calling `dispatch()` still ran the
+  body successfully. The guard is checked in `prepare()`, not between prepare
+  and body dispatch.
+* A global `tools/execute` waterfall denial **does close the tested window**:
+  after prepare, a global listener returned a denial without calling `next()` for
+  A, B and agent-less prepared calls; none reached the MCP body (server call log
+  unchanged). An allowed call through `next()` executed normally.
+* Approval and cancellation remained intact with the dispatch-stage wrapper:
+  a real `tools/pre-execute` ask against a provided approval seam allowed the
+  body on `allowed-once`, denied it on `rejected` and `cancelled` before
+  dispatch, and an abort after prepare produced “aborted before dispatch”
+  without reaching the body. The approval *answerer* was a test stub; the real
+  approval service, session audit and UI were not exercised.
+* Adding an agent-scoped `tools.restrict({deny})` after prepare caused dispatch
+  to fail as unknown tool **both** with and without a step set: the no-set path
+  re-resolves current visibility; the step-set path also re-checks its admitted
+  definitions against current visibility. The changed restriction was visible in
+  `schemas()` immediately, and the MCP body was not called.
 * A removed registration cannot execute from an old step snapshot.
 * A body that had already started finished after `AbortController.abort()`; the
   result was an error containing “aborted”. Already-dispatched work is not
   forcibly stopped.
 
-**Consequence:** a close that is only implemented as a guard cannot satisfy
-“a prepared but not yet dispatched request must be rejected”. Any Task 4 switch
-policy would need a dispatch-stage re-check that was not proven here.
+**Consequence:** a close implemented only as a guard is insufficient. A
+dispatch-stage `tools/execute` denial and restriction re-check both close the
+tested native-pipeline window. They are promising components, not a complete
+Task 4 proof: executors other than native, PTC/subcall paths, listener ordering
+(`prepend`/other plugins), schema hiding, identity and real model-step
+integration were not tested. The plan’s “prepared but not dispatched must be
+rejected” property was tested here, but Task 4 remains unimplemented.
 
 ### 6. MCP resources and server instructions (independent channels)
 
@@ -191,10 +236,11 @@ With server `alpha` business tools denied for agent A:
 
 * A’s schemas still contained `list_mcp_resources`,
   `list_mcp_resource_templates`, `read_mcp_resource`.
-* `read_mcp_resource({server: "alpha", uri: "alpha://secret"})` succeeded and
-  returned `ALPHA_RESOURCE_PAYLOAD`.
-* `list_mcp_resources` and the assembled system prompt still listed `alpha` and
-  `beta`.
+* `list_mcp_resources`, `list_mcp_resource_templates` and
+  `read_mcp_resource({server: "alpha", uri: "alpha://secret"})` were each called
+  successfully for A; read returned `ALPHA_RESOURCE_PAYLOAD`.
+* the resource list and the assembled system prompt still listed `alpha` and
+  `beta`;
 * A’s system prompt still contained `ALPHA_INSTRUCTIONS_MARKER`.
 
 Hiding the three shared resource tools for A hid all servers’ resource tools
@@ -213,7 +259,8 @@ After the server process exited with reconnect disabled:
 * all last-known MCP schemas remained in `tools.definitions()`/`schemas()`;
 * the assembled prompt still contained the stale server instructions;
 * business calls failed with a connection error;
-* resource list/read failed with “server is disconnected”;
+* `list_mcp_resources`, `list_mcp_resource_templates` and `read_mcp_resource`
+  each failed with “server is disconnected”;
 * status had no `toolCount`, while the registry still had the tool names.
 
 So “registered schema” is not a reliable proxy for “service online”. A
@@ -229,30 +276,60 @@ Unmount removed the tools; remount with the same raw list reproduced the same
 public names. Stable names are proven; stable *identity disclosure* is not,
 because no generation identity or raw mapping is exposed.
 
-## Why Tasks 4/5 are blocked
+## Task 4/5 status (not implemented)
 
-* **Task 4 (global per-tool switch):** the guard path covers all agents and
-  agent-less calls before dispatch, but the guard-to-body race means a request
-  prepared before the commit can still execute after it. The plan requires such
-  a request to be rejected. No confirmed dispatch-stage re-check exists in the
-  tested interfaces. The switch must not be advertised as reliable.
-* **Task 5 (service-level progressive disclosure):** there is no supported
-  current-generation `public → server/raw` mapping; the shadow workaround
-  bypasses restrictions and leaks through inspection surfaces; resources and
-  server instructions are independent channels that remain visible; offline
-  schemas and instructions are stale. Initial hiding, next-step original-name
-  calls, dynamic updates and per-agent isolation cannot all be proven together,
-  so the progressive mode must not be enabled.
+* **Task 4 (global per-tool switch): not implemented.** Guard-only close fails
+  the prepared-call race. A dispatch-stage `tools/execute` denial and a
+  post-prepare restriction re-check both prevented the body in the tested native
+  pipeline, and approval/cancellation remained intact with a stub answerer. They
+  are candidate mechanisms, not a complete proof: real agent/model-step flow,
+  PTC and custom executors, `tools/execute` listener ordering, schema hiding,
+  and live identity are untested.
+* **Task 5 (service-level progressive disclosure): not implemented.** A
+  per-agent `tools.restrict` layer can be disposed to reveal the original MCP
+  tool without shadowing and without releasing an independent ancestor deny for
+  a static name set. Dynamic additions are visible before expansion (observed
+  gap), the shadow path is unsafe, no trusted live identity was proven, and
+  resources/server instructions remain independent; offline schema/instruction
+  staleness is unchanged. An allow-list design or other registration strategy
+  may avoid the dynamic gap but was not tested.
+* Do not claim that no implementation is possible; the tested alternatives are
+  insufficient. Preserve full injection. Tasks 1/2 (description/metadata)
+  remain independent.
 
-Per the plan, preserve full injection and implement no misleading switch or
-progressive mode. Tasks 1/2 (description/metadata) remain independent.
+## Corrections to earlier overstatements
+
+This revision corrects the prior report:
+
+* “Each resource tool was called” is now true: all three shared resource tools
+  are called online, and list/list-templates/read are called offline.
+* Generation-swap atomicity is qualified: rejected syncs left no partial set,
+  but successful swaps expose partial sets to synchronous `tools/change`
+  observers.
+* Duplicate-list stability is an observation after a 300 ms window, not a timing
+  guarantee.
+* Reverse identity is an observed absence in the tested public surfaces, not a
+  proof that no mapping could exist.
+* The guard race is an observed failure; a dispatch-stage denial is an observed
+  working alternative in the native pipeline, not proof that Task 4 is safe.
+* The scoped shadow is unsafe; the restrict-dispose layer is a tested static
+  alternative with a dynamic gap, not a blanket impossibility claim.
 
 ## Untested / limitations
 
 * Real AgentRegistry / agent-loop step preparation, model request assembly,
   system-prompt `toolSet` handoff, KV cache and token cost: not exercised.
   Scope keys stand in for live agents.
-* PTC executor (`run_code`) and program subcalls: not exercised.
+* Real `dsh-user-approval` service, session audit, approval UI and policy
+  switching: the tools-side ask → `ctx.get('approval').request` path was tested
+  with a stub answerer; audit/UI behaviour is unverified.
+* PTC executor (`run_code`) and program subcalls: not exercised. A custom
+  executor that does not use the shared pipeline could bypass the tested
+  `tools/execute` policy.
+* `tools/execute` listener ordering with other plugins, `prepend` listeners, and
+  event-order races beyond the tested single listener: not proven.
+* Disposal of a `tools.restrict` layer racing an already-running `resolve()` was
+  not tested; the concurrency check covers two resolves after disposal.
 * Streamable HTTP transport, OAuth, credential templates/rotation, startup
   failure and cleanup-timeout paths: not exercised.
 * Modern 2026-07-28 MCP wire revision and task-based execution: not exercised;
@@ -260,22 +337,29 @@ progressive mode. Tasks 1/2 (description/metadata) remain independent.
 * MCP prompt templates: documented unsupported by DSH, not exercised.
 * Live manager `watch`/`restart`, Settings API and Web GUI: not exercised; the
   manager was used through `list()` and `probe()` only.
+* The approval tests use a stub `approval` value; no real approval service was
+  mounted.
 * The live user profile, OpenViking and real MCP services were deliberately not
   touched. No credentials or user state appear in this document or the test.
 
-## Reproduction
+## Reproduction and skip policy
 
 From the repository root (`pkg/dsh-skill-pool` in the plan; this worktree root):
 
 ```sh
-node --test test/mcp-feasibility.test.mjs   # 15/15 pass
-npm test                                    # 79/79 pass
+node --test test/mcp-feasibility.test.mjs   # 21/21 pass
+npm run test:feasibility                    # same, skips with "unverified" if runtime absent
+npm run verify:feasibility                  # required mode: exits nonzero if runtime absent
+npm test                                    # 85/85 pass (includes 21 feasibility tests here)
 npm run lint                                # exit 0
 node test-persisted-mcp.mjs                 # all persisted-MCP checks passed
 ```
 
 The feasibility file locates the installed runtime at
 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh` by default and accepts
-`DSH_FEASIBILITY_ROOT` to point at another installed DSH tree. If the runtime or
-the expected `0.2.2-rc.3` version is absent, every check is reported as skipped
-with the reason “unverified”, never as a passing capability claim.
+`DSH_FEASIBILITY_ROOT` to point at another installed DSH tree. The default
+`npm test` suite keeps normal portability: without the installed runtime the 21
+checks are reported as skipped with the reason “unverified”, **not** as passing
+capability claims. `DSH_FEASIBILITY_REQUIRED=1` (the `verify:feasibility` script)
+makes the same command fail nonzero instead of skipping, so a capability gate
+can require real host coverage.
