@@ -375,3 +375,185 @@ test('a fresh read sees a description changed outside the store', async () => {
   assert.equal(fresh.mcp.kb.description, 'Written by another process')
   assert.deepEqual(fresh.mcp.kb.definition, mcpDefinition)
 })
+
+/**
+ * Reject if a promise does not settle in time, so a queue deadlock fails the
+ * test with a clear error instead of hanging the whole suite. The message is
+ * deliberately different from the store's own reentrancy message.
+ */
+async function withDeadline(promise, label, ms = 2000) {
+  let timer
+  const deadline = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`deadline exceeded: ${label} did not settle`)), ms)
+  })
+  try {
+    return await Promise.race([promise, deadline])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+test('a nested store.write inside an update mutator fails fast instead of deadlocking', async () => {
+  const { file, store } = await temporaryStore()
+  await store.write(
+    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
+  )
+  const before = await readFile(file, 'utf8')
+
+  await assert.rejects(
+    withDeadline(
+      store.update(async (current) => {
+        await store.write(defaultState())
+        return current
+      }),
+      'nested write',
+    ),
+    /cannot be called from inside an update mutator/,
+  )
+  assert.equal(await readFile(file, 'utf8'), before, 'a rejected nested write must not alter the document')
+
+  // The queue recovers: the rejected task settled and later updates still run.
+  const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
+  assert.equal(recovered.mcp.after.enabled, true)
+  assert.equal(recovered.mcp.kb.description, 'keep me')
+  assert.deepEqual(recovered.mcp.kb.definition, mcpDefinition)
+})
+
+test('a nested store.update inside an update mutator fails fast instead of deadlocking', async () => {
+  const { file, store } = await temporaryStore()
+  await store.write(
+    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
+  )
+  const before = await readFile(file, 'utf8')
+
+  await assert.rejects(
+    withDeadline(
+      store.update(async (current) => {
+        await store.update((state) => state)
+        return current
+      }),
+      'nested update',
+    ),
+    /cannot be called from inside an update mutator/,
+  )
+  assert.equal(await readFile(file, 'utf8'), before, 'a rejected nested update must not alter the document')
+
+  const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
+  assert.equal(recovered.mcp.after.enabled, true)
+  assert.equal(recovered.mcp.kb.description, 'keep me')
+})
+
+test('independent concurrent external updates still queue while an async update runs', async () => {
+  const { file, store } = await temporaryStore()
+  await store.write(defaultState())
+
+  let entered
+  const started = new Promise((resolve) => {
+    entered = resolve
+  })
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const slow = store.update(async (current) => {
+    entered()
+    await gate
+    return upsertItem(current, 'mcp', 'slow', mcpScope)
+  })
+  await started
+
+  // This caller is outside the running task's async context, so it must queue,
+  // not be mistaken for reentrancy by a process-wide "busy" flag.
+  const fast = store.update((current) => upsertItem(current, 'mcp', 'fast', mcpScope))
+  release()
+  const [, state] = await Promise.all([slow, fast])
+
+  assert.equal(state.mcp.slow.enabled, true)
+  assert.equal(state.mcp.fast.enabled, true)
+  const persisted = JSON.parse(await readFile(file, 'utf8'))
+  assert.equal(persisted.mcp.slow.enabled, true)
+  assert.equal(persisted.mcp.fast.enabled, true)
+})
+
+test('an async mutation result is persisted once it settles', async () => {
+  const { file, store } = await temporaryStore()
+  const state = await store.update(async (current) => {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    return upsertItem(current, 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'async summary' })
+  })
+  assert.equal(state.mcp.kb.description, 'async summary')
+  const persisted = JSON.parse(await readFile(file, 'utf8'))
+  assert.equal(persisted.mcp.kb.description, 'async summary')
+  assert.deepEqual(persisted.mcp.kb.definition, mcpDefinition)
+})
+
+test('an invalid mutation result is rejected and leaves the document bytes untouched', async () => {
+  const { file, store } = await temporaryStore()
+  await store.write(
+    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
+  )
+  const before = await readFile(file)
+
+  const invalidMutators = [
+    ['undefined (sync)', () => undefined],
+    ['undefined (async)', async () => undefined],
+    ['null', () => null],
+    ['string', () => 'not-a-state'],
+    ['plain object without version', () => ({})],
+  ]
+  for (const [label, mutate] of invalidMutators) {
+    await assert.rejects(store.update(mutate), /must return a complete v4 state document/, label)
+    assert.deepEqual(await readFile(file), before, `${label} must not rewrite the document`)
+  }
+
+  // The queue recovers and the stored configuration is still there.
+  const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
+  assert.equal(recovered.mcp.kb.description, 'keep me')
+  assert.equal(recovered.mcp.after.enabled, true)
+  assert.deepEqual(recovered.mcp.kb.definition, mcpDefinition)
+})
+
+test('an update refuses to overwrite a corrupt state file and recovers after repair', async () => {
+  const { file, store } = await temporaryStore()
+  await store.write(
+    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
+  )
+  const good = await readFile(file, 'utf8')
+  await writeFile(file, '{"version":4,"mcp":', 'utf8')
+  const corrupt = await readFile(file)
+
+  await assert.rejects(
+    store.update((current) => upsertItem(current, 'mcp', 'new', mcpScope)),
+    /not valid JSON; refusing to overwrite/,
+  )
+  assert.deepEqual(await readFile(file), corrupt, 'corrupt bytes stay untouched for manual recovery')
+
+  // Repairing the file lets the next update proceed and keeps the original data.
+  await writeFile(file, good, 'utf8')
+  const repaired = await store.update((current) => upsertItem(current, 'mcp', 'new', mcpScope))
+  assert.equal(repaired.mcp.kb.description, 'keep me')
+  assert.deepEqual(repaired.mcp.kb.definition, mcpDefinition)
+  assert.equal(repaired.mcp.new.enabled, true)
+})
+
+test('an update refuses a JSON document that is not a state object', async () => {
+  const { file, store } = await temporaryStore()
+  await store.write(defaultState())
+  for (const text of ['null', '[]', '"text"']) {
+    await writeFile(file, text, 'utf8')
+    const before = await readFile(file)
+    await assert.rejects(store.update((current) => current), /not a JSON object; refusing to overwrite/)
+    assert.deepEqual(await readFile(file), before, `${text} must not be overwritten`)
+  }
+  await writeFile(file, JSON.stringify(defaultState()), 'utf8')
+  const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
+  assert.equal(recovered.mcp.after.enabled, true)
+})
+
+test('a plain read keeps its lenient fallback so only updates are strict', async () => {
+  const { file, store } = await temporaryStore()
+  await store.write(defaultState())
+  await writeFile(file, '{not json', 'utf8')
+  const lenient = await store.read({ fresh: true })
+  assert.deepEqual(lenient, defaultState())
+})

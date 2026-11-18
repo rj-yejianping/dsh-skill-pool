@@ -31,6 +31,7 @@
  * @module dsh-skill-pool/store
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
@@ -613,6 +614,26 @@ export function normalizeState(raw) {
 }
 
 /**
+ * Validate the document an update mutator returned.
+ *
+ * `normalizeState` treats anything that is not a v4 document as an empty
+ * default, so persisting an accidental `undefined` result (a mutation that
+ * forgot to return, or an async mutator that resolved to nothing) would
+ * silently erase every stored member and credential. Refuse it before it can
+ * reach the file.
+ *
+ * @param {unknown} next - mutation result.
+ * @returns {object} the same document when it is acceptable.
+ * @throws {TypeError} when the result is not a complete v4 document.
+ */
+function assertStateDocument(next) {
+  if (!isObject(next) || next.version !== STATE_VERSION) {
+    throw new TypeError('StateStore.update(mutate) must return a complete v4 state document')
+  }
+  return next
+}
+
+/**
  * Merge a settings patch over a normalized document.
  * Unknown keys (including the retired `enforcePool`) are ignored.
  *
@@ -750,6 +771,9 @@ export class StateStore {
     this.version = version
     this.cached = undefined
     this.writeChain = Promise.resolve()
+    // Marks the async context of a task currently running on `writeChain`, so a
+    // nested write/update can be rejected instead of waiting on itself forever.
+    this.taskContext = new AsyncLocalStorage()
   }
 
   /** Read the document, caching the normalized result. */
@@ -772,16 +796,65 @@ export class StateStore {
    * A rejection settles only the operation's own promise: the queue itself is
    * reset to a fulfilled promise, so one failed save never wedges later ones.
    *
+   * A call made from inside a queued task's async context (typically `await
+   * store.write(...)` inside an `update` mutator) is rejected immediately: it
+   * would queue behind the very task awaiting it and deadlock the store.
+   * AsyncLocalStorage distinguishes those descendants from independent callers
+   * that merely arrive while the queue is busy — a process-wide "busy" flag
+   * would wrongly reject those external calls too.
+   *
    * @param {() => Promise<object>} task - operation to run once its turn comes.
    * @returns {Promise<object>} the operation's result.
    */
   #enqueue(task) {
-    const run = this.writeChain.then(task)
+    if (this.taskContext.getStore() === true) {
+      return Promise.reject(
+        new Error(
+          'StateStore.write/update cannot be called from inside an update mutator: it would wait on the same queue',
+        ),
+      )
+    }
+    const run = this.writeChain.then(() => this.taskContext.run(true, task))
     this.writeChain = run.then(
       () => undefined,
       () => undefined,
     )
     return run
+  }
+
+  /**
+   * Read the document for a queued read-modify-write, failing instead of
+   * guessing.
+   *
+   * The public `read()` keeps its lenient fallback for compatibility, but an
+   * update is about to overwrite the file: a JSON parse error or an I/O error
+   * must abort the save instead of replacing credential-bearing state with
+   * defaults. Only a missing file (ENOENT) legitimately starts from defaults.
+   *
+   * @returns {Promise<object>} normalized on-disk document.
+   */
+  async #readStrict() {
+    let text
+    try {
+      text = await readFile(this.file, 'utf8')
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        this.cached = defaultState()
+        return this.cached
+      }
+      throw new Error('state file could not be read; refusing to overwrite it', { cause: error })
+    }
+    let raw
+    try {
+      raw = JSON.parse(text)
+    } catch (error) {
+      throw new Error('state file is not valid JSON; refusing to overwrite it', { cause: error })
+    }
+    if (!isObject(raw)) {
+      throw new Error('state file is not a JSON object; refusing to overwrite it')
+    }
+    this.cached = normalizeState(raw)
+    return this.cached
   }
 
   /**
@@ -814,19 +887,21 @@ export class StateStore {
    * Apply one mutation to a fresh read and persist the result as one queued
    * read-modify-write.
    *
-   * The fresh read happens inside the queue, after every earlier write/update
-   * has settled. Two concurrent updates therefore see each other's result
-   * instead of overwriting it, and direct `write` calls keep their call order.
-   * The body uses `#persist` directly (not `write`) to avoid enqueueing behind
-   * itself, which would deadlock the queue.
+   * The strict fresh read happens inside the queue, after every earlier
+   * write/update has settled. Two concurrent updates therefore see each other's
+   * result instead of overwriting it, and direct `write` calls keep their call
+   * order. `mutate` may be async, but must resolve to a complete v4 document;
+   * an invalid result is rejected before anything is written. A nested
+   * `store.write`/`store.update` inside `mutate` is rejected instead of
+   * enqueueing behind itself, which would deadlock the queue.
    *
    * @param {(state: object) => object|Promise<object>} mutate - pure mutation.
    * @returns {Promise<object>} the persisted document.
    */
   async update(mutate) {
     return this.#enqueue(async () => {
-      const current = await this.read({ fresh: true })
-      const next = await mutate(current)
+      const current = await this.#readStrict()
+      const next = assertStateDocument(await mutate(current))
       return this.#persist(normalizeState(next))
     })
   }
