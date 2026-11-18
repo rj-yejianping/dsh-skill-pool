@@ -17,7 +17,7 @@ capability was verified. See “Host-bound probe and release gate” below.
 
 | Command | Purpose | Installed runtime present | Runtime absent or wrong version |
 | --- | --- | --- | --- |
-| `npm test` | ordinary portable suite; excludes the probe | 72/72 pass | 72/72 pass (no capability claim) |
+| `npm test` | ordinary portable suite; excludes the probe | 91/91 pass | 91/91 pass (no capability claim) |
 | `npm run test:feasibility` | optional focused probe; reports skips | 21/21 pass | 21 skipped; prints `[unverified] ...`; exit 0 |
 | `npm run verify:feasibility` | **strict capability gate** | 21/21 pass | fails nonzero |
 
@@ -382,7 +382,7 @@ DSH_FEASIBILITY_ROOT=/nonexistent node --test test/mcp-feasibility.probe.mjs
 # 21 skipped, exit 0 (optional probe, clearly unverified)
 DSH_FEASIBILITY_ROOT=/nonexistent npm run verify:feasibility
 # exit nonzero (strict gate; the wrapper sets DSH_FEASIBILITY_REQUIRED=1)
-npm test                                     # 72/72 pass; probe is excluded
+npm test                                     # 91/91 pass; probe is excluded
 npm run lint                                 # exit 0
 node test-persisted-mcp.mjs                  # all persisted-MCP checks passed
 ```

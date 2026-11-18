@@ -12,7 +12,9 @@
 3. **生效条件**：每个维度独立——`from === 'group'` 且组存在则用组的值，否则用成员自己的值；
    组不存在时回落成员自己的值。`resolvePool` 语义不变，判定前先算生效条件。
 4. **迁移**：v3 → v4 是显式迁移（`store.migrateV3`），按组内现状推出组值并标记继承，
-   保证迁移前后 `resolvePool` 对任意会话逐条相同；其余未知版本仍重置为空文档。
+   保证迁移前后 `resolvePool` 对任意会话逐条相同。读取文件时，v1 / v2 / 未知版本一律拒绝
+   （`state-unsupported-version`），不会重置覆盖；纯函数 `normalizeState` 的旧行为只保留给
+   内部写入/测试，不再是任何读取路径的回退。
 5. **模式列表**：`inventory.modes` 不再注入 `default`；`default` 只是 `modeOf()` 的内部兜底。
    `buildInventory` 额外返回 `defaultMode`（预设注册表的默认预设）供面板初始化预览。
 6. **预览**：`/resolve` 增加 `allModes` / `allWorkspaces`（值为 `1`），用于"全部模式/全部工作区"
@@ -111,17 +113,34 @@
 }
 ```
 
-版本不符的旧文档一律重置为默认（`normalizeState` 既有行为）。
+版本不符的旧文档在读取时拒绝；`normalizeState` 仍保留"未知版本返回空文档"的纯函数行为，
+仅供内部写入/迁移测试使用。
 
-**读取失败与损坏**：
+**读取失败与损坏（全部 fail-closed）**：
 
-- 普通读取（`read()`，含面板 GET）宽松回退为默认文档：非法 JSON、JSON 非对象、非 `ENOENT`
-  的 I/O 错误都只影响本次显示，不写盘。
-- 写操作（`store.update`）在覆盖前**严格读取**：上述任一情况直接失败，**不修改原文件字节**。
-  HTTP 返回 500（如 `resource-pool/save-failed`），错误消息只说明无法读取/不是合法 JSON，
-  **不回显文件内容、definition 或其中的凭据**；`ENOENT` 仍视为空文档。
+- 所有读取（`store.read()`，含面板 GET、`/resolve`、Agent 激活）和写入前读取都先校验完整
+  文档：非法 JSON、JSON 非对象、不支持的版本、缺少必需段，以及会被规范化成更宽权限的语义错误
+  （非布尔开关、非法 `modes`/`workspaces`、非法成员键、无效继承标记等）直接抛
+  `StateReadError`（`resource-pool/state-*`），**不回退到默认文档**。
+- 首次运行（文件从未存在）仍是合法的空文档。同一 Store 实例已经看到过文件后，再出现 `ENOENT`
+  按 `state-missing` 失败。Host 重启后文件已被删除与真正首次使用无法区分，此时按首次运行处理；
+  这是已记录的边界。插件重载会先释放旧限制层；重载时若文件仍损坏，已有 Agent 只能走
+  保守层（拒绝当时可见的 `mcp__*`），无法重建原来的精确范围——这是插件生命周期边界，
+  不会假装已恢复。
+- 更新（`store.update`）与直接 `store.write` 都使用同一校验，失败时**不修改原文件字节**。
+  HTTP 返回 500，错误消息只说明无法读取/不是合法 JSON/文档不合法，**不回显文件内容、definition
+  或其中的凭据**。
+- **已有 Agent**：激活失败时保留上一次成功安装的限制层（包括 MCP `restrict`），不先释放旧层；
+  失败只记日志/状态，不把会话改成无门控。若某个已存在 Agent 没有旧层（例如插件重载后从损坏
+  文件重建失败），`reapplyAll` 安装一个拒绝**当时可见**全部 `mcp__*` 工具的保守层；这是静态名单，
+  动态新增工具仍是已知缺口，MCP resources/instructions 不受影响。
+- **新 Agent**：没有旧层可保留时 `applyToAgent` 抛错；`agent/created` 是宿主串行 await 的监听器，
+  因而创建被拒绝。不会通过捕获错误继续发布一个未门控的 Agent。
+- MCP `restrict` 注册失败按激活失败处理；只有在新的 deny 层安装成功后才释放旧层。
+- 面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 返回 `stateStatus.ok=false`
+  与安全错误码/恢复说明。
 - 恢复前应先**备份** `state.json`（`0600`，可能含 MCP 令牌），再人工修复或从备份还原；
-  插件不会自动备份，也不会自动重写损坏文件。
+  插件不会自动备份，也不会自动重写损坏文件。修复后下一次保存或插件重载会重新应用。
 
 ### 2.2 资源目录（独立文件夹，不与系统技能混放）
 
@@ -187,9 +206,19 @@ resolvePool(state, {mode, cwd}) -> {gated, skills: string[], mcpServers: string[
 
 1. **技能层**：按 §3 注册 provider（`allowed` 为本次判定结果）。`gateDefaultSkills === true` 时额外摘掉全局技能……（v3 不实现该分支，仅保留设置位，见 §9）。
 2. **MCP 层**：从全局 `ctx.tools.schemas()` 取 `mcp__<server>__*`，不在 `mcpServers` 内的名字 `agent.ctx.tools.restrict({deny})`。
+   注意：`mcpServerOf` 以**第一个** `__` 解析 server，而 public 名无法可靠反查 server/raw；合法
+   Server 名本身含 `__` 时可能误归类（误隐藏或误放行）。这层是尽力而为的 Server 级限制，**不是**
+   强安全边界：动态新增工具可绕过静态 deny，MCP resources 与 server instructions 也不受工具 deny 影响。
 3. **提示词**：`agent.ctx.systemPrompt.section({name:'resource-pool:active', order: getSectionOrder('TOOL_READ')-30, text})`，说明模式、工作区、可用技能与 MCP。
 
 生命周期与并发（不变）：`agent/created` 必须 `await`；先算后放；每 Agent 一条 promise chain；`signature` 去重；`agent/disposed` 释放；插件卸载 `disposeAll`；`ctx.inject(['agents'], () => reapplyAll())`。
+
+Fail-closed 增量：
+
+- 读取/校验失败时，已有激活的 Agent 保留旧 layer，新的 `restrict` 先安装、旧的后释放；
+- 没有旧激活的 Agent（新建路径）失败必须向上抛出，使 `agent/created` 拒绝创建；
+- `tools.schemas()` 不可用而本次又需要 MCP 门控时视为激活失败，不能当作"没有工具要隐藏"；
+- 状态错误只影响资源池门控，不改变 MCP resources / server instructions 的既有边界。
 
 ## 6. HTTP API
 

@@ -31,6 +31,9 @@ import { mcpServerOf, MCP_TOOL_PREFIX, resolvePool } from './rules.js'
 
 const SECTION_NAME = 'resource-pool:active'
 
+/** Labels of effects that restrict the MCP tool surface (normal or fallback). */
+const RESTRICT_LABELS = new Set(['mcp-restrict', 'mcp-restrict-fallback'])
+
 /**
  * Read the Agent mode of one live Agent.
  * @param {object} ctx - plugin context.
@@ -190,22 +193,26 @@ function summaryTextEn({ mode, cwd, skillNames, servers, skillGated, mcpGated })
  * @returns {object} manager with applyToAgent/reapplyAll/disposeAgent/disposeAll.
  */
 export function createActivation({ ctx, getState, logger, promptLanguage = () => 'zh', libraryRoot = () => librarySkillsRoot() }) {
-  /** @type {WeakMap<object, {disposers: Function[], signature: string, chain: Promise<void>}>} */
+  /** @type {WeakMap<object, {disposers: {dispose: Function, label: string}[], signature: string, activated: boolean, chain: Promise<void>}>} */
   const agents = new WeakMap()
+
+  /** Dispose one recorded registration, tolerating an already-disposed effect. */
+  const disposeEntry = (entry) => {
+    try {
+      entry.dispose()
+    } catch {
+      /* already disposed */
+    }
+  }
 
   /** Release every registration owned for one Agent. */
   const release = (agent) => {
     const record = agents.get(agent)
     if (record === undefined) return
-    for (const dispose of record.disposers.reverse()) {
-      try {
-        dispose()
-      } catch {
-        /* already disposed */
-      }
-    }
+    for (const entry of record.disposers.reverse()) disposeEntry(entry)
     record.disposers = []
     record.signature = ''
+    record.activated = false
   }
 
   /** Signature of a decision, used to skip no-op re-applications. */
@@ -222,23 +229,98 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       lib: libraryNames,
     })
 
-  /** Serialize applications per Agent. */
-  const applyToAgent = async (agent, { force = false } = {}) => {
+  /**
+   * Serialize applications per Agent.
+   *
+   * A failure for an Agent that already has a live activation is contained: the
+   * previous registrations stay installed and are never released before the new
+   * ones are known to be safe. A failure for an Agent with no activation is
+   * propagated to the caller, so `agent/created` rejects and no ungated Agent is
+   * published.
+   */
+  const applyToAgent = async (agent, { force = false, conservative = false } = {}) => {
     if (agent?.ctx === undefined) return
     let record = agents.get(agent)
     if (record === undefined) {
-      record = { disposers: [], signature: '', chain: Promise.resolve() }
+      record = { disposers: [], signature: '', activated: false, chain: Promise.resolve() }
       agents.set(agent, record)
     }
-    const next = record.chain.then(() => applyNow(agent, record, { force })).catch((error) => {
+    const run = record.chain.then(() => applyNow(agent, record, { force }))
+    // Keep the per-Agent chain fulfilled even when this application failed, so a
+    // later retry (after the file is repaired) is not wedged behind it.
+    record.chain = run.then(
+      () => undefined,
+      () => undefined,
+    )
+    try {
+      return await run
+    } catch (error) {
+      const hadActivation = record.activated
       logger?.warn?.(`[resource-pool] activation failed: ${error instanceof Error ? error.message : String(error)}`)
-    })
-    record.chain = next
-    return next
+      if (hadActivation) {
+        // The old layer is deliberately still installed. Reporting success would
+        // hide a degraded state; rejecting would make the Agent unusable even
+        // though its previous, authorized gate still protects it.
+        return
+      }
+      if (conservative) {
+        // A live Agent with no layer of ours (for example one that existed before
+        // a plugin reload) cannot be left ungated while the document is
+        // unreadable. Deny every currently visible MCP tool and keep the Agent
+        // alive; dynamic additions remain a documented gap.
+        try {
+          applyConservativeGate(agent)
+          return
+        } catch (gateError) {
+          logger?.warn?.(
+            `[resource-pool] conservative MCP gate failed: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
+          )
+        }
+      }
+      // This is also the only safe response for an Agent with no previous gate:
+      // no caller may be told "activated" while nothing protects the Agent.
+      throw error
+    }
+  }
+
+  /**
+   * Apply a deny-all-visible-MCP layer to one live Agent when the state cannot
+   * be read and there is no previous layer to keep. This is deliberately a
+   * static list: newly registered MCP tools can still appear, as documented.
+   */
+  const applyConservativeGate = (agent) => {
+    const tools = ctx.get('tools')
+    if (tools === undefined || typeof tools.schemas !== 'function') {
+      throw new Error('global tools service is unavailable')
+    }
+    const schemas = tools.schemas()
+    if (!Array.isArray(schemas)) throw new Error('global tool list is not an array')
+    const deny = schemas
+      .map((schema) => schema?.name)
+      .filter((name) => typeof name === 'string' && name.startsWith(MCP_TOOL_PREFIX))
+    const record = agents.get(agent)
+    if (record === undefined) throw new Error('agent activation record is missing')
+    if (deny.length === 0) {
+      record.disposers = []
+      record.signature = ''
+      record.activated = true
+      logger?.warn?.('[resource-pool] state unavailable; no visible MCP tools to deny for an ungated Agent')
+      return
+    }
+    const dispose = agent.ctx.effect(() => agent.ctx.tools.restrict({ deny }), 'resource-pool.mcp-restrict-fallback')
+    record.disposers = [{ dispose: typeof dispose === 'function' ? dispose : () => {}, label: 'mcp-restrict-fallback' }]
+    record.signature = ''
+    record.activated = true
+    logger?.warn?.(
+      `[resource-pool] state unavailable; applied conservative MCP deny (${deny.length} tool${deny.length === 1 ? '' : 's'}) to an ungated Agent`,
+    )
   }
 
   /** Build one Agent's registrations. Runs serialized per Agent. */
   const applyNow = async (agent, record, { force }) => {
+    // This read is fail-closed: a corrupt/unreadable/unsupported document throws
+    // instead of resolving to an empty pool. It happens before any live
+    // registration is touched, so an already-gated Agent keeps its old layers.
     const state = await getState()
     const settings = state.settings ?? {}
     const mode = modeOf(ctx, agent)
@@ -267,69 +349,119 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
 
     // ---- Compute the whole next activation before touching the live one.
     const allowedSkills = new Set(allowed)
-    const denyMcp = []
-    if (pool.gateMcp && tools !== undefined) {
-      const allowedServers = new Set(pool.mcpServers)
-      try {
-        for (const schema of tools.schemas()) {
-          const name = schema?.name
-          if (typeof name !== 'string' || !name.startsWith(MCP_TOOL_PREFIX)) continue
-          if (!allowedServers.has(mcpServerOf(name))) denyMcp.push(name)
-        }
-      } catch {
-        /* no observable global tool surface: nothing to hide */
+    let denyMcp = []
+    if (pool.gateMcp) {
+      // A missing/unreadable global tool surface is not "nothing to hide": it
+      // means the MCP gate cannot be established. Treat it as an activation
+      // failure instead of publishing an Agent without its deny layer.
+      if (tools === undefined || typeof tools.schemas !== 'function') {
+        throw new Error('MCP gate is required but the global tools service is unavailable')
       }
-    }
-
-    // ---- Apply synchronously from here on.
-    release(agent)
-    const disposers = record.disposers
-    const effect = (register, label) => {
+      let schemas
       try {
-        disposers.push(agent.ctx.effect(register, `resource-pool.${label}`))
+        schemas = tools.schemas()
       } catch (error) {
-        logger?.debug?.(`[resource-pool] ${label} registration failed: ${error instanceof Error ? error.message : String(error)}`)
+        throw new Error('MCP gate is required but the global tool list could not be read', { cause: error })
+      }
+      if (!Array.isArray(schemas)) throw new Error('MCP gate is required but the global tool list is not an array')
+      const allowedServers = new Set(pool.mcpServers)
+      for (const schema of schemas) {
+        const name = schema?.name
+        if (typeof name !== 'string' || !name.startsWith(MCP_TOOL_PREFIX)) continue
+        if (!allowedServers.has(mcpServerOf(name))) denyMcp.push(name)
       }
     }
 
-    if (allowedSkills.size > 0) {
-      if (skills === undefined || typeof skills.registerProvider !== 'function') {
-        logger?.warn?.('[resource-pool] skills registry unavailable; library skills cannot be served')
-      } else {
-        const root = libraryRoot()
-        effect(
-          // Registered from `agent.ctx`: the layer belongs to this Agent alone.
-          () => skills.registerProvider((control) => createLibraryProvider({ root, allowed: allowedSkills, logger, control })),
-          'skill-provider',
+    // ---- Apply transactionally: install the new MCP deny while the old one is
+    // still active (restrictions intersect, so this can only tighten), release
+    // only the non-critical old effects, and release the old deny last. A
+    // failed critical registration leaves the previous gate untouched.
+    const previous = record.disposers
+    const pending = []
+    let incomplete = false
+    const addEffect = (register, label, { critical = false } = {}) => {
+      try {
+        const dispose = agent.ctx.effect(register, `resource-pool.${label}`)
+        pending.push({ dispose: typeof dispose === 'function' ? dispose : () => {}, label })
+        return true
+      } catch (error) {
+        if (critical) throw error
+        incomplete = true
+        logger?.debug?.(`[resource-pool] ${label} registration failed: ${error instanceof Error ? error.message : String(error)}`)
+        return false
+      }
+    }
+
+    try {
+      if (denyMcp.length > 0) addEffect(() => agent.ctx.tools.restrict({ deny: denyMcp }), 'mcp-restrict', { critical: true })
+
+      // Skill providers and prompt sections are keyed by name, so the old
+      // registration of that kind must be gone before the new one is inserted.
+      // They are not a rights-widening boundary: if the new one fails, the Agent
+      // has no pool skills / summary, which fails closed for this Agent.
+      const oldRestrictions = []
+      for (const entry of previous) {
+        if (RESTRICT_LABELS.has(entry.label)) oldRestrictions.push(entry)
+        else disposeEntry(entry)
+      }
+      record.disposers = oldRestrictions
+
+      if (allowedSkills.size > 0) {
+        if (skills === undefined || typeof skills.registerProvider !== 'function') {
+          logger?.warn?.('[resource-pool] skills registry unavailable; library skills cannot be served')
+        } else {
+          const root = libraryRoot()
+          addEffect(
+            // Registered from `agent.ctx`: the layer belongs to this Agent alone.
+            () => skills.registerProvider((control) => createLibraryProvider({ root, allowed: allowedSkills, logger, control })),
+            'skill-provider',
+          )
+        }
+      }
+
+      const systemPrompt = ctx.get('systemPrompt')
+      if (
+        settings.injectSummary !== false &&
+        pool.gated &&
+        systemPrompt !== undefined &&
+        typeof systemPrompt.getSectionOrder === 'function'
+      ) {
+        const skillNames = allowedSkills.size > 0 ? [...allowedSkills].sort() : []
+        const summary = (promptLanguage() === 'en' ? summaryTextEn : summaryTextZh)({
+          mode,
+          cwd,
+          skillNames,
+          servers,
+          skillGated: pool.gateSkills,
+          mcpGated: pool.gateMcp,
+        })
+        addEffect(
+          () =>
+            agent.ctx.systemPrompt.section({
+              name: SECTION_NAME,
+              order: systemPrompt.getSectionOrder('TOOL_READ') - 30,
+              text: summary,
+            }),
+          'summary',
         )
       }
+
+      // The new MCP layers are installed; dropping the previous ones now can
+      // only keep the same or a smaller set of visible tools.
+      for (const entry of oldRestrictions) disposeEntry(entry)
+      record.disposers = pending
+      record.activated = true
+      // Leave the signature unset when a non-critical registration failed, so
+      // the next ordinary re-apply retries it instead of treating the incomplete
+      // layer as final.
+      record.signature = incomplete ? '' : signature
+    } catch (error) {
+      // No successful commit: remove anything this attempt registered and leave
+      // the previous gate (still in `record.disposers`) in force.
+      for (const entry of pending.reverse()) disposeEntry(entry)
+      throw error
     }
 
-    if (denyMcp.length > 0) effect(() => agent.ctx.tools.restrict({ deny: denyMcp }), 'mcp-restrict')
-
-    const systemPrompt = ctx.get('systemPrompt')
-    if (settings.injectSummary !== false && pool.gated && systemPrompt !== undefined && typeof systemPrompt.getSectionOrder === 'function') {
-      const skillNames = allowedSkills.size > 0 ? [...allowedSkills].sort() : []
-      const summary = (promptLanguage() === 'en' ? summaryTextEn : summaryTextZh)({
-        mode,
-        cwd,
-        skillNames,
-        servers,
-        skillGated: pool.gateSkills,
-        mcpGated: pool.gateMcp,
-      })
-      effect(
-        () =>
-          agent.ctx.systemPrompt.section({
-            name: SECTION_NAME,
-            order: systemPrompt.getSectionOrder('TOOL_READ') - 30,
-            text: summary,
-          }),
-        'summary',
-      )
-    }
-
-    record.signature = signature
     logger?.debug?.(
       `[resource-pool] activated mode=${mode} cwd=${cwd} skills=${allowedSkills.size}/${libraryNames.length} mcpHidden=${denyMcp.length}`,
     )
@@ -339,7 +471,15 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
   const reapplyAll = async () => {
     const registry = ctx.get('agents')
     const live = typeof registry?.list === 'function' ? registry.list() : []
-    await Promise.all(live.map((agent) => applyToAgent(agent, { force: true })))
+    // A failure for one Agent must not stop the others, and it must not be
+    // reported as a successful application for that Agent.
+    await Promise.all(
+      live.map((agent) =>
+        applyToAgent(agent, { force: true, conservative: true }).catch((error) => {
+          logger?.warn?.(`[resource-pool] re-apply failed: ${error instanceof Error ? error.message : String(error)}`)
+        }),
+      ),
+    )
   }
 
   /** Release one Agent's registrations. */

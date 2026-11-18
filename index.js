@@ -21,7 +21,7 @@ import { createRequire } from 'node:module'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from '@deepseek-ai/schemastery'
 
-import { StateStore, statePath } from './src/store.js'
+import { StateReadError, StateStore, defaultState, statePath } from './src/store.js'
 import { registerWebApi } from './src/web-api.js'
 import { createActivation, modeOf, workspaceOf } from './src/activation.js'
 import { createMountTracker } from './src/uploads.js'
@@ -68,11 +68,29 @@ export function apply(ctx, config = {}) {
   const promptLanguage = config.promptLanguage === 'en' ? 'en' : 'zh'
   const masterEnabled = config.enabled !== false
 
+  /** Read the stored document with fail-closed validation (diagnostics too). */
+  const readStoredState = () => store.read({ fresh: true })
+
   /** Effective document: the profile's master switch wins over the stored one. */
   const getState = async () => {
-    const state = await store.read({ fresh: true })
-    if (masterEnabled) return state
-    return { ...state, settings: { ...state.settings, enabled: false } }
+    if (!masterEnabled) {
+      // A deliberately disabled plugin never gates a session, so a corrupt file
+      // must not turn into a creation failure. Keep the panel/status diagnostic
+      // path (which reads the store directly) intact and fall back to an empty,
+      // ungated document. Nothing is written.
+      try {
+        const state = await readStoredState()
+        return { ...state, settings: { ...state.settings, enabled: false } }
+      } catch (error) {
+        // Only a state-reader failure is expected here; anything else is a bug
+        // and must not be turned into a silent "ungated" answer.
+        if (!(error instanceof StateReadError)) throw error
+        logger?.warn?.(`[skill-pool] plugin disabled; ignoring unreadable state: ${error.message}`)
+        const state = defaultState()
+        return { ...state, settings: { ...state.settings, enabled: false } }
+      }
+    }
+    return readStoredState()
   }
 
   const activation = createActivation({ ctx, getState, logger, promptLanguage: () => promptLanguage })
@@ -87,7 +105,9 @@ export function apply(ctx, config = {}) {
 
   ctx.on('agent/created', async ({ agent }) => {
     // Listeners are awaited before creation resolves and before the Agent may
-    // assemble its first request; `applyToAgent` contains its own failures.
+    // assemble its first request. If the state file cannot be read safely and
+    // this Agent has no previous gate, `applyToAgent` rejects: letting creation
+    // continue would publish an Agent with no MCP restriction (fail-open).
     await activation.applyToAgent(agent)
   })
 
@@ -104,7 +124,9 @@ export function apply(ctx, config = {}) {
     const live = typeof registry?.list === 'function' ? registry.list() : []
     const agent = live.find((candidate) => candidate?.session?.id === sessionId || candidate?.id === sessionId)
     if (agent === undefined) return
-    void activation.applyToAgent(agent, { force: true })
+    void activation.applyToAgent(agent, { force: true, conservative: true }).catch((error) => {
+      logger?.warn?.(`[skill-pool] preset re-apply failed: ${error instanceof Error ? error.message : String(error)}`)
+    })
   })
 
   // Registrations live on each Agent's context; release them when the plugin
@@ -150,7 +172,32 @@ export function apply(ctx, config = {}) {
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }],
     },
     async execute(_args, exec) {
-      const state = await getState()
+      let state
+      try {
+        const stored = await readStoredState()
+        state = masterEnabled ? stored : { ...stored, settings: { ...stored.settings, enabled: false } }
+      } catch (error) {
+        // A status call must stay answerable precisely when the pool is
+        // degraded, so the Agent can explain why resources are unavailable.
+        const expected = error instanceof StateReadError
+        const code = expected ? error.code : 'resource-pool/state-unavailable'
+        const message = expected ? error.message : 'resource-pool state is unavailable'
+        return {
+          plugin: 'dsh-skill-pool',
+          version: VERSION,
+          stateFile: file,
+          promptLanguage,
+          masterEnabled,
+          stateStatus: {
+            ok: false,
+            code,
+            message,
+            recovery:
+              'No pool was applied from the unreadable document. Existing Agents keep their previous gate; new Agents are refused. Back up state.json, repair or restore it, then retry.',
+          },
+          pool: null,
+        }
+      }
       const agent = exec?.agent
       const mode = agent === undefined ? '' : modeOf(ctx, agent)
       const cwd = agent === undefined ? '' : workspaceOf(agent)
@@ -161,6 +208,7 @@ export function apply(ctx, config = {}) {
         stateFile: file,
         promptLanguage,
         masterEnabled,
+        stateStatus: { ok: true },
         mode,
         cwd,
         ...pool,

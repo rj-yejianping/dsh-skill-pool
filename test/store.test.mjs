@@ -550,12 +550,14 @@ test('an update refuses a JSON document that is not a state object', async () =>
   assert.equal(recovered.mcp.after.enabled, true)
 })
 
-test('a plain read keeps its lenient fallback so only updates are strict', async () => {
+test('a plain read fails closed too instead of returning defaults', async () => {
   const { file, store } = await temporaryStore()
   await store.write(defaultState())
   await writeFile(file, '{not json', 'utf8')
-  const lenient = await store.read({ fresh: true })
-  assert.deepEqual(lenient, defaultState())
+  await assert.rejects(store.read({ fresh: true }), (error) => {
+    assert.equal(error?.code, 'resource-pool/state-invalid-json')
+    return true
+  })
 })
 
 test('an update rejects v4 fragments and wrong section shapes without rewriting the document', async () => {

@@ -617,6 +617,229 @@ export function normalizeState(raw) {
 const STATE_SECTIONS = ['settings', 'skills', 'mcp', 'sources', 'groups']
 
 /**
+ * A state document that cannot be used safely.
+ *
+ * The code is intentionally stable for the HTTP/status surfaces; the message is
+ * a fixed explanation and never contains file bytes, member definitions or
+ * credentials. Callers either keep their previous gate (an already-live Agent)
+ * or fail closed (a new Agent).
+ */
+export class StateReadError extends Error {
+  /**
+   * @param {string} code - stable error code such as `resource-pool/state-invalid-json`.
+   * @param {string} message - safe explanation, never document content.
+   */
+  constructor(code, message) {
+    super(message)
+    this.name = 'StateReadError'
+    this.code = code
+    this.status = 500
+  }
+}
+
+/** Throw the one "this document cannot be trusted" error. */
+function invalidDocument(detail) {
+  throw new StateReadError(
+    'resource-pool/state-invalid-document',
+    `state file is not a valid resource-pool document (${detail}); refusing to overwrite or use it`,
+  )
+}
+
+/** Require a plain object. */
+function requireObject(value, what) {
+  if (!isObject(value)) invalidDocument(`${what} must be an object`)
+}
+
+/** Require a boolean when the property is present. */
+function optionalBoolean(value, what) {
+  if (value !== undefined && typeof value !== 'boolean') invalidDocument(`${what} must be a boolean`)
+}
+
+/** Require a string when the property is present. */
+function optionalStringField(value, what, limit = 4096) {
+  if (value === undefined) return
+  if (typeof value !== 'string' || value.length > limit) invalidDocument(`${what} must be a string of at most ${limit} characters`)
+}
+
+/** Require an array of conservative names. */
+function requireNameList(value, what) {
+  if (!Array.isArray(value)) invalidDocument(`${what} must be an array of names`)
+  for (const item of value) {
+    if (typeof item !== 'string' || cleanName(item) !== item) invalidDocument(`${what} contains an invalid name`)
+  }
+}
+
+/** Require an array of absolute workspace paths. */
+function requirePathList(value, what) {
+  if (!Array.isArray(value)) invalidDocument(`${what} must be an array of workspace paths`)
+  for (const item of value) {
+    if (typeof item !== 'string' || normalizePath(item).length === 0) invalidDocument(`${what} contains an invalid workspace path`)
+  }
+}
+
+/** Validate the settings switches. v3 allowed some switches to be absent. */
+function validateSettings(raw, { requireAll }) {
+  requireObject(raw, 'settings')
+  for (const key of SETTING_KEYS) {
+    if (requireAll && !Object.hasOwn(raw, key)) invalidDocument(`settings.${key} is missing`)
+    optionalBoolean(raw[key], `settings.${key}`)
+  }
+  if (typeof raw.enabled !== 'boolean') invalidDocument('settings.enabled must be a boolean')
+}
+
+/** Validate the optional inheritance markers of a v4 skill member. */
+function validateInheritance(raw, what) {
+  for (const key of ['modesFrom', 'workspacesFrom']) {
+    if (raw[key] !== undefined && raw[key] !== 'group' && raw[key] !== 'self') {
+      invalidDocument(`${what}.${key} must be 'group' or 'self'`)
+    }
+  }
+}
+
+/** Validate one stored MCP connection definition without echoing it. */
+function validateDefinition(raw, what) {
+  requireObject(raw, what)
+  if (raw.transport !== undefined && !MCP_TRANSPORTS.includes(raw.transport)) invalidDocument(`${what}.transport is unsupported`)
+  for (const key of ['serverName', 'url', 'command', 'cwd']) optionalStringField(raw[key], `${what}.${key}`, 4096)
+  if (raw.args !== undefined) {
+    if (!Array.isArray(raw.args) || raw.args.some((arg) => typeof arg !== 'string')) {
+      invalidDocument(`${what}.args must be an array of strings`)
+    }
+  }
+  for (const key of ['headers', 'env']) {
+    if (raw[key] === undefined) continue
+    requireObject(raw[key], `${what}.${key}`)
+    for (const [name, value] of Object.entries(raw[key])) {
+      if (typeof name !== 'string' || name.length === 0 || name.length > 256 || typeof value !== 'string') {
+        invalidDocument(`${what}.${key} contains an invalid entry`)
+      }
+    }
+  }
+}
+
+/** Validate one pool member (`skills` / `mcp`). */
+function validateMember(raw, what, { version, kind }) {
+  requireObject(raw, what)
+  optionalBoolean(raw.enabled, `${what}.enabled`)
+  requireNameList(raw.modes, `${what}.modes`)
+  requirePathList(raw.workspaces, `${what}.workspaces`)
+  optionalStringField(raw.installedAt, `${what}.installedAt`, 64)
+  if (version === STATE_VERSION) validateInheritance(raw, what)
+  if (kind === 'skill') {
+    optionalStringField(raw.sourceId, `${what}.sourceId`, 128)
+    optionalStringField(raw.digest, `${what}.digest`, 128)
+  }
+  if (kind === 'mcp') {
+    optionalStringField(raw.description, `${what}.description`, DESCRIPTION_LIMIT)
+    if (raw.definition !== undefined) validateDefinition(raw.definition, `${what}.definition`)
+  }
+}
+
+/** Validate one member map. */
+function validateMembers(raw, what, options) {
+  requireObject(raw, what)
+  for (const [key, value] of Object.entries(raw)) {
+    if (cleanName(key) !== key) invalidDocument(`${what} contains an invalid member key`)
+    validateMember(value, `${what}.${key}`, options)
+  }
+}
+
+/** Validate the optional `lastCheck` record of a Git source. */
+function validateLastCheck(raw, what) {
+  requireObject(raw, what)
+  if (!CHECK_STATUSES.includes(raw.status)) invalidDocument(`${what}.status is unsupported`)
+  for (const key of ['at', 'remote', 'error']) optionalStringField(raw[key], `${what}.${key}`, 1024)
+}
+
+/** Validate one source record. */
+function validateSource(raw, key, what) {
+  requireObject(raw, what)
+  if (typeof raw.id !== 'string' || cleanName(raw.id) !== raw.id || raw.id !== key) {
+    invalidDocument(`${what}.id must be a valid name matching its map key`)
+  }
+  if (!SOURCE_KINDS.includes(raw.kind)) invalidDocument(`${what}.kind is unsupported`)
+  optionalStringField(raw.label, `${what}.label`, 160)
+  if (raw.skills !== undefined) requireNameList(raw.skills, `${what}.skills`)
+  if (raw.excluded !== undefined) requireNameList(raw.excluded, `${what}.excluded`)
+  optionalStringField(raw.digest, `${what}.digest`, 128)
+  optionalStringField(raw.createdAt, `${what}.createdAt`, 64)
+  if (raw.kind !== 'git') return
+  if (deriveGit(raw) === null) invalidDocument(`${what} does not name a usable Git repository`)
+  if (raw.provider !== undefined && !GIT_PROVIDERS.includes(raw.provider)) invalidDocument(`${what}.provider is unsupported`)
+  for (const sub of ['url', 'project', 'branch', 'subdir', 'sha', 'tokenCredential']) {
+    optionalStringField(raw[sub], `${what}.${sub}`, 2048)
+  }
+  if (raw.lastCheck !== undefined) validateLastCheck(raw.lastCheck, `${what}.lastCheck`)
+}
+
+/** Validate the `sources` map. */
+function validateSources(raw) {
+  requireObject(raw, 'sources')
+  for (const [key, value] of Object.entries(raw)) validateSource(value, key, `sources.${key}`)
+}
+
+/** Validate one group record (`repo:<project>` / `import:<sourceId>`). */
+function validateGroup(raw, key, what) {
+  requireObject(raw, what)
+  if (raw.key !== undefined && raw.key !== key) invalidDocument(`${what}.key must match its map key`)
+  if (raw.kind !== undefined && !GROUP_KINDS.includes(raw.kind)) invalidDocument(`${what}.kind is unsupported`)
+  optionalBoolean(raw.enabled, `${what}.enabled`)
+  requireNameList(raw.modes, `${what}.modes`)
+  requirePathList(raw.workspaces, `${what}.workspaces`)
+  if (typeof key !== 'string' || !(key.startsWith('repo:') || key.startsWith('import:')) || key.length <= 5 || key.length > 512) {
+    invalidDocument(`${what} has an invalid group key`)
+  }
+  if (raw.kind !== undefined && !key.startsWith(`${raw.kind}:`)) invalidDocument(`${what}.kind does not match its key`)
+}
+
+/** Validate the `groups` map. */
+function validateGroups(raw) {
+  requireObject(raw, 'groups')
+  for (const [key, value] of Object.entries(raw)) validateGroup(value, key, `groups.${key}`)
+}
+
+/**
+ * Validate a stored document before it is trusted for gating.
+ *
+ * `normalizeState` is deliberately lenient for pure migration/write helpers;
+ * reading a file is different: silently repairing a damaged document can widen
+ * what an Agent may reach. This function accepts exactly the complete v4 shape
+ * (and the v3 shape the explicit migration understands) and rejects anything it
+ * would otherwise have to invent, drop, or reinterpret.
+ *
+ * @param {unknown} raw - parsed JSON document.
+ * @returns {object} normalized v4 document.
+ * @throws {StateReadError} when the document is invalid or unsupported.
+ */
+export function normalizeReadableState(raw) {
+  if (!isObject(raw)) {
+    throw new StateReadError('resource-pool/state-not-object', 'state file is not a JSON object; refusing to overwrite or use it')
+  }
+  if (raw.version === LEGACY_VERSION) {
+    validateSettings(raw.settings, { requireAll: false })
+    validateMembers(raw.skills, 'skills', { version: LEGACY_VERSION, kind: 'skill' })
+    validateMembers(raw.mcp, 'mcp', { version: LEGACY_VERSION, kind: 'mcp' })
+    validateSources(raw.sources)
+    return normalizeState(migrateV3(raw))
+  }
+  if (raw.version !== STATE_VERSION) {
+    throw new StateReadError(
+      'resource-pool/state-unsupported-version',
+      `state file uses unsupported version ${String(raw.version)}; refusing to overwrite or use it`,
+    )
+  }
+  for (const section of STATE_SECTIONS) {
+    if (!isObject(raw[section])) invalidDocument(`missing or invalid "${section}" section`)
+  }
+  validateSettings(raw.settings, { requireAll: true })
+  validateMembers(raw.skills, 'skills', { version: STATE_VERSION, kind: 'skill' })
+  validateMembers(raw.mcp, 'mcp', { version: STATE_VERSION, kind: 'mcp' })
+  validateSources(raw.sources)
+  validateGroups(raw.groups)
+  return normalizeState(raw)
+}
+
+/**
  * Validate the document an update mutator returned.
  *
  * `normalizeState` treats anything that is not a complete v4 document as an
@@ -784,19 +1007,68 @@ export class StateStore {
     // Marks the async context of a task currently running on `writeChain`, so a
     // nested write/update can be rejected instead of waiting on itself forever.
     this.taskContext = new AsyncLocalStorage()
+    // Whether this Store instance has ever successfully read or written the
+    // document. A later ENOENT is then a failure, not a fresh first run. A new
+    // process cannot distinguish a deleted file from a genuine first run; that
+    // boundary is documented in README/CONTRACTS.
+    this.everLoaded = false
+    // Whether the path was ever observed to exist (even if its bytes failed to
+    // parse). Deleting it afterwards is still abnormal.
+    this.everObserved = false
   }
 
-  /** Read the document, caching the normalized result. */
+  /**
+   * Decode and validate one state text.
+   *
+   * @param {string} text - raw file contents.
+   * @returns {object} normalized v4 document.
+   * @throws {StateReadError} when the bytes are not a readable state document.
+   */
+  #decode(text) {
+    let raw
+    try {
+      raw = JSON.parse(text)
+    } catch {
+      throw new StateReadError('resource-pool/state-invalid-json', 'state file is not valid JSON; refusing to overwrite or use it')
+    }
+    const state = normalizeReadableState(raw)
+    this.everLoaded = true
+    return state
+  }
+
+  /**
+   * Read the document, caching the normalized result.
+   *
+   * A missing file is a valid first run only until this Store has seen the
+   * document. Every other failure throws a {@link StateReadError}; returning
+   * defaults here would silently widen the pool (an empty pool does not gate).
+   *
+   * @param {{fresh?: boolean}} [options] - force a disk read.
+   * @returns {Promise<object>} normalized v4 document.
+   * @throws {StateReadError} when the file is missing after a successful read,
+   *   unreadable, corrupt, unsupported or semantically invalid.
+   */
   async read({ fresh = false } = {}) {
     if (!fresh && this.cached !== undefined) return this.cached
-    let raw = null
+    let text
     try {
-      raw = JSON.parse(await readFile(this.file, 'utf8'))
+      text = await readFile(this.file, 'utf8')
     } catch (error) {
-      if (error?.code !== 'ENOENT') this.logger?.warn?.('[skill-pool] state unreadable; starting from defaults')
-      raw = null
+      if (error?.code !== 'ENOENT') {
+        this.everObserved = true
+        throw new StateReadError('resource-pool/state-unreadable', 'state file could not be read; refusing to overwrite or use it')
+      }
+      if (this.everLoaded || this.everObserved) {
+        throw new StateReadError(
+          'resource-pool/state-missing',
+          'state file disappeared after it was known to exist; refusing to treat it as a first run',
+        )
+      }
+      this.cached = defaultState()
+      return this.cached
     }
-    this.cached = normalizeState(raw)
+    this.everObserved = true
+    this.cached = this.#decode(text)
     return this.cached
   }
 
@@ -836,10 +1108,12 @@ export class StateStore {
    * Read the document for a queued read-modify-write, failing instead of
    * guessing.
    *
-   * The public `read()` keeps its lenient fallback for compatibility, but an
-   * update is about to overwrite the file: a JSON parse error or an I/O error
-   * must abort the save instead of replacing credential-bearing state with
-   * defaults. Only a missing file (ENOENT) legitimately starts from defaults.
+   * An update is about to overwrite the file, so it uses the same fail-closed
+   * validation as `read()`: a JSON parse error, unsupported version, semantic
+   * invalidity or I/O error must abort the save instead of replacing
+   * credential-bearing state with defaults. Only a missing file (ENOENT)
+   * legitimately starts from defaults, and only before this store has observed
+   * the document.
    *
    * @returns {Promise<object>} normalized on-disk document.
    */
@@ -849,21 +1123,20 @@ export class StateStore {
       text = await readFile(this.file, 'utf8')
     } catch (error) {
       if (error?.code === 'ENOENT') {
+        if (this.everLoaded || this.everObserved) {
+          throw new StateReadError(
+            'resource-pool/state-missing',
+            'state file disappeared after it was known to exist; refusing to overwrite it',
+          )
+        }
         this.cached = defaultState()
         return this.cached
       }
-      throw new Error('state file could not be read; refusing to overwrite it', { cause: error })
+      this.everObserved = true
+      throw new StateReadError('resource-pool/state-unreadable', 'state file could not be read; refusing to overwrite it')
     }
-    let raw
-    try {
-      raw = JSON.parse(text)
-    } catch (error) {
-      throw new Error('state file is not valid JSON; refusing to overwrite it', { cause: error })
-    }
-    if (!isObject(raw)) {
-      throw new Error('state file is not a JSON object; refusing to overwrite it')
-    }
-    this.cached = normalizeState(raw)
+    this.everObserved = true
+    this.cached = this.#decode(text)
     return this.cached
   }
 
@@ -884,12 +1157,16 @@ export class StateStore {
     await writeFile(temporary, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
     await rename(temporary, this.file)
     this.cached = normalized
+    this.everLoaded = true
+    this.everObserved = true
     return normalized
   }
 
-  /** Persist a normalized document, queued behind earlier writes/updates. */
+  /** Persist a complete, readable document, queued behind earlier writes/updates. */
   async write(state) {
-    const normalized = normalizeState(state)
+    // Validate before queueing: a direct write must not be able to replace a
+    // credential-bearing document with a fragment or a semantically broken one.
+    const normalized = normalizeReadableState(state)
     return this.#enqueue(() => this.#persist(normalized))
   }
 
@@ -912,7 +1189,9 @@ export class StateStore {
     return this.#enqueue(async () => {
       const current = await this.#readStrict()
       const next = assertStateDocument(await mutate(current))
-      return this.#persist(normalizeState(next))
+      // Validate the mutation's result with the same fail-closed rules as a
+      // disk read: never persist a document we would refuse to read back.
+      return this.#persist(normalizeReadableState(next))
     })
   }
 }

@@ -24,6 +24,7 @@ import {
   normalizeItemName,
   removeItem,
   removeSource,
+  StateReadError,
   upsertGroup,
   upsertItem,
   upsertSource,
@@ -69,6 +70,17 @@ function json(value, status = 200) {
 /** Failure response helper. */
 function failure(code, message, status = 400) {
   return json({ ok: false, error: { code, message } }, status)
+}
+
+/**
+ * Map one route failure, preserving the explicit state-read code when the
+ * document could not be trusted. A corrupt file must not be reported as a
+ * generic import/update failure: the panel's error should tell the user to
+ * repair the state file.
+ */
+function stateFailure(error, fallbackCode, fallbackStatus = 500) {
+  if (error instanceof StateReadError) return failure(error.code, error.message, 500)
+  return failure(fallbackCode, error instanceof Error ? error.message : String(error), fallbackStatus)
 }
 
 /** Whether a value is a plain object (not an array, not null). */
@@ -152,7 +164,9 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
   const probeTimeoutMs = Number.isFinite(mountProbe?.timeoutMs) ? mountProbe.timeoutMs : DEFAULT_PROBE_TIMEOUT_MS
   const probeIntervalMs = Number.isFinite(mountProbe?.intervalMs) ? mountProbe.intervalMs : DEFAULT_PROBE_INTERVAL_MS
 
-  const readState = () => store.read()
+  // Always read the file for the panel: a cached document would hide an
+  // external edit (including corruption) until the process restarted.
+  const readState = () => store.read({ fresh: true })
   const skillsRoot = () => librarySkillsRoot()
 
   /** Committed mutation response: file is already on disk, re-apply, then answer. */
@@ -341,6 +355,10 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       const inventory = await buildInventory(ctx, { state, libraryRoot: skillsRoot() })
       return json({ ok: true, meta, state: publicState(state), inventory, mounts: mounts.status() })
     } catch (error) {
+      if (error instanceof StateReadError) {
+        logger?.warn?.(`[resource-pool] overview refused: ${error.message}`)
+        return failure(error.code, error.message, 500)
+      }
       logger?.warn?.(`[resource-pool] overview failed: ${error instanceof Error ? error.message : String(error)}`)
       return failure('resource-pool/read-failed', '无法读取技能池状态', 500)
     }
@@ -412,6 +430,9 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     if (kind === '') return failure('resource-pool/bad-kind', "kind 必须是 'skill' 或 'mcp'")
     const name = normalizeItemName(body.name)
     if (name.length === 0) return failure('resource-pool/bad-name', '缺少合法的 name')
+    // Refuse before deleting skill files or a Loader row: a corrupt state file
+    // must not turn a failed remove into partial data loss.
+    await readState()
 
     const removed = { kind, name }
     if (kind === 'skill') {
@@ -437,7 +458,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         })
         return committed(state, { removed })
       } catch (error) {
-        return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+        return stateFailure(error, 'resource-pool/save-failed', 500)
       }
     }
 
@@ -455,7 +476,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       const state = await store.update((current) => removeItem(current, 'mcp', name))
       return committed(state, { removed })
     } catch (error) {
-      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+      return stateFailure(error, 'resource-pool/save-failed', 500)
     }
   }
 
@@ -468,7 +489,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       const state = await store.update((current) => applySettingsPatch(current, patch))
       return committed(state)
     } catch (error) {
-      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+      return stateFailure(error, 'resource-pool/save-failed', 500)
     }
   }
 
@@ -494,7 +515,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       const state = await store.update((current) => upsertGroup(current, patch))
       return committed(state)
     } catch (error) {
-      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+      return stateFailure(error, 'resource-pool/save-failed', 500)
     }
   }
 
@@ -556,7 +577,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         return next
       })
     } catch (error) {
-      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+      return stateFailure(error, 'resource-pool/save-failed', 500)
     }
 
     const servers = []
@@ -581,6 +602,8 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     const body = await readBody(request)
     const serverName = textOf(body.server)
     if (serverName.length === 0) return failure('resource-pool/bad-server', '缺少 server')
+    // Validate state before removing the Loader row.
+    await readState()
     let result
     try {
       result = await removeMcpServer(ctx, serverName)
@@ -592,7 +615,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       const state = await store.update((current) => removeItem(current, 'mcp', result.serverName))
       return committed(state)
     } catch (error) {
-      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+      return stateFailure(error, 'resource-pool/save-failed', 500)
     }
   }
 
@@ -601,6 +624,8 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     const body = await readBody(request)
     const files = uploadFiles(body.files)
     if (files.length === 0) return failure('resource-pool/bad-files', '缺少 files（[{path, contentBase64}]）')
+    // Do not install files if the membership update cannot be read back later.
+    await readState()
     let scope
     try {
       scope = readScope(body.scope)
@@ -638,7 +663,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         failures: result.failures,
       })
     } catch (error) {
-      return failure('resource-pool/upload-failed', error instanceof Error ? error.message : String(error), 400)
+      return stateFailure(error, 'resource-pool/upload-failed', 400)
     }
   }
 
@@ -648,6 +673,8 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     if (typeof body.archiveBase64 !== 'string' || body.archiveBase64.length === 0) {
       return failure('resource-pool/bad-archive', '缺少 archiveBase64')
     }
+    // Validate before unpacking anything to disk.
+    await readState()
     let scope
     try {
       scope = readScope(body.scope)
@@ -684,7 +711,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         failures: result.failures,
       })
     } catch (error) {
-      return failure('resource-pool/zip-failed', error instanceof Error ? error.message : String(error), 400)
+      return stateFailure(error, 'resource-pool/zip-failed', 400)
     }
   }
 
@@ -693,6 +720,8 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     const body = await readBody(request)
     const url = textOf(body.url)
     if (url.length === 0) return failure('resource-pool/bad-url', '缺少仓库 URL')
+    // Validate before downloading/installing anything to disk.
+    await readState()
     // Empty branch/subdir lets the library fall back to what the pasted URL encodes
     // (GitLab's '/-/tree/<branch>/<subdir>'), then to 'main'.
     const branch = textOf(body.branch)
@@ -746,7 +775,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         failures: result.failures,
       })
     } catch (error) {
-      return failure('resource-pool/git-failed', error instanceof Error ? error.message : String(error), 400)
+      return stateFailure(error, 'resource-pool/git-failed', 400)
     }
   }
 
@@ -840,7 +869,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       })
       return committed(state, { results })
     } catch (error) {
-      return failure('resource-pool/check-failed', error instanceof Error ? error.message : String(error), 500)
+      return stateFailure(error, 'resource-pool/check-failed', 500)
     }
   }
 
@@ -922,7 +951,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         changed,
       })
     } catch (error) {
-      return failure('resource-pool/update-failed', error instanceof Error ? error.message : String(error), 400)
+      return stateFailure(error, 'resource-pool/update-failed', 400)
     }
   }
 
@@ -955,26 +984,42 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       })
       return committed(state, { removed, skipped })
     } catch (error) {
-      return failure('resource-pool/delete-failed', error instanceof Error ? error.message : String(error), 400)
+      return stateFailure(error, 'resource-pool/delete-failed', 400)
+    }
+  }
+
+  /**
+   * Turn a fail-closed state read into an explicit 500 for the panel instead of
+   * letting it fall through as a generic internal error. Reads never write.
+   */
+  const guarded = (handler) => async (request) => {
+    try {
+      return await handler(request)
+    } catch (error) {
+      if (error instanceof StateReadError) {
+        logger?.warn?.(`[resource-pool] request refused: ${error.message}`)
+        return failure(error.code, error.message, 500)
+      }
+      throw error
     }
   }
 
   const routes = [
-    ['', ['GET'], overview],
-    ['/item', ['POST'], itemRoute],
-    ['/item/remove', ['POST'], itemRemoveRoute],
-    ['/settings', ['POST'], settingsRoute],
-    ['/group', ['POST'], groupRoute],
-    ['/resolve', ['GET'], resolveRoute],
-    ['/skill/upload', ['POST'], skillUploadRoute],
-    ['/skill/zip', ['POST'], skillZipRoute],
-    ['/source/git', ['POST'], sourceGitRoute],
-    ['/source/check', ['POST'], sourceCheckRoute],
-    ['/source/update', ['POST'], sourceUpdateRoute],
-    ['/source/delete', ['POST'], sourceDeleteRoute],
-    ['/mcp/import', ['POST'], mcpImportRoute],
-    ['/mcp/remove', ['POST'], mcpRemoveRoute],
-    ['/mounts', ['GET'], mountsRoute],
+    ['', ['GET'], guarded(overview)],
+    ['/item', ['POST'], guarded(itemRoute)],
+    ['/item/remove', ['POST'], guarded(itemRemoveRoute)],
+    ['/settings', ['POST'], guarded(settingsRoute)],
+    ['/group', ['POST'], guarded(groupRoute)],
+    ['/resolve', ['GET'], guarded(resolveRoute)],
+    ['/skill/upload', ['POST'], guarded(skillUploadRoute)],
+    ['/skill/zip', ['POST'], guarded(skillZipRoute)],
+    ['/source/git', ['POST'], guarded(sourceGitRoute)],
+    ['/source/check', ['POST'], guarded(sourceCheckRoute)],
+    ['/source/update', ['POST'], guarded(sourceUpdateRoute)],
+    ['/source/delete', ['POST'], guarded(sourceDeleteRoute)],
+    ['/mcp/import', ['POST'], guarded(mcpImportRoute)],
+    ['/mcp/remove', ['POST'], guarded(mcpRemoveRoute)],
+    ['/mounts', ['GET'], guarded(mountsRoute)],
   ]
 
   // ------------------------------------------------------------- transport
