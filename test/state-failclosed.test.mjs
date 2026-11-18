@@ -2254,3 +2254,52 @@ test('a healthy state with no visible MCP tools is normal, not a degraded noVisi
     await rm(dir, { recursive: true, force: true })
   }
 })
+
+
+test('state failure after an explicit mcpGate:false does not claim a retained restriction layer', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    const off = validState()
+    off.settings.mcpGate = false
+    await store.write(off)
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(activeLayers(agent), 0)
+
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    const result = await harness.activation.applyToAgent(agent, { force: true, conservative: true })
+    assert.equal(result.ok, false)
+    assert.equal(result.code, 'resource-pool/activation-degraded')
+    assert.equal(result.retainedOldGate, false)
+    assert.equal(result.conservative, false)
+    assert.equal(result.underRestricted, false)
+    assert.match(result.message, /no prior MCP restriction layer/)
+    assert.deepEqual(activeDeny(agent), [])
+    assert.equal(agent.sections.length, 0)
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('state failure with a real previous restriction reports retainedOldGate=true', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const harness = makeActivation(store)
+  try {
+    await store.write(validState())
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(activeLayers(agent), 2)
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    const result = await harness.activation.applyToAgent(agent, { force: true, conservative: true })
+    assert.equal(result.ok, false)
+    assert.equal(result.retainedOldGate, true)
+    assert.equal(result.conservative, false)
+    assert.match(result.message, /previous MCP restriction layer retained/)
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})

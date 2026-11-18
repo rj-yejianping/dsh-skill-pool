@@ -247,8 +247,9 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   - `conservative`：已进入保守 deny 模式（可同时 under/over）。
   - `noVisible`：仅在异常降级、无可见 MCP 工具且未安装新 deny 时置位；健康的空池/首次空工具面
     是正常状态，不产生该 flag 或 warning。
-  - `retainedOldGate` / `fallbackFailed`：激活失败保留旧限制 / 保守层安装失败（结构失败也会记录，
-    不会只落成 generic error）。
+  - `retainedOldGate` / `fallbackFailed`：激活失败时**确实存在**旧 restrict 层才置位；
+    明确 `mcpGate:false`（无 restrict 层）时返回 `retainedOldGate=false`，提示“没有可保留的旧 MCP
+    限制层”，不触发 conservative。保守层结构安装失败记 `fallbackFailed`，不会只落成 generic error。
   同一个 Agent 可同时 under+over；跨 Agent 的各维度独立计数，不会被优先级吞掉。HTTP warning 根据
   这些计数与固定脱敏文案组合显示实际组合；仍返回 200 和已提交 state；面板 warning 需手动关闭。
 - **空清单/零层**：没有任何可见 MCP 工具时，不会宣称安装了新 deny；会保留旧层并 reported degraded。
@@ -302,14 +303,14 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，159 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，161 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 159/159；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 161/161；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 5/5；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |

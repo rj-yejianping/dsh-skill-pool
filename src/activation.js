@@ -339,11 +339,27 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
             }
           }
         }
+        if (hasRestrictLayer) {
+          return {
+            ok: false,
+            code: 'resource-pool/activation-degraded',
+            message: 'activation failed; previous MCP restriction layer retained',
+            retainedOldGate: true,
+            underRestricted: false,
+            overRestricted: false,
+            conservative: false,
+            noVisibleTools: false,
+          }
+        }
         return {
           ok: false,
           code: 'resource-pool/activation-degraded',
-          message: 'activation failed; previous gate retained',
-          retainedOldGate: true,
+          message: 'activation failed; no prior MCP restriction layer to retain',
+          retainedOldGate: false,
+          underRestricted: false,
+          overRestricted: false,
+          conservative: false,
+          noVisibleTools: false,
         }
       }
       if (conservative) {
