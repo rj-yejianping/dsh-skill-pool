@@ -150,3 +150,70 @@ test('the initial load is applied unchanged', () => {
   })
   assert.equal(next, loaded)
 })
+
+test('a draft for a member absent from the authoritative document is never re-added', () => {
+  const current = {
+    state: documentWith('Draft for a member deleted elsewhere'),
+    inventory: { mcp: [] },
+    mounts: {},
+    meta: { version: 'old' },
+  }
+  const authoritative = documentWith('Unused server purpose')
+  delete authoritative.mcp.kb
+  const loaded = {
+    state: authoritative,
+    inventory: { mcp: [{ server: 'private' }] },
+    mounts: {},
+    meta: { version: 'new' },
+  }
+
+  const next = plugin.boardState.applyLoadedBoard(current, loaded, {
+    startedRevision: 9,
+    currentRevision: 9,
+    drafts: new Map([['mcp:kb', draftOf('Draft for a member deleted elsewhere')]]),
+  })
+
+  assert.equal(Object.hasOwn(next.state.mcp, 'kb'), false, 'no phantom row is resurrected')
+  assert.equal(next.state.mcp.private.enabled, true)
+  assert.deepEqual(next.inventory, loaded.inventory)
+})
+
+test('orphaned drafts are exposed with their unsaved entry for a visible warning', () => {
+  const authoritative = documentWith('Server purpose')
+  delete authoritative.mcp.kb
+  authoritative.skills['still-here'] = { enabled: true, modes: ['a'], workspaces: [] }
+  const orphans = plugin.boardState.orphanedDrafts(authoritative, new Map([
+    ['mcp:kb', draftOf('Unsaved knowledge base text')],
+    ['skill:still-here', { enabled: false, modes: ['a'], workspaces: [] }],
+  ]))
+
+  assert.equal(orphans.length, 1)
+  assert.equal(orphans[0].key, 'mcp:kb')
+  assert.equal(orphans[0].entry.description, 'Unsaved knowledge base text')
+})
+
+test('a save response cannot resurrect a member deleted meanwhile', () => {
+  const current = documentWith('Fresh local state')
+  delete current.mcp.kb
+  const canonical = { enabled: true, modes: ['a'], workspaces: [], description: 'Stale save result' }
+  const next = plugin.boardState.applyItemSave(current, 'mcp', 'kb', canonical)
+  assert.equal(next, current, 'the removed row is not re-added by its old save response')
+  assert.equal(Object.hasOwn(next.mcp, 'kb'), false)
+})
+
+test('a save response still updates an existing member', () => {
+  const current = documentWith('Old purpose')
+  const canonical = { enabled: true, modes: ['a'], workspaces: [], description: 'Saved purpose' }
+  const next = plugin.boardState.applyItemSave(current, 'mcp', 'kb', canonical)
+  assert.equal(next.mcp.kb.description, 'Saved purpose')
+  assert.equal(next.mcp.private.enabled, true)
+})
+
+test('the discarded-draft warning preserves the unsaved text visibly', () => {
+  const message = plugin.boardState.draftLossMessage([
+    { key: 'mcp:kb', entry: { enabled: true, modes: ['a'], workspaces: [], description: 'Unsaved knowledge base text' } },
+  ])
+  assert.ok(message.includes('kb'), message)
+  assert.ok(message.includes('Unsaved knowledge base text'), message)
+  assert.ok(message.toLowerCase().includes('unsaved'), message)
+})

@@ -74,6 +74,7 @@ window.__ModuleLoader__.load({
         rowDescriptionHint: '会发送给 AI，请勿填写凭据或连接信息。',
         rowDescriptionPlaceholder: '一句话说明这个 MCP 连接能做什么',
         descriptionCount: '{count}/300',
+        draftDiscarded: '以下未保存的修改因为对应资源已在别处删除而被丢弃；请先复制需要保留的内容：',
         allModes: '全部模式',
         allWorkspaces: '全部工作区',
         editConditions: '设置条件',
@@ -280,6 +281,7 @@ window.__ModuleLoader__.load({
         rowDescriptionHint: 'Sent to the AI. Do not include credentials or connection details.',
         rowDescriptionPlaceholder: 'One line about what this MCP connection is for',
         descriptionCount: '{count}/300',
+        draftDiscarded: 'These unsaved edits were discarded because the matching resource was deleted elsewhere; copy anything you need to keep:',
         allModes: 'All modes',
         allWorkspaces: 'All workspaces',
         editConditions: 'Conditions',
@@ -902,19 +904,55 @@ window.__ModuleLoader__.load({
       return { ...state, [key]: next }
     }
 
+    /** Split a `kind:name` row key into its namespace and member name. */
+    function rowKeyOf(key) {
+      if (typeof key !== 'string') return null
+      if (key.startsWith('mcp:')) return { kind: MCP, name: key.slice(4) }
+      if (key.startsWith('skill:')) return { kind: 'skill', name: key.slice(6) }
+      return null
+    }
+
+    /** Whether the loaded document still contains this row. */
+    function hasLoadedMember(loadedState, key) {
+      const row = rowKeyOf(key)
+      if (row === null) return false
+      const bucket = row.kind === MCP ? loadedState.mcp : loadedState.skills
+      return bucket !== null && typeof bucket === 'object' && Object.hasOwn(bucket, row.name)
+    }
+
+    /**
+     * Drafts whose member is gone from the authoritative document.
+     *
+     * The panel surfaces these as a visible warning (with the unsaved text)
+     * instead of silently discarding them; they must never be rendered as rows.
+     */
+    function orphanedDrafts(loadedState, drafts) {
+      const out = []
+      if (!drafts || typeof drafts[Symbol.iterator] !== 'function') return out
+      for (const [key, entry] of drafts) {
+        if (rowKeyOf(key) === null || entry === null || typeof entry !== 'object') continue
+        if (!hasLoadedMember(loadedState, key)) out.push({ key, entry })
+      }
+      return out
+    }
+
     /**
      * Overlay unsaved row drafts on a document loaded from the Host.
      *
      * A debounced/in-flight/failed save is a local draft that the server does
-     * not know yet; a GET response must not make the user's text disappear.
+     * not know yet; a GET response must not make the user's text disappear. A
+     * draft whose member is gone is skipped (never turned into a phantom row).
      */
     function mergeRowDrafts(loadedState, drafts) {
       let next = loadedState
       if (!drafts || typeof drafts[Symbol.iterator] !== 'function') return next
       for (const [key, entry] of drafts) {
-        if (typeof key !== 'string' || entry === null || typeof entry !== 'object') continue
-        if (key.startsWith('mcp:')) next = withEntry(next, MCP, key.slice(4), entry)
-        else if (key.startsWith('skill:')) next = withEntry(next, 'skill', key.slice(6), entry)
+        const row = rowKeyOf(key)
+        if (row === null || entry === null || typeof entry !== 'object') continue
+        // Never resurrect a member the authoritative document no longer has:
+        // another tab may have deleted it while this draft was being typed.
+        if (!hasLoadedMember(loadedState, key)) continue
+        next = withEntry(next, row.kind, row.name, entry)
       }
       return next
     }
@@ -938,6 +976,39 @@ window.__ModuleLoader__.load({
       const refreshed = { ...current, inventory: loaded.inventory, mounts: loaded.mounts, meta: loaded.meta }
       if (options.startedRevision !== options.currentRevision) return refreshed
       return { ...loaded, state: mergeRowDrafts(loaded.state, options.drafts) }
+    }
+
+    /**
+     * Apply one save response to the current document.
+     *
+     * A save response is a snapshot from the moment that write completed; if the
+     * member was deleted in another tab before the response was rendered, adding
+     * it back would create a phantom row that every later save rejects with 400.
+     */
+    function applyItemSave(currentState, kind, name, canonical) {
+      const bucket = kind === MCP ? currentState.mcp : currentState.skills
+      if (bucket === null || typeof bucket !== 'object' || !Object.hasOwn(bucket, name)) return currentState
+      // No canonical member means no safe partial update; never fall back to the
+      // response's whole document, which may still contain removed rows.
+      return canonical ? withEntry(currentState, kind, name, canonical) : currentState
+    }
+
+    /** Visible warning text for drafts that lost their member while unsaved. */
+    function draftLossMessage(orphans) {
+      const parts = orphans.map((orphan) => {
+        const row = rowKeyOf(orphan.key)
+        const entry = asObject(orphan.entry)
+        const purpose = typeof entry.description === 'string' ? entry.description : ''
+        const text = purpose.length > 0
+          ? purpose
+          : JSON.stringify({
+              enabled: entry.enabled !== false,
+              modes: asStringArray(entry.modes),
+              workspaces: asStringArray(entry.workspaces),
+            })
+        return `${row ? row.name : orphan.key}: ${text}`
+      })
+      return `${TEXT.draftDiscarded} ${parts.join(' | ')}`
     }
 
     function summarizeList(values, allLabel, labeler, limit) {
@@ -2257,7 +2328,8 @@ window.__ModuleLoader__.load({
                 const canonical = job.kind === MCP ? nextState.mcp[job.name] : nextState.skills[job.name]
                 setBoard((current) => {
                   if (!current) return current
-                  return { ...current, state: canonical ? withEntry(current.state, job.kind, job.name, canonical) : nextState }
+                  const state = applyItemSave(current.state, job.kind, job.name, canonical)
+                  return state === current.state ? current : { ...current, state }
                 })
               }
             } catch (cause) {
@@ -2357,10 +2429,21 @@ window.__ModuleLoader__.load({
               mounts: normalizeMount(payload.mounts || payload.mount),
               meta: asObject(payload.meta),
             }
+            const currentRevision = boardRevisionRef.current
+            if (startedRevision === currentRevision) {
+              // The authoritative document no longer has these rows. Never show
+              // them again; surface their unsaved text instead of dropping it
+              // silently.
+              const orphans = orphanedDrafts(loaded.state, draftsRef.current)
+              if (orphans.length > 0) {
+                for (const orphan of orphans) draftsRef.current.delete(orphan.key)
+                setError(draftLossMessage(orphans))
+              }
+            }
             setBoard((current) =>
               applyLoadedBoard(current, loaded, {
                 startedRevision,
-                currentRevision: boardRevisionRef.current,
+                currentRevision,
                 drafts: draftsRef.current,
               }),
             )
@@ -4569,7 +4652,7 @@ window.__ModuleLoader__.load({
       inject: ['slots'],
       // Pure reconciliation used by `loadBoard`; exposed so the Node test can
       // exercise the production function without a browser renderer.
-      boardState: { applyLoadedBoard },
+      boardState: { applyLoadedBoard, applyItemSave, draftLossMessage, orphanedDrafts },
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(

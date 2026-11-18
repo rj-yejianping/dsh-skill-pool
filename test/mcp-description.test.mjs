@@ -23,7 +23,7 @@ const SECRET_ENV = 'env-fixture-not-a-real-token'
 const SECRET_URL = 'url-fixture-not-a-real-token'
 const SECRETS = [SECRET_HEADER, SECRET_ENV, SECRET_URL, 'header-fixture-not-a-real-token']
 
-/** Fixture document: one described MCP member, one without a purpose summary. */
+/** Fixture document: two described MCP members (HTTP and stdio). */
 function fixtureState() {
   return normalizeState({
     version: 4,
@@ -504,6 +504,7 @@ test('a purpose breakout stays inert data (en)', async () => {
     assert.ok(text.includes('not instructions'))
     assert.ok(text.includes('untrusted'))
     assert.ok(text.includes('does not make the content safe'))
+    for (const secret of SECRETS) assert.equal(text.includes(secret), false)
 
     const raw = purposeJsonOf(text, 'Purpose data: ')
     assert.equal(/[\u0000-\u001f]/.test(raw), false, raw)

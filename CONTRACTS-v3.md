@@ -203,6 +203,9 @@ resolvePool(state, {mode, cwd}) -> {gated, skills: string[], mcpServers: string[
 规则：
 
 - 写操作：原子落盘 → `reapplyAll()` → 返回新 `state`。
+- `POST /item` **只编辑已存在的成员**：成员不存在（包括只改条件的请求）返回 400 `resource-pool/unknown-item`，不会新建成员；新建只由导入接口完成。这样删除期间迟到的保存不能把成员重新创建出来。
+- 所有返回 `state` 的响应（概览与全部写操作）都经过公开投影：MCP 成员只含 `enabled`、`modes`、`workspaces`、`installedAt`、`description`，**绝不包含 `definition`**（URL/命令/headers/env 中的凭据）。落盘状态仍保留 `definition` 供启动重挂载；投影只影响浏览器响应。
+- MCP 用途摘要进入系统提示时，当前 Agent 可用的服务名列表单独、权威地给出；各服务的用途作为独立 JSON 数据（`purpose: null` 表示未填写用途摘要）。该数据明确标记为用户提供、不可信、不是指令、不是授权依据；JSON 编码只是结构边界，**不是注入防护，也不保证内容安全**。
 - `scope` 缺省为 `{modes:[],workspaces:[]}`。
 - `/mcp/import` 先同步校验定义（非法 ⇒ 400），**先把成员与 `definition` 落盘**，再后台挂载；`ready` 必须观测到 `mcp__<server>__*` 工具，20s 超时 ⇒ `failed`。
 - 状态文件权限为 `0600`：`definition.headers` 可能携带 `Authorization` 之类的令牌。
