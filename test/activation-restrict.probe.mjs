@@ -116,6 +116,9 @@ test('real activation: an all-allowed zero-layer record gets a conservative deny
     const result = await activation.applyToAgent(h.agent, { force: true, conservative: true })
     assert.equal(result.ok, false)
     assert.equal(result.code, 'resource-pool/activation-conservative')
+    assert.equal(result.conservative, true)
+    assert.equal(result.underRestricted, false)
+    assert.equal(result.noVisibleTools, false)
     assert.deepEqual(h.visible(), [], 'kb, other and the new tool are conservatively denied')
 
     activation.disposeAgent(h.agent)
@@ -157,6 +160,8 @@ test('real activation: a raced restrict registration keeps successes and converg
     const incomplete = await activation.applyToAgent(h.agent, { force: true })
     assert.equal(incomplete.ok, false)
     assert.equal(incomplete.code, 'resource-pool/activation-incomplete')
+    assert.equal(incomplete.underRestricted, true)
+    assert.equal(incomplete.overRestricted, true)
     assert.deepEqual(h.visible(), [], 'old and successful layers still hide everything currently registered')
 
     // Re-register the raced tool. Before a retry it is callable: this is the

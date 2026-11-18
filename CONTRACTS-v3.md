@@ -236,7 +236,9 @@ Fail-closed 增量：
 - 已有保守层时，每次显式 `reapplyAll`/preset 重放都重新枚举当前可见 `mcp__*` 并**先注册后释放**，
   不会因为一次空清单就把 `activated` 当成健康激活而永不刷新；
 - `tools.schemas()` 不可用而本次又需要 MCP 门控时视为激活失败，不能当作"没有工具要隐藏"；
-- `reapplyAll()` 返回 `{total, failed, degraded, warnings}`；`warnings` 只含固定/脱敏消息，供 HTTP warning 使用；
+- `reapplyAll()` 返回 `{total, failed, degraded, under, over, conservative, noVisible, retainedOldGate, fallbackFailed, warnings}`；
+  各维度独立计数（同一 Agent 可 under+over，跨 Agent 不互相覆盖）；HTTP 按计数与固定脱敏文案组合，
+  `warnings` 不作为分类依据；
 - 状态错误只影响资源池门控，不改变 MCP resources / server instructions 的既有边界。
 
 ## 6. HTTP API

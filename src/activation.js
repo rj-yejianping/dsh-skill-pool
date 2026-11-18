@@ -272,6 +272,10 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
           ok: false,
           code: 'resource-pool/activation-incomplete',
           message: 'MCP deny is incomplete; a tool whose restrict layer failed may be callable until the next replay',
+          underRestricted: true,
+          overRestricted: record.degraded === true,
+          conservative: false,
+          noVisibleTools: false,
         }
       }
       return record.degraded
@@ -280,8 +284,12 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
             degraded: true,
             code: 'resource-pool/activation-over-restricted',
             message: 'some previously denied tools are not currently visible; old deny layers were retained and may over-restrict',
+            underRestricted: false,
+            overRestricted: true,
+            conservative: false,
+            noVisibleTools: false,
           }
-        : { ok: true }
+        : { ok: true, underRestricted: false, overRestricted: false, conservative: false, noVisibleTools: false }
     } catch (error) {
       const hadActivation = record.activated
       logger?.warn?.(`[resource-pool] activation failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -314,6 +322,8 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
               ok: false,
               code: 'resource-pool/activation-degraded',
               message: 'state unavailable and no prior MCP restriction could be installed',
+              fallbackFailed: true,
+              retainedOldGate: false,
             }
           }
         }
@@ -321,6 +331,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
           ok: false,
           code: 'resource-pool/activation-degraded',
           message: 'activation failed; previous gate retained',
+          retainedOldGate: true,
         }
       }
       if (conservative) {
@@ -461,11 +472,18 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
    */
   const conservativeResult = (agent) => {
     const info = applyConservativeGate(agent)
+    const common = {
+      underRestricted: info.under === true,
+      overRestricted: info.kept === true,
+      conservative: info.visible > 0,
+      noVisibleTools: info.visible === 0,
+    }
     if (info.under) {
       return {
         ok: false,
         code: 'resource-pool/activation-incomplete',
         message: 'state unavailable; conservative MCP deny is incomplete and a failed tool may be callable',
+        ...common,
       }
     }
     if (info.visible === 0) {
@@ -475,12 +493,14 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         message: info.kept
           ? 'state unavailable; no MCP tools visible, previous layers kept, no new deny installed'
           : 'state unavailable; no MCP tools visible, no deny could be installed',
+        ...common,
       }
     }
     return {
       ok: false,
       code: 'resource-pool/activation-conservative',
       message: 'state unavailable; conservative MCP deny applied to visible tools',
+      ...common,
     }
   }
 
@@ -764,16 +784,36 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       }),
     )
     const failed = results.filter((result) => result !== undefined && result.ok === false)
-    const degraded = results.filter((result) => result?.ok === true && result.degraded === true)
+    const count = (key) => results.filter((result) => result?.[key] === true).length
+    const under = count('underRestricted')
+    const over = count('overRestricted')
+    const conservative = count('conservative')
+    const noVisible = count('noVisibleTools')
+    const retainedOldGate = count('retainedOldGate')
+    const fallbackFailed = count('fallbackFailed')
+    const degraded = over
     const seen = new Set()
     const warnings = []
-    for (const result of [...failed, ...degraded]) {
+    for (const result of results) {
+      if (result === undefined || typeof result.code !== 'string' || typeof result.message !== 'string') continue
+      if (result.ok === true && result.degraded !== true) continue
       const key = `${result.code}|${result.message}`
       if (seen.has(key)) continue
       seen.add(key)
       warnings.push({ code: result.code, message: result.message })
     }
-    return { total: live.length, failed: failed.length, degraded: degraded.length, warnings }
+    return {
+      total: live.length,
+      failed: failed.length,
+      degraded,
+      under,
+      over,
+      conservative,
+      noVisible,
+      retainedOldGate,
+      fallbackFailed,
+      warnings,
+    }
   }
 
   /** Release one Agent's registrations. */

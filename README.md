@@ -234,14 +234,20 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   **注册过程中单个 per-tool 失败**时：保留所有旧层 + 已成功的新层，清 signature/保持 degraded；
   下一次非空重放重试并收敛。新 Agent 没有旧授权可依赖时，部分 MCP 覆盖失败仍拒绝创建。
 - **恢复路径**：修复文件后显式保存/重放，等所有相关工具重新可见，会释放旧不可见层并重建精确
-  per-tool 层，degraded 警告随之消失。插件重载会先释放全部层；若状态仍坏则退化为保守层。
+  per-tool 层；服务端后续重放不再返回该 warning，但面板已有的持久 banner 仍需用户手动关闭
+  （不会自动消失）。插件重载会先释放全部层；若状态仍坏则退化为保守层。
   rescope/preset 重放与保存重放走同一逻辑。
-- **degraded 语义**：`reapplyAll` 返回 `failed` 与 `degraded`，二者含义不同：
-  - `activation-incomplete`（under-restriction）：某个 per-tool deny 注册失败，DSH 拒绝未知名；
-    该工具若重新注册，在下一次重放前**可能可调用**。HTTP warning 明确写“部分工具可能仍可调用”，
-    不伪称已完全生效。
-  - `activation-over-restricted`（over-restriction）：保留了暂不可见工具的旧 deny，可能暂时过度限制。
-  `committed` 仍返回 200 和已提交 state，面板显示持久 warning；已提交状态不变。
+- **结构化的 degraded 语义**：`reapplyAll` 返回独立计数
+  `failed / under / over / conservative / noVisible / retainedOldGate / fallbackFailed`，不是只靠
+  一个 `degraded` 或 error 字符串：
+  - `under`（under-restriction）：per-tool deny 注册失败，DSH 拒绝未知名；工具重新注册后、下次
+    重放前**可能可调用**。
+  - `over`（over-restriction）：保留了暂不可见工具的旧 deny，可能暂时过度限制。
+  - `conservative`：已进入保守 deny 模式（可同时 under/over）。
+  - `noVisible`：当前无可见 MCP 工具，未安装新 deny（不宣称已安装）。
+  - `retainedOldGate` / `fallbackFailed`：激活失败保留旧限制 / 保守层安装失败。
+  同一个 Agent 可同时 under+over；跨 Agent 的各维度独立计数，不会被优先级吞掉。HTTP warning 根据
+  这些计数与固定脱敏文案组合显示实际组合；仍返回 200 和已提交 state；面板 warning 需手动关闭。
 - **空清单/零层**：没有任何可见 MCP 工具时，不会宣称安装了新 deny；会保留旧层并 reported degraded。
   零 restrict 层但上次仍要求门控时，读取失败会尝试 conservative deny 当前全部已知 MCP，失败明确
   incomplete，不静默放行；明确 `mcpGate:false` 不覆盖。
@@ -293,14 +299,14 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，151 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，155 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 151/151；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 155/155；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 5/5；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
