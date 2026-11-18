@@ -22,7 +22,8 @@
  * DSH_FEASIBILITY_REQUIRED=1 (npm run verify:feasibility) to turn that absence
  * into a nonzero failure.
  *
- * Run with: node --test test/mcp-feasibility.test.mjs
+ * Run with: node --test test/mcp-feasibility.probe.mjs
+ * (Deliberately not named *.test.mjs: the default npm test suite does not include it.)
  */
 
 import assert from 'node:assert/strict'
@@ -255,6 +256,10 @@ try {
   dsh = await loadDsh()
 } catch (error) {
   dshError = error
+}
+
+if (dshError !== undefined && !REQUIRE_FEASIBILITY) {
+  console.error(`[unverified] feasibility probe will skip: ${dshError.message}`)
 }
 
 /** Register a test but report an absent/unusable installed runtime honestly. */
@@ -536,7 +541,9 @@ feasibilityTest('environment: the installed DSH tools/scoping/execution packages
   assert.equal(typeof dsh.McpClient.apply, 'function')
   assert.equal(typeof dsh.McpClient.connectionStatusOf, 'function')
   assert.equal(typeof dsh.McpManager, 'function')
-  // The public client export surface intentionally has no naming helper.
+  // The package root does not export a naming helper. The package's ./src/*
+  // subpath points at TypeScript source; this probe does not treat that as a
+  // supported runtime identity API and never imports it.
   assert.equal(Object.hasOwn(dsh.McpClient, 'publicToolName'), false)
 })
 
@@ -611,7 +618,8 @@ feasibilityTest('identity: live registration yields deterministic public names, 
   assert.equal(Object.hasOwn(definition, 'source'), false)
   assert.equal(Object.hasOwn(definition, 'mcp'), false)
 
-  // No supported API maps a public name back to (serverName, rawName).
+  // No supported root export maps a public name back to (serverName, rawName).
+  // The ./src/* subpath is TypeScript source, not a public runtime helper.
   assert.equal(Object.hasOwn(dsh.McpClient, 'publicToolName'), false)
 })
 
@@ -710,6 +718,9 @@ feasibilityTest('dynamic sync: a tool added between steps appears only in the ne
   const echoResult = await callTool(h.root, echo, {}, { agent: scopes.a, toolSet: oldSet })
   assert.equal(echoResult.isError, true, 'the closed step cannot execute even an unchanged MCP tool after a generation swap')
   assert.ok(textOf(echoResult).includes('unknown tool'))
+  oldSet.dispose()
+  nextSet.dispose()
+  nextSetB.dispose()
 })
 
 feasibilityTest('dynamic registration: a synchronous tools/change listener can re-enter the registry', async t => {
@@ -840,6 +851,10 @@ feasibilityTest('scoping: per-agent expansion canaries are isolated and cannot r
   const inspected = h.root.tools.definitions(scopes.a).map(definition => definition.name)
   assert.ok(inspected.includes('feasibility_canary_service1'))
   assert.ok(inspected.includes('feasibility_canary_service2'))
+  setA.dispose()
+  setB.dispose()
+  setA2.dispose()
+  setA3.dispose()
   presetDisposer()
 })
 
@@ -882,6 +897,8 @@ feasibilityTest('scoping: a same-name agent shadow can execute a restricted MCP 
   // tools.restrict(), so expansion can release an admission restriction. The
   // design explicitly forbids relying on this path.
   assert.equal(h.root.tools.schemas(scopes.a).some(schema => schema.name === name), true)
+  before.dispose()
+  after.dispose()
 })
 
 feasibilityTest('shutdown: guard runs before dispatch but not again in the guard-to-body window (observed race)', async t => {
@@ -954,6 +971,7 @@ feasibilityTest('shutdown: old step snapshots and removed registrations cannot e
   const result = await callTool(h.root, 'feasibility_snapshot', {}, { agent: scopes.a, toolSet: set })
   assert.equal(result.isError, true)
   assert.equal(bodyCalls, 0, 'a registration removed after the step snapshot cannot run')
+  set.dispose()
 
   // Already-dispatched work is not forcibly interrupted; cancellation settles
   // the started body as aborted.
@@ -1011,6 +1029,10 @@ feasibilityTest('resources/instructions: hiding business tools leaves resource a
   const templates = await callTool(h.root, 'list_mcp_resource_templates', { server: 'alpha' }, { agent: scopes.a })
   assert.equal(templates.isError, false, 'the shared template-list tool is callable for the filtered server')
   assert.ok(textOf(templates).includes('resourceTemplates'))
+
+  const betaList = await callTool(h.root, 'list_mcp_resources', { server: 'beta' }, { agent: scopes.a })
+  assert.equal(betaList.isError, false)
+  assert.ok(textOf(betaList).includes('beta://secret'), 'the list call is server-scoped, not an aggregate')
 
   // Hiding the three shared resource tools is all-or-nothing and still does
   // not remove the server instruction section.
@@ -1321,6 +1343,7 @@ feasibilityTest('shutdown: post-prepare agent restriction blocks dispatch with a
   const withSetOutcome = await pipeline.complete(withSet.exec, await pipeline.dispatch(withSet.exec))
   assert.equal(withSetOutcome.isError, true)
   assert.ok(textOf(withSetOutcome).includes('unknown tool'))
+  set.dispose()
   layerWithSet()
 
   await delay(50)
@@ -1395,6 +1418,10 @@ feasibilityTest('scoping: per-agent restrict disclosure layer reveals the origin
   assert.equal(setB.view(scopes.b).has(betaEcho), true)
   assert.equal(setB.view(scopes.b).has(betaSearch), false)
 
+  oldSet.dispose()
+  nextSet.dispose()
+  setA.dispose()
+  setB.dispose()
   presetDeny()
   betaEchoLayer()
 })
@@ -1434,6 +1461,8 @@ feasibilityTest('scoping: deny-list disclosure layer does not hide MCP tools reg
   const [setA, setB] = await Promise.all([resolveFor(h.root, scopes.a), resolveFor(h.root, scopes.b)])
   assert.equal(setA.view(scopes.a).has(expectedPublicName('alpha', 'search')), false)
   assert.equal(setB.view(scopes.b).has(expectedPublicName('alpha', 'search')), true)
+  setA.dispose()
+  setB.dispose()
 
   layer()
   assert.equal(visible(scopes.a).some(name => existing.includes(name)), true, 'disposing the layer reveals the original names')

@@ -6,8 +6,25 @@ alternatives are not yet sufficient to enable them**
 
 This document records only what the installed DSH runtime actually did. It does
 not describe a proposed design as if it existed. The automated evidence is
-`test/mcp-feasibility.test.mjs` (21 tests, all passing, including tests that pin
-observed failures and gaps).
+`test/mcp-feasibility.probe.mjs` (21 host-bound checks, all passing here,
+including checks that pin observed failures and gaps).
+
+The probe file is deliberately **not** named `*.test.mjs` and is **not** part of
+the default `npm test` suite: a green default suite must never imply that host
+capability was verified. See “Host-bound probe and release gate” below.
+
+## Host-bound probe and release gate
+
+| Command | Purpose | Installed runtime present | Runtime absent or wrong version |
+| --- | --- | --- | --- |
+| `npm test` | ordinary portable suite; excludes the probe | 64/64 pass | 64/64 pass (no capability claim) |
+| `npm run test:feasibility` | optional focused probe; reports skips | 21/21 pass | 21 skipped; prints `[unverified] ...`; exit 0 |
+| `npm run verify:feasibility` | **strict capability gate** | 21/21 pass | fails nonzero |
+
+`npm run verify:feasibility` is **mandatory for any feature release or capability
+claim**. The ordinary suite passing without it proves only the portable code, not
+MCP feasibility. The skip path is explicit (`unverified — ...` per test), never a
+hidden pass.
 
 ## Environment and isolation
 
@@ -92,7 +109,10 @@ raw name, so dispatch never re-parses the public name. This part is proven.
 **No supported reverse mapping was found in the tested surfaces.** The live
 registry exposes only `name`, `description`, `parameters`, `output`, `execute`
 and `projectContent`; it exposes no server, raw-name or source metadata. The
-client package does not export its `publicToolName` helper. `connectionStatusOf()`
+client package **root** does not export its `publicToolName` helper; the helper
+is internal in the compiled module, while the package’s `./src/*` export points
+at TypeScript source. This probe did not import that subpath and does not treat
+it as a supported runtime identity API. `connectionStatusOf()`
 status has only `state`, `toolCount`, `connectedAt` (or failure fields). The
 manager status type from live Inspect is the same shape.
 
@@ -149,12 +169,13 @@ reveal the **original global MCP tool**, with no local re-registration:
 * disposing A’s alpha deny layer revealed alpha’s original MCP names in A;
   calling the revealed name executed the real MCP body and reached the controlled
   server with `raw=search`;
-* an independent ancestor deny (beta search) remained in force for A and B;
-* a second A-only deny layer (beta echo) remained in force;
+* an independent ancestor deny specifically for beta search remained in force
+  for A and B; it did not hide beta echo;
+* a second A-only deny layer hid beta echo in A;
 * an independent global guard (a “switch” on beta echo) still denied B’s visible
   beta-echo call before its body after A’s alpha layer was disposed; opening the
   guard let it execute;
-* B’s alpha/beta visibility was unaffected;
+* B’s alpha and beta-echo visibility was unaffected (the ancestor beta-search deny applied to B as well);
 * a step set resolved before the disposal stayed closed; the next step admitted
   the revealed tool;
 * two concurrent `resolve()` calls (A and B) after disposal observed their own
@@ -236,11 +257,12 @@ With server `alpha` business tools denied for agent A:
 
 * A’s schemas still contained `list_mcp_resources`,
   `list_mcp_resource_templates`, `read_mcp_resource`.
-* `list_mcp_resources`, `list_mcp_resource_templates` and
-  `read_mcp_resource({server: "alpha", uri: "alpha://secret"})` were each called
-  successfully for A; read returned `ALPHA_RESOURCE_PAYLOAD`.
-* the resource list and the assembled system prompt still listed `alpha` and
-  `beta`;
+* `list_mcp_resources` was called separately for alpha and beta; each returned
+  its own server-scoped resource (`alpha://secret` / `beta://secret`), not an
+  aggregate list. `list_mcp_resource_templates` and
+  `read_mcp_resource({server: "alpha", uri: "alpha://secret"})` were called for
+  alpha; read returned `ALPHA_RESOURCE_PAYLOAD`.
+* the assembled system prompt listed both `alpha` and `beta`;
 * A’s system prompt still contained `ALPHA_INSTRUCTIONS_MARKER`.
 
 Hiding the three shared resource tools for A hid all servers’ resource tools
@@ -347,19 +369,23 @@ This revision corrects the prior report:
 From the repository root (`pkg/dsh-skill-pool` in the plan; this worktree root):
 
 ```sh
-node --test test/mcp-feasibility.test.mjs   # 21/21 pass
-npm run test:feasibility                    # same, skips with "unverified" if runtime absent
-npm run verify:feasibility                  # required mode: exits nonzero if runtime absent
-npm test                                    # 85/85 pass (includes 21 feasibility tests here)
-npm run lint                                # exit 0
-node test-persisted-mcp.mjs                 # all persisted-MCP checks passed
+node --test test/mcp-feasibility.probe.mjs   # real root: 21/21 pass
+npm run test:feasibility                     # real root: 21/21; absent: 21 skipped + [unverified], exit 0
+npm run verify:feasibility                   # real root: 21/21; absent/wrong: nonzero
+DSH_FEASIBILITY_ROOT=/nonexistent node --test test/mcp-feasibility.probe.mjs
+# 21 skipped, exit 0 (optional probe, clearly unverified)
+DSH_FEASIBILITY_ROOT=/nonexistent npm run verify:feasibility
+# exit nonzero (strict gate)
+npm test                                     # 64/64 pass; probe is excluded
+npm run lint                                 # exit 0
+node test-persisted-mcp.mjs                  # all persisted-MCP checks passed
 ```
 
-The feasibility file locates the installed runtime at
+The probe locates the installed runtime at
 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh` by default and accepts
-`DSH_FEASIBILITY_ROOT` to point at another installed DSH tree. The default
-`npm test` suite keeps normal portability: without the installed runtime the 21
-checks are reported as skipped with the reason “unverified”, **not** as passing
-capability claims. `DSH_FEASIBILITY_REQUIRED=1` (the `verify:feasibility` script)
-makes the same command fail nonzero instead of skipping, so a capability gate
-can require real host coverage.
+`DSH_FEASIBILITY_ROOT` to point at another installed DSH tree. It requires the
+expected host version (`0.2.2-rc.3`). The default `npm test` script’s
+`test/*.test.mjs` glob does not match `mcp-feasibility.probe.mjs`, so the
+ordinary suite can pass without the host and makes no capability claim. The
+optional focused command prints the skip reason; the strict command
+(`DSH_FEASIBILITY_REQUIRED=1`) fails nonzero instead of skipping.
