@@ -275,8 +275,12 @@ Fail-closed 增量：
   面板合法的 self→group 继承动作（组可解析、值未改）允许；group→self 的仅标记切换会把
   当前生效的组值物化到 own 列表，面板携带空 own 列表也按“仅标记”处理，避免扩成全部。
 - **重新导入/更新**：`installItems` 在换 sourceId 前捕获 effective enabled/modes/workspaces；
-  若新来源没有等价组，物化为 `self`；显式 import `scope` 落 `self` 并优先；旧组 disabled
-  物化为成员 disabled。文件/ZIP/Git/source update 共用该路径。
+  若新来源没有等价组，物化为 `self`；显式 import `scope` 落 `self` 并优先。若仍是**同一个有效组**，
+  保留成员 own `enabled`（组关闭再开启可恢复）；只有组身份改变/丢失才物化旧 effective enabled。
+  文件/ZIP/Git/source update 共用该路径。
+- **空工具快照**：正常激活中 `tools.schemas()` 为空且仍需 MCP 门控时保留旧 restrict 层（交集），
+  不释放；`mcpGate:false`/无 MCP 成员才立即释放。其它放宽待下一次非空快照。真实 DSH 限制层由
+  `npm run test:restrict` 覆盖；静态 deny 对新公共名的残余动态缺口不变。
 - `POST /group` 的 `import:`/`repo:` 空名返回 400。
 - **警告持久化**：写成功但重新应用失败返回 200 + 脱敏 `warning`；面板显示可关闭的持久警告条，
   不被后续成功响应或短 toast 覆盖。

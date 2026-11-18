@@ -15,7 +15,7 @@ import test from 'node:test'
 
 import { createActivation } from '../src/activation.js'
 import { registerWebApi, ROUTE_PREFIX } from '../src/web-api.js'
-import { StateStore, defaultState, normalizeState, upsertItem } from '../src/store.js'
+import { StateStore, defaultState, normalizeState, upsertGroup, upsertItem, upsertSource } from '../src/store.js'
 
 /** A valid v4 document with one MCP member that only mode `b` may use. */
 function validState() {
@@ -419,7 +419,7 @@ async function makeApi(initial = validState(), { onChanged = async () => {} } = 
       callback({ get: (name) => services[name], effect: (register) => register() }),
     effect: (register) => register(),
   }
-  registerWebApi({ ctx, store, meta: { file, version: 'test' }, onChanged, logger: {} })
+  const registry = registerWebApi({ ctx, store, meta: { file, version: 'test' }, onChanged, logger: {} })
 
   const call = async (method, suffix, body) => {
     const pathname = suffix.split('?')[0]
@@ -436,6 +436,8 @@ async function makeApi(initial = validState(), { onChanged = async () => {} } = 
 
   return {
     call,
+    store,
+    testHooks: registry?.testHooks,
     dir,
     file,
     async dispose() {
@@ -1351,6 +1353,103 @@ test('a marker-only group -> self switch materializes the effective scope instea
     assert.deepEqual(groupMode.payload.pool.skills, ['shared'])
     const other = await api.call('GET', '/resolve?mode=ptc&cwd=%2Felsewhere')
     assert.deepEqual(other.payload.pool.skills, [])
+  } finally {
+    await api.dispose()
+  }
+})
+
+
+test('a transient empty tool list keeps the healthy restrict layer until a real change is visible', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await store.write(validState())
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(agent.restrictions.length, 1)
+    assert.equal(agent.restrictions[0].disposed, false)
+
+    schemasRef.current = []
+    await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(agent.restrictions[0].disposed, false, 'an empty snapshot must not release the previous deny')
+
+    schemasRef.current = [{ name: 'mcp__kb__search' }]
+    await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(agent.restrictions[0].disposed, true)
+    assert.equal(agent.restrictions.length, 2)
+    assert.deepEqual(agent.restrictions[1].deny, ['mcp__kb__search'])
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an explicit mcpGate off still releases the old deny even with an empty tool list', async () => {
+  const { dir, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await store.write(validState())
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(agent.restrictions.length, 1)
+
+    schemasRef.current = []
+    const off = validState()
+    off.settings.mcpGate = false
+    await store.write(off)
+    await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(agent.restrictions[0].disposed, true, 'the user explicitly disabled MCP gating')
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('source/update on the same disabled group keeps the member enabled flag for re-enabling', async () => {
+  const api = await makeApi(sharedSourceState({ groupEnabled: false }))
+  try {
+    const hooks = api.testHooks
+    assert.equal(typeof hooks?.installItems, 'function')
+    const current = await api.store.read({ fresh: true })
+    const previous = hooks.captureEffectiveScopes(current, ['shared'])
+    const movedSource = { ...current.sources.src_a, subdir: 'moved' }
+    let next = upsertSource(current, movedSource)
+    next = hooks.installItems(next, ['shared'], {
+      scope: undefined, sourceId: 'src_a', digests: {}, installedAt: '2026-11-19T00:00:00.000Z', previous,
+    })
+    assert.equal(next.skills.shared.enabled, true, 'the member own enabled flag is preserved')
+    assert.equal(next.skills.shared.modesFrom, 'group')
+    const disabled = await (await import('../src/rules.js')).resolvePool(next, { mode: 'standard', cwd: '/workspace' })
+    assert.deepEqual(disabled.skills, [], 'the disabled group still makes it inactive')
+
+    const enabled = upsertGroup(next, { key: 'repo:example/project', enabled: true })
+    const restored = await (await import('../src/rules.js')).resolvePool(enabled, { mode: 'standard', cwd: '/workspace' })
+    assert.deepEqual(restored.skills, ['shared'], 're-enabling the same group restores the member')
+  } finally {
+    await api.dispose()
+  }
+})
+
+test('source/update that loses its group materializes the old effective disabled state', async () => {
+  const api = await makeApi(sharedSourceState({ groupEnabled: false }))
+  try {
+    const hooks = api.testHooks
+    const current = await api.store.read({ fresh: true })
+    const previous = hooks.captureEffectiveScopes(current, ['shared'])
+    const projectChanged = { ...current.sources.src_a, project: 'example/other', url: 'https://github.com/example/other' }
+    let next = upsertSource(current, projectChanged)
+    next = hooks.installItems(next, ['shared'], {
+      scope: undefined, sourceId: 'src_a', digests: {}, installedAt: '2026-11-19T00:00:00.000Z', previous,
+    })
+    assert.equal(next.skills.shared.enabled, false, 'old effective disabled is materialized')
+    assert.equal(next.skills.shared.modesFrom, 'self')
+    assert.deepEqual(next.skills.shared.modes, ['standard'])
+    const enabled = upsertGroup(next, { key: 'repo:example/project', enabled: true })
+    const restored = await (await import('../src/rules.js')).resolvePool(enabled, { mode: 'standard', cwd: '/workspace' })
+    assert.deepEqual(restored.skills, [], 'the old group must not resurrect a detached member')
   } finally {
     await api.dispose()
   }

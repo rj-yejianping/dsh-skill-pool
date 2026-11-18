@@ -496,10 +496,19 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         )
       }
 
-      // The new MCP layers are installed; dropping the previous ones now can
-      // only keep the same or a smaller set of visible tools.
-      for (const entry of oldRestrictions) disposeEntry(entry)
-      record.disposers = pending
+      // If the host is between tool generations, an empty snapshot cannot prove
+      // that a previously hidden tool is now allowed. Keep the old restrict
+      // layer (intersection) until a non-empty snapshot or an explicit
+      // `mcpGate: false` makes the intent visible. User-driven state changes
+      // that still need a gate will be reflected by the next non-empty apply.
+      const keepOldRestrictions = denyMcp.length === 0 && pool.gateMcp && oldRestrictions.length > 0
+      if (keepOldRestrictions) {
+        record.disposers = [...pending, ...oldRestrictions]
+        logger?.warn?.('[resource-pool] empty MCP tool snapshot; kept the previous restrict layer')
+      } else {
+        for (const entry of oldRestrictions) disposeEntry(entry)
+        record.disposers = pending
+      }
       record.activated = true
       record.conservative = false
       // Leave the signature unset when a non-critical registration failed, so

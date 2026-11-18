@@ -31,7 +31,7 @@ import {
   upsertSource,
 } from './store.js'
 import { buildInventory } from './inventory.js'
-import { effectiveEnabled, effectiveScope, groupOfMember, resolvePool } from './rules.js'
+import { effectiveEnabled, effectiveScope, groupKeyOfSource, groupOfMember, resolvePool } from './rules.js'
 import { DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS, mountServer } from './mount.js'
 import {
   buildMcpConfig,
@@ -374,6 +374,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         enabled: effectiveEnabled(state, member),
         modes: [...effective.modes],
         workspaces: [...effective.workspaces],
+        groupKey: groupKeyOfSource(isObject(state.sources) ? state.sources[member.sourceId] : undefined),
       }
     }
     return out
@@ -412,6 +413,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
               enabled: effectiveEnabled(next, existing),
               modes: [...effectiveScope(next, existing).modes],
               workspaces: [...effectiveScope(next, existing).workspaces],
+              groupKey: groupKeyOfSource(isObject(next.sources) ? next.sources[existing.sourceId] : undefined),
             }
         let modesFrom = existing.modesFrom === 'self' ? 'self' : 'group'
         let workspacesFrom = existing.workspacesFrom === 'self' ? 'self' : 'group'
@@ -430,8 +432,12 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
           workspacesFrom = 'self'
           own.workspaces = [...prior.workspaces]
         }
-        // Preserve the effective disabled state, including a disabled group.
-        own.enabled = prior.enabled
+        // A still-identical group keeps the member's own enabled flag, so
+        // disabling and re-enabling that group restores the member. Only a
+        // changed/lost group materializes the old effective enabled state.
+        const newGroupKey = groupKeyOfSource(isObject(next.sources) ? next.sources[sourceId] : undefined)
+        const sameGroup = prior.groupKey === newGroupKey && (newGroup !== undefined || newGroupKey.length === 0)
+        own.enabled = sameGroup ? existing.enabled : prior.enabled
         extra.modesFrom = modesFrom
         extra.workspacesFrom = workspacesFrom
       } else if (provided.modes !== undefined || provided.workspaces !== undefined) {
@@ -1371,4 +1377,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     }
     debug(`registered ${routes.length} resource pool routes under ${ROUTE_PREFIX} (exact fetch)`)
   }
+
+  // Host-independent seam for scope-preservation tests; production ignores it.
+  return { testHooks: { captureEffectiveScopes, installItems } }
 }
