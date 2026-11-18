@@ -613,14 +613,17 @@ export function normalizeState(raw) {
   }
 }
 
+/** Top-level sections every complete v4 document must carry as plain objects. */
+const STATE_SECTIONS = ['settings', 'skills', 'mcp', 'sources', 'groups']
+
 /**
  * Validate the document an update mutator returned.
  *
- * `normalizeState` treats anything that is not a v4 document as an empty
- * default, so persisting an accidental `undefined` result (a mutation that
- * forgot to return, or an async mutator that resolved to nothing) would
- * silently erase every stored member and credential. Refuse it before it can
- * reach the file.
+ * `normalizeState` treats anything that is not a complete v4 document as an
+ * empty default, so persisting an accidental `undefined` result (a mutation
+ * that forgot to return, or an async mutator that resolved to nothing) — or a
+ * fragment such as `{version: 4}` — would silently erase every stored member
+ * and credential. Refuse anything incomplete before it can reach the file.
  *
  * @param {unknown} next - mutation result.
  * @returns {object} the same document when it is acceptable.
@@ -629,6 +632,13 @@ export function normalizeState(raw) {
 function assertStateDocument(next) {
   if (!isObject(next) || next.version !== STATE_VERSION) {
     throw new TypeError('StateStore.update(mutate) must return a complete v4 state document')
+  }
+  for (const section of STATE_SECTIONS) {
+    if (!isObject(next[section])) {
+      throw new TypeError(
+        `StateStore.update(mutate) must return a complete v4 state document: "${section}" must be an object`,
+      )
+    }
   }
   return next
 }

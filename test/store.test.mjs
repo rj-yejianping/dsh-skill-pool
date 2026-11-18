@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -556,4 +556,63 @@ test('a plain read keeps its lenient fallback so only updates are strict', async
   await writeFile(file, '{not json', 'utf8')
   const lenient = await store.read({ fresh: true })
   assert.deepEqual(lenient, defaultState())
+})
+
+test('an update rejects v4 fragments and wrong section shapes without rewriting the document', async () => {
+  const { file, store } = await temporaryStore()
+  await store.write(
+    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
+  )
+  const before = await readFile(file)
+  const complete = defaultState()
+
+  const invalid = [
+    ['missing every section', () => ({ version: 4 })],
+    ['missing groups', () => ({ ...complete, groups: undefined })],
+  ]
+  for (const section of ['settings', 'skills', 'mcp', 'sources', 'groups']) {
+    invalid.push([`${section} is null`, () => ({ ...complete, [section]: null })])
+    invalid.push([`${section} is an array`, () => ({ ...complete, [section]: [] })])
+  }
+
+  for (const [label, mutate] of invalid) {
+    await assert.rejects(store.update(mutate), /must return a complete v4 state document/, label)
+    assert.deepEqual(await readFile(file), before, `${label} must not rewrite the document`)
+  }
+
+  // The queue recovers and the credential-bearing member is still intact.
+  const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
+  assert.equal(recovered.mcp.kb.description, 'keep me')
+  assert.deepEqual(recovered.mcp.kb.definition, mcpDefinition)
+  assert.equal(recovered.mcp.after.enabled, true)
+})
+
+test('an update over a stored v3 document still migrates it to v4', async () => {
+  const { file, store } = await temporaryStore()
+  await writeFile(file, JSON.stringify(legacyDocument()), { encoding: 'utf8', mode: 0o600 })
+
+  const state = await store.update((current) =>
+    upsertItem(current, 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'migrated' }),
+  )
+  assert.equal(state.version, 4)
+  assert.equal(state.skills['lark-doc'].modesFrom, 'group')
+  assert.deepEqual(state.groups['repo:larksuite/cli'].modes, ['standard'])
+  assert.equal(state.mcp.kb.description, 'migrated')
+
+  const persisted = JSON.parse(await readFile(file, 'utf8'))
+  assert.equal(persisted.version, 4)
+  assert.equal(persisted.skills['lark-doc'].modesFrom, 'group')
+  assert.deepEqual(persisted.groups['repo:larksuite/cli'].modes, ['standard'])
+  assert.equal(persisted.mcp.kb.description, 'migrated')
+})
+
+test('an update refuses a non-ENOENT read error (EISDIR) without touching the path', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'skill-pool-store-'))
+  const file = join(dir, 'state.json')
+  await mkdir(file)
+  const store = new StateStore({ file })
+
+  await assert.rejects(store.update((current) => current), /could not be read; refusing to overwrite/)
+  assert.equal((await stat(file)).isDirectory(), true, 'the path is still the directory we created')
+  assert.deepEqual(await readdir(dir), ['state.json'], 'no temporary file was written next to it')
 })
