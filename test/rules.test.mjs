@@ -108,6 +108,7 @@ test('ambiguous MCP names include overlapping separators and malformed splits', 
     'mcp__alpha',          // no separator
     'mcp____x',            // empty server
     'mcp__alpha__' + 'b'.repeat(36) + '_0123456789ab', // lossy hash suffix
+    'mcp__alpha__report_0123456789ab', // clean raw that merely looks like the suffix
   ]) {
     assert.equal(isAmbiguousMcpToolName(name), true, name)
   }

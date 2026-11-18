@@ -389,6 +389,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     // ---- Compute the whole next activation before touching the live one.
     const allowedSkills = new Set(allowed)
     let denyMcp = []
+    let observedMcp = 0
     if (pool.gateMcp) {
       // A missing/unreadable global tool surface is not "nothing to hide": it
       // means the MCP gate cannot be established. Treat it as an activation
@@ -408,6 +409,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       for (const schema of schemas) {
         const name = schema?.name
         if (typeof name !== 'string' || !name.startsWith(MCP_TOOL_PREFIX)) continue
+        observedMcp += 1
         if (isAmbiguousMcpToolName(name)) {
           // The public name cannot be attributed to one server; deny rather than
           // allow by a prefix that an external server could share.
@@ -501,7 +503,13 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       // layer (intersection) until a non-empty snapshot or an explicit
       // `mcpGate: false` makes the intent visible. User-driven state changes
       // that still need a gate will be reflected by the next non-empty apply.
-      const keepOldRestrictions = denyMcp.length === 0 && pool.gateMcp && oldRestrictions.length > 0
+      // `denyMcp.length === 0` alone cannot distinguish "no MCP tools visible"
+      // from "all visible MCP tools are now allowed". Only the former is a
+      // transient snapshot; the latter is an intentional widening and must
+      // release the old deny.
+      const keepOldRestrictions = observedMcp === 0 && pool.gateMcp && oldRestrictions.length > 0
+      const keptConservative =
+        keepOldRestrictions && oldRestrictions.some((entry) => entry.label === 'mcp-restrict-fallback')
       if (keepOldRestrictions) {
         record.disposers = [...pending, ...oldRestrictions]
         logger?.warn?.('[resource-pool] empty MCP tool snapshot; kept the previous restrict layer')
@@ -510,11 +518,14 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         record.disposers = pending
       }
       record.activated = true
-      record.conservative = false
-      // Leave the signature unset when a non-critical registration failed, so
-      // the next ordinary re-apply retries it instead of treating the incomplete
-      // layer as final.
-      record.signature = incomplete ? '' : signature
+      // A retained conservative fallback stays conservative: if the file breaks
+      // again with new tools visible, the next failure must refresh the fallback
+      // rather than treat the retained layer as a healthy activation.
+      record.conservative = keptConservative
+      // Leave the signature unset when a non-critical registration failed or a
+      // conservative fallback was retained, so a later explicit re-apply retries
+      // instead of treating the incomplete layer as final.
+      record.signature = incomplete || keptConservative ? '' : signature
     } catch (error) {
       // No successful commit: remove anything this attempt registered and leave
       // the previous gate (still in `record.disposers`) in force.

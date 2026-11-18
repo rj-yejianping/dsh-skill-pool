@@ -95,7 +95,17 @@ test('real DSH restrict layers intersect, unregister/re-register, and keep a doc
     const denyEcho = h.scoped.ctx.tools.restrict({ deny: ['mcp__alpha__echo'] })
     h.hostCtx.tools.register(definition('mcp__alpha__late'))
     assert.deepEqual(h.visible().sort(), ['mcp__alpha__late', 'mcp__alpha__search'])
+
+    // Register the refreshed deny before releasing the old layer: the new layer
+    // must cover both the old and the newly visible name first.
+    const refreshed = h.scoped.ctx.tools.restrict({
+      deny: ['mcp__alpha__echo', 'mcp__alpha__late'],
+    })
+    assert.deepEqual(h.visible(), ['mcp__alpha__search'])
     denyEcho()
+    assert.deepEqual(h.visible(), ['mcp__alpha__search'], 'the refreshed layer survives releasing the old one')
+    refreshed()
+    assert.deepEqual(h.visible().sort(), ['mcp__alpha__echo', 'mcp__alpha__late', 'mcp__alpha__search'])
   } finally {
     await h.dispose()
   }

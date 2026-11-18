@@ -148,8 +148,9 @@
 - 面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 返回 `stateStatus.ok=false`
   与安全错误码/恢复说明。写成功但重新应用失败返回 200 + 脱敏 warning；面板持久、可关闭提示。
 - 保守 fallback 在可见工具列表短暂为空时保留旧 deny，不释放；下一次非空重放先注册后释放。
-- MCP ambiguous predicate 覆盖重叠分隔符（`mcp__a___b`）与宿主 lossy hash 后缀；mount readiness
-  与 inventory 使用同一 predicate，不能把这类名字归到前缀 server。
+- MCP ambiguous predicate 覆盖重叠分隔符（`mcp__a___b`）、非法字符规范化、64 字符截断及
+  任意 `_<12 位小写 hex>` 后缀（合法 clean raw 也会被误拒）；mount readiness/inventory 使用同一
+  predicate，不能把这类名字归到前缀 server；若 server 全部工具都歧义，mount 会超时而非 ready。
 - 已提交的写操作若重新应用有失败，HTTP 返回 200（保留已提交状态）并附带固定文案的
   `warning: {code, message, failed?}`；不把内部错误或工具名回显给浏览器。
 - 恢复前应先**备份** `state.json`（`0600`，可能含 MCP 令牌），再人工修复或从备份还原；
@@ -276,11 +277,16 @@ Fail-closed 增量：
   当前生效的组值物化到 own 列表，面板携带空 own 列表也按“仅标记”处理，避免扩成全部。
 - **重新导入/更新**：`installItems` 在换 sourceId 前捕获 effective enabled/modes/workspaces；
   若新来源没有等价组，物化为 `self`；显式 import `scope` 落 `self` 并优先。若仍是**同一个有效组**，
-  保留成员 own `enabled`（组关闭再开启可恢复）；只有组身份改变/丢失才物化旧 effective enabled。
-  文件/ZIP/Git/source update 共用该路径。
-- **空工具快照**：正常激活中 `tools.schemas()` 为空且仍需 MCP 门控时保留旧 restrict 层（交集），
-  不释放；`mcpGate:false`/无 MCP 成员才立即释放。其它放宽待下一次非空快照。真实 DSH 限制层由
-  `npm run test:restrict` 覆盖；静态 deny 对新公共名的残余动态缺口不变。
+  保留成员 own `enabled`（组关闭再开启可恢复）；换到另一个**维度值等价**的可解析组时继续继承，
+  新组 `enabled` 开关优先（disabled 即隐藏，重新开启恢复）；组丢失或维度不等价则物化旧
+  effective scope/enabled 为 `self`，不采用可能扩大权限的新组值。
+  文件/ZIP/Git/source update 共用该路径；真实 `/source/update` 路由有本地 GitLab 归档测试，
+  覆盖组禁用期间更新后组重新启用恢复成员。
+- **空工具快照 vs 全部允许**：只有 `tools.schemas()` 中 MCP 工具观察数为 0 且仍需门控时保留
+  旧 restrict 层（交集）；非空快照若所有可见 MCP 工具都已允许（`denyMcp=[]`）则释放旧 deny。
+  `mcpGate:false`/无 MCP 成员立即释放。若保留的是 conservative fallback，仍保持 conservative
+  标志并清空 signature，文件再次损坏+新工具出现时会再次刷新；真实 DSH 限制层（含先注册新 deny
+  再释放旧层）由 `npm run test:restrict` 覆盖；静态 deny 对新公共名的残余动态缺口不变。
 - `POST /group` 的 `import:`/`repo:` 空名返回 400。
 - **警告持久化**：写成功但重新应用失败返回 200 + 脱敏 `warning`；面板显示可关闭的持久警告条，
   不被后续成功响应或短 toast 覆盖。

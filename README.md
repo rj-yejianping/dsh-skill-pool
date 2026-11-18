@@ -124,8 +124,11 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
   `enabled`/`modes`/`workspaces` 保留下来；新来源没有可解析组时落成 `self`，不会把空列表
   解释成"所有模式/所有工作区"。显式 `scope` 优先并落成 `self`；旧组被禁用时仍保持禁用。
   文件、ZIP、Git 与来源更新共用同一条 `installItems` 路径。若来源更新后仍是**同一个有效组**，
-  成员的 own `enabled` 保持不变，组关闭再打开会恢复该成员；只有组身份改变/丢失时才把旧
-  effective `enabled` 物化到成员。
+  成员的 own `enabled` 保持不变，组关闭再打开会恢复该成员。若换到**另一个可解析且维度值等价**
+  的组，保留成员 own 标志并继续 group 继承，**新组的 enabled 开关优先**（新组 disabled 就隐藏，
+  重新启用才恢复）；若组丢失或维度值不等价，则把旧 effective scope/enabled 物化为 `self`，
+  旧有效范围优先，不采用可能扩大权限的新组值。
+  真实 `/source/update` 路由（临时本地 GitLab 归档/commits 服务）有独立测试覆盖同组恢复。
 - **检查更新**：按来源查询远端提交（GitHub/GitLab commits API），**不下载归档**即可判断；
   「有更新」后再执行更新。更新只覆盖该来源安装的技能，保留池内条件；上游删除的技能会一并清理。
   - 未配置 token 时，GitHub 的 commits API 可能被限流（403）。此时若安装时记录的也是归档身份
@@ -211,11 +214,15 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   （静态名单；动态新增工具仍可能漏过，见已知限制）。
 - **新 Agent**：状态无法安全读取时，`agent/created` 监听器抛错，宿主拒绝创建该 Agent；
   不会发布一个没有 MCP 门控的会话。修复文件后，下一次保存或插件重载会恢复正常。
-- **空工具快照**：正常激活期间若 `tools.schemas()` 暂时为空，会保留旧 restrict 层（交集），
-  不把一次空快照当成“放开全部”；只有用户明确 `mcpGate:false`/池中无 MCP 成员时才立即释放。
-  其它有效放宽会在下一次非空快照重放时生效（fail safe，可能短暂过度限制）。
-  真实 DSH 限制层的注册/交集/卸载/重注册由 `npm run test:restrict` 验证；新注册的公共名在再次
-  重放前仍可能绕过静态 deny，这是明确残余缺口。
+- **空工具快照 vs 全部允许**：只有 `tools.schemas()` 中**一个 MCP 工具都没有**（observed
+  count = 0）才保留旧 restrict 层；非空快照即使 `denyMcp` 为空（所有可见 MCP 工具都已允许），
+  也会释放旧 deny，避免用户启用后旧限制永久不消失。用户明确 `mcpGate:false`/池中无 MCP 成员
+  也立即释放。保留期间是交集，下一次非空快照重放时按新状态注册/释放。
+  若被保留的是**保守 fallback**（状态曾不可读），本次仍保持 `conservative` 标志并清空
+  signature：文件再次损坏且出现新 MCP 工具时，会再次刷新保守 deny 覆盖新工具，而不是误当成
+  健康激活。
+  真实 DSH 限制层的注册/交集/卸载/重注册，以及“先注册新 deny 再释放旧层”由
+  `npm run test:restrict` 验证；新注册的公共名在再次重放前仍可能绕过静态 deny，这是明确残余缺口。
 - **降级可见**：面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 工具在失败时返回
   `stateStatus.ok=false`、错误码与恢复说明。写入成功但重新应用失败时，HTTP 仍返回 200（已提交状态保留）
   并附带脱敏的 `warning`；面板显示**持久、可手动关闭**的警告条（不再使用 3.2 秒成功 toast，也不会被
@@ -261,14 +268,14 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，130 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，136 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 130/130；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 136/136；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 4/4；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
