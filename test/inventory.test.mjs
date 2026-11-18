@@ -42,7 +42,7 @@ test('a session whose preset is unknown is still listed once', async () => {
 
 test('collectMcpServers does not attribute an ambiguous public name to a server prefix', () => {
   const ctx = {
-    get: (name) => (name === 'tools' ? { schemas: () => [{ name: 'mcp__alpha__search' }, { name: 'mcp__alpha__a__x' }] } : undefined),
+    get: (name) => (name === 'tools' ? { schemas: () => [{ name: 'mcp__alpha__search' }, { name: 'mcp__alpha__a__x' }, { name: 'mcp__alpha___b' }] } : undefined),
   }
   const rows = collectMcpServers(ctx)
   const alpha = rows.find((row) => row.serverName === 'alpha')

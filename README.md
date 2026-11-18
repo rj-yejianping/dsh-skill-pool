@@ -120,6 +120,10 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
   - 走 tarball 下载 + `tar` 解包，**不依赖 `git` 二进制**。
   - 若实例**禁用了归档接口**（对 `/repository/archive.*` 返回 406，常见于加固过的内网 GitLab），
     自动改走 `tree` + 逐文件 `raw` 接口重建同一份目录树，导入结果一致（代价是请求数变多）。
+- **重新导入/更新已有技能**：若成员原先继承仓库组条件，导入会先把当前**生效的**
+  `enabled`/`modes`/`workspaces` 保留下来；新来源没有可解析组时落成 `self`，不会把空列表
+  解释成"所有模式/所有工作区"。显式 `scope` 优先并落成 `self`；旧组被禁用时仍保持禁用。
+  文件、ZIP、Git 与来源更新共用同一条 `installItems` 路径。
 - **检查更新**：按来源查询远端提交（GitHub/GitLab commits API），**不下载归档**即可判断；
   「有更新」后再执行更新。更新只覆盖该来源安装的技能，保留池内条件；上游删除的技能会一并清理。
   - 未配置 token 时，GitHub 的 commits API 可能被限流（403）。此时若安装时记录的也是归档身份
@@ -220,7 +224,8 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
 避免把已关闭的组读成开启）；生效条件 = 成员开关 **且** 组开关。
 旧 API 可能写入过任意 group key：只要键本身安全（非原型污染、无控制字符），这类组会作为
 **惰性遗留项**保留，但只有 `repo:<project>` / `import:<sourceId>` 才能被来源引用；
-新的 `POST /group` 会拒绝其它 key（400），不再制造无法引用的组。
+新的 `POST /group` 会拒绝其它 key（400），`import:`（空来源名）与 `repo:`（空项目）也返回 400，
+不再制造无法引用的组。
 
 **无组/无来源成员的旧格式**：`modesFrom`/`workspacesFrom` 为 `group` 但没有可解析的组，是插件
 长期写入的合法默认标记（无组时按成员自己的列表回落；自己的列表为空即"全部"）。strict reader
@@ -229,6 +234,9 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   `modesFrom:'self'` / `workspacesFrom:'self'`，避免"改了但没生效"；
 - 没有有效组却提交修改后的 `group` 标记同样 400，提示改用 `self`，避免产生无法解析的继承；
 - 只改 `enabled`/用途等部分更新仍保留原标记与原语义，不会被误报为配置损坏。
+- 面板的继承按钮合法地执行 self → group 切换（组可解析时允许），不会因“值没变”而误拒。
+- group → self 的**仅标记切换**会把当前生效的组值物化到成员自己的列表，再切到 `self`；
+  面板发送的空 own 列表也按此处理，避免一次继承开关把 scope 扩成全部模式/工作区。
 
 v3 文档会被**迁移**到 v4 而不是丢弃：按仓库推出组、把成员已一致的取值灌给组并让成员继承，
 因此迁移前后每个会话看到的资源完全相同；组内本来就不一致的维度留空，成员保留自己的取值。
@@ -246,15 +254,16 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，114 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，126 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 114/114；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 126/126；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 4/4；不是宿主能力门禁 |
+| `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:feasibility` | 可选探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
 | `npm run verify:feasibility` | **发布或能力声明的强制门禁**（Node 包装器，POSIX/Windows 通用） | 缺失、版本不符或任一探针失败均非零退出 |
 
@@ -272,13 +281,16 @@ MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。
   渐进披露（按服务按需展开）。任务 4/5 在本版本**未实现**，不是隐藏的实验开关。
 - 现有可行性证据不支持上述能力：当前代 public 名称无法可靠反查 server/raw（`mcpServerOf`
   按第一个 `__` 解析，合法服务名本身含 `__` 时可能把工具归到错误的 Server）。现在对
-  **有歧义的 `mcp__*` 名一律 deny**（`isAmbiguousMcpToolName`），优先不扩权；代价是合法
-  server/raw 名本身含 `__` 的工具也会被隐藏，面板的 MCP 工具列表也不会把它们归到某个
-  server（无法安全归属）。动态新增工具仍可绕过静态 deny 名单；
+  **有歧义的 `mcp__*` 名一律 deny**（`isAmbiguousMcpToolName`），包括重叠分隔符
+  （`mcp__a___b`）和宿主因截断/字符规范化附加 `_<12 hex>` 哈希的名字；mount readiness 与
+  inventory 也不再把这些名字归到前缀 server。代价是合法 server/raw 名本身含 `__` 的工具也会被
+  隐藏，面板的 MCP 工具列表也不会把它们归到某个 server（无法安全归属）。动态新增工具仍可绕过
+  静态 deny 名单；
   隐藏业务工具不影响 MCP resources 与 server instructions；断线后 schema/提示可能陈旧。
   这不是全面的 MCP 隔离证明。详见 `docs/mcp-feasibility-results.md`。
 - **状态 fail-closed 只解决"损坏状态被当成空池"这一条**：新 Agent 在状态不可读时会被拒绝创建，
-  已有 Agent 保留旧限制（没有旧层时退化为拒绝当时可见 MCP 工具的保守层）；它**不**把 MCP
+  已有 Agent 保留旧限制（没有旧层时退化为拒绝当时可见 MCP 工具的保守层；若随后工具列表
+  短暂为空，会保留旧保守 deny 而不是释放它）；它**不**把 MCP
   变成安全边界，也不修复静态 deny 的动态注册缺口。保守层/正常 deny 只覆盖**当前全球工具清单中
   可见的 `mcp__*` 公共名**，不覆盖 MCP resources、server instructions、程序化注册的 scoped/隐藏服务，
   也不能证明 Loader 名单完整。MCP 仍不是强安全边界。
@@ -300,6 +312,7 @@ npm test                    # 可移植单测 test/*.test.mjs（不含宿主探�
 npm run test:feasibility    # 可选宿主探针；缺失运行时会跳过，不能当发布证据
 npm run verify:feasibility  # 强制宿主门禁：缺失/版本不符/失败均非零退出
 npm run test:lifecycle      # index.js 生命周期/恢复/保守回退探针（需要 DSH）
+npm run test:naming         # 真实 publicToolName 歧义/截断哈希探针（需要 DSH）
 node test-persisted-mcp.mjs # MCP 定义持久化/重挂载检查
 ```
 

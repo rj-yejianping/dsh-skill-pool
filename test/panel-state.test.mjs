@@ -228,3 +228,19 @@ test('an activation warning persists across unrelated successes and is explicitl
   assert.deepEqual(plugin.boardState.mergeActivationWarning(warning, { state: {} }), warning)
   assert.equal(plugin.boardState.dismissActivationWarning(), null)
 })
+
+
+test('the panel inherit payload keeps current values and switches the marker to group', () => {
+  const body = plugin.boardState.buildItemSaveBody(
+    {
+      kind: 'skill',
+      name: 'shared',
+      entry: { enabled: true, modes: ['x'], workspaces: ['/x'], modesFrom: 'group', workspacesFrom: 'group' },
+    },
+    new Set(),
+  )
+  assert.equal(body.modesFrom, 'group')
+  assert.equal(body.workspacesFrom, 'group')
+  assert.deepEqual(body.modes, ['x'])
+  assert.deepEqual(body.workspaces, ['/x'])
+})

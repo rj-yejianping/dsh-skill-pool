@@ -146,7 +146,10 @@
   因而创建被拒绝。不会通过捕获错误继续发布一个未门控的 Agent。
 - MCP `restrict` 注册失败按激活失败处理；只有在新的 deny 层安装成功后才释放旧层。
 - 面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 返回 `stateStatus.ok=false`
-  与安全错误码/恢复说明。
+  与安全错误码/恢复说明。写成功但重新应用失败返回 200 + 脱敏 warning；面板持久、可关闭提示。
+- 保守 fallback 在可见工具列表短暂为空时保留旧 deny，不释放；下一次非空重放先注册后释放。
+- MCP ambiguous predicate 覆盖重叠分隔符（`mcp__a___b`）与宿主 lossy hash 后缀；mount readiness
+  与 inventory 使用同一 predicate，不能把这类名字归到前缀 server。
 - 已提交的写操作若重新应用有失败，HTTP 返回 200（保留已提交状态）并附带固定文案的
   `warning: {code, message, failed?}`；不把内部错误或工具名回显给浏览器。
 - 恢复前应先**备份** `state.json`（`0600`，可能含 MCP 令牌），再人工修复或从备份还原；
@@ -269,6 +272,12 @@ Fail-closed 增量：
   （回落成员自己的列表，空列表 = 全部）；strict reader 保留它，不误报损坏。API 仅在**会改变
   scope** 时拒绝：组可解析却只改 `modes`/`workspaces`（修改不会生效）→ 400 提示切 `self`；
   无有效组却提交修改后的 group 标记 → 400。仅 `enabled`/用途等部分更新保持原语义。
+  面板合法的 self→group 继承动作（组可解析、值未改）允许；group→self 的仅标记切换会把
+  当前生效的组值物化到 own 列表，面板携带空 own 列表也按“仅标记”处理，避免扩成全部。
+- **重新导入/更新**：`installItems` 在换 sourceId 前捕获 effective enabled/modes/workspaces；
+  若新来源没有等价组，物化为 `self`；显式 import `scope` 落 `self` 并优先；旧组 disabled
+  物化为成员 disabled。文件/ZIP/Git/source update 共用该路径。
+- `POST /group` 的 `import:`/`repo:` 空名返回 400。
 - **警告持久化**：写成功但重新应用失败返回 200 + 脱敏 `warning`；面板显示可关闭的持久警告条，
   不被后续成功响应或短 toast 覆盖。
 - `POST /source/delete` 在删除共享来源前，把被引用成员当前生效的 `enabled`/`modes`/`workspaces`

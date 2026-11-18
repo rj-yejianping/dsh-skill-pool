@@ -285,7 +285,10 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       ? patch.workspacesFrom
       : existing.workspacesFrom === 'self' ? 'self' : 'group'
 
-    if (desiredModesFrom === 'group' && (modesChanged || (patch.modesFrom === 'group' && existing.modesFrom !== 'group'))) {
+    if (
+      desiredModesFrom === 'group' &&
+      ((hasGroup && modesChanged) || (!hasGroup && (modesChanged || (patch.modesFrom === 'group' && existing.modesFrom !== 'group'))))
+    ) {
       throw Object.assign(
         new Error(
           hasGroup
@@ -297,7 +300,8 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     }
     if (
       desiredWorkspacesFrom === 'group' &&
-      (workspacesChanged || (patch.workspacesFrom === 'group' && existing.workspacesFrom !== 'group'))
+      ((hasGroup && workspacesChanged) ||
+        (!hasGroup && (workspacesChanged || (patch.workspacesFrom === 'group' && existing.workspacesFrom !== 'group'))))
     ) {
       throw Object.assign(
         new Error(
@@ -359,18 +363,83 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     }
   }
 
+  /** Capture effective scopes before a source change (see `installItems`). */
+  const captureEffectiveScopes = (state, names) => {
+    const out = {}
+    for (const name of names) {
+      const member = isObject(state.skills) ? state.skills[name] : undefined
+      if (!isObject(member)) continue
+      const effective = effectiveScope(state, member)
+      out[name] = {
+        enabled: effectiveEnabled(state, member),
+        modes: [...effective.modes],
+        workspaces: [...effective.workspaces],
+      }
+    }
+    return out
+  }
+
   /**
-   * Add freshly installed skills to the pool, keeping a member's previous
-   * conditions when the import did not specify new ones.
+   * Add freshly installed skills to the pool.
+   *
+   * A re-import can move a member to a different source. Its group may not
+   * exist in the new source's repository, so blindly keeping `modesFrom:
+   * 'group'` would turn an inherited scope into the member's empty own list
+   * ("all modes/workspaces"). Any dimension that would change effective scope
+   * is materialized into `self` from the pre-import effective scope; `enabled`
+   * is always preserved as the effective value (a disabled group stays
+   * disabled). An explicit import `scope` wins for that dimension and is
+   * stored as `self`, so a group can never silently override it.
+   *
+   * `previous` must be captured before the new source is written; it is
+   * supplied by every import/update route.
    */
-  const installItems = (state, names, { scope, sourceId, digests, installedAt }) => {
+  const installItems = (state, names, { scope, sourceId, digests, installedAt, previous }) => {
     let next = state
+    const provided = isObject(scope) ? scope : {}
     for (const name of names) {
       const extra = { installedAt }
       if (typeof sourceId === 'string' && sourceId.length > 0) extra.sourceId = sourceId
       const digest = isObject(digests) ? digests[name] : undefined
       if (typeof digest === 'string' && digest.length > 0) extra.digest = digest
-      next = upsertItem(next, 'skill', name, itemScope(next, 'skill', name, scope ?? {}), extra)
+      const existing = isObject(next.skills) ? next.skills[name] : undefined
+      const own = itemScope(next, 'skill', name, provided)
+
+      if (isObject(existing)) {
+        const prior = isObject(previous) && isObject(previous[name])
+          ? previous[name]
+          : {
+              enabled: effectiveEnabled(next, existing),
+              modes: [...effectiveScope(next, existing).modes],
+              workspaces: [...effectiveScope(next, existing).workspaces],
+            }
+        let modesFrom = existing.modesFrom === 'self' ? 'self' : 'group'
+        let workspacesFrom = existing.workspacesFrom === 'self' ? 'self' : 'group'
+        if (provided.modes !== undefined) modesFrom = 'self'
+        if (provided.workspaces !== undefined) workspacesFrom = 'self'
+
+        const newGroup = groupOfMember(next, { sourceId })
+        if (modesFrom === 'group' && (newGroup === undefined || !sameStringList(newGroup.modes, prior.modes))) {
+          modesFrom = 'self'
+          own.modes = [...prior.modes]
+        }
+        if (
+          workspacesFrom === 'group' &&
+          (newGroup === undefined || !sameStringList(newGroup.workspaces, prior.workspaces))
+        ) {
+          workspacesFrom = 'self'
+          own.workspaces = [...prior.workspaces]
+        }
+        // Preserve the effective disabled state, including a disabled group.
+        own.enabled = prior.enabled
+        extra.modesFrom = modesFrom
+        extra.workspacesFrom = workspacesFrom
+      } else if (provided.modes !== undefined || provided.workspaces !== undefined) {
+        if (provided.modes !== undefined) extra.modesFrom = 'self'
+        if (provided.workspaces !== undefined) extra.workspacesFrom = 'self'
+      }
+
+      next = upsertItem(next, 'skill', name, own, extra)
     }
     return next
   }
@@ -490,7 +559,29 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
             { code: 'resource-pool/unknown-item', status: 400 },
           )
         }
-        if (kind === 'skill') assertScopePatch(current, existing, patch)
+        if (kind === 'skill') {
+          assertScopePatch(current, existing, patch)
+          // Marker-only group -> self must retain the inherited values. The
+          // panel normally sends them, but an API caller may switch only the marker.
+          const group = groupOfMember(current, existing)
+          if (group !== undefined) {
+            const effective = effectiveScope(current, existing)
+            // The panel's inherit-off action sends the member's existing own
+            // values with `self`. If those values did not actually change, the
+            // action is marker-only: materialize the inherited scope rather
+            // than turning the empty own list into "all".
+            const modesUnchanged =
+              patch.modes === undefined || sameStringList(patch.modes, existing.modes)
+            const workspacesUnchanged =
+              patch.workspaces === undefined || sameStringList(patch.workspaces, existing.workspaces)
+            if (patch.modesFrom === 'self' && existing.modesFrom !== 'self' && modesUnchanged) {
+              patch.modes = [...effective.modes]
+            }
+            if (patch.workspacesFrom === 'self' && existing.workspacesFrom !== 'self' && workspacesUnchanged) {
+              patch.workspaces = [...effective.workspaces]
+            }
+          }
+        }
         const extra = {
           sourceId: existing?.sourceId,
           digest: existing?.digest,
@@ -596,9 +687,10 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     // Only repo:/import: groups can ever be referenced by a source. Older API
     // versions could write other keys; they remain readable as inert legacy
     // entries, but new writes must not create more of them.
+    const groupPrefix = key.startsWith('repo:') ? 'repo:' : key.startsWith('import:') ? 'import:' : ''
     if (
-      !(key.startsWith('repo:') || key.startsWith('import:')) ||
-      key.length <= 5 ||
+      groupPrefix.length === 0 ||
+      key.length <= groupPrefix.length ||
       key.length > 512 ||
       /[\u0000-\u001f\u007f]/.test(key)
     ) {
@@ -752,12 +844,14 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         createdAt: new Date().toISOString(),
       }
       const state = await store.update((current) => {
+        const previous = captureEffectiveScopes(current, result.installed)
         let next = upsertSource(current, source)
         next = installItems(next, result.installed, {
           scope,
           sourceId: source.id,
           digests: result.digests,
           installedAt: new Date().toISOString(),
+          previous,
         })
         return next
       })
@@ -800,12 +894,14 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         createdAt: new Date().toISOString(),
       }
       const state = await store.update((current) => {
+        const previous = captureEffectiveScopes(current, result.installed)
         let next = upsertSource(current, source)
         next = installItems(next, result.installed, {
           scope,
           sourceId: source.id,
           digests: result.digests,
           installedAt: new Date().toISOString(),
+          previous,
         })
         return next
       })
@@ -864,12 +960,14 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       const tokenCredential = await storeGitToken(source.id, token)
       if (tokenCredential !== undefined) source.tokenCredential = tokenCredential
       const state = await store.update((current) => {
+        const previous = captureEffectiveScopes(current, result.installed)
         let next = upsertSource(current, source)
         next = installItems(next, result.installed, {
           scope,
           sourceId: source.id,
           digests: result.digests,
           installedAt: new Date().toISOString(),
+          previous,
         })
         return next
       })
@@ -1026,12 +1124,14 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         },
       }
       const state = await store.update((doc) => {
+        const previous = captureEffectiveScopes(doc, result.installed)
         let next = upsertSource(doc, nextSource)
         next = installItems(next, result.installed, {
           scope: undefined,
           sourceId: id,
           digests: result.digests,
           installedAt: new Date().toISOString(),
+          previous,
         })
         // Skills that disappeared upstream are gone from disk already.
         const shared = sharedNames(next, id)

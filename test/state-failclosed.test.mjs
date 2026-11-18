@@ -7,6 +7,7 @@
  */
 
 import assert from 'node:assert/strict'
+import zlib from 'node:zlib'
 import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -816,6 +817,54 @@ test('a dangling source reference is rejected only when an inherited scope depen
   }
 })
 
+/** Build a minimal stored ZIP with one `name/SKILL.md` entry. */
+function storedZip(name, content) {
+  const data = Buffer.from(content, 'utf8')
+  const file = Buffer.from(`${name}/SKILL.md`, 'utf8')
+  const crc = zlib.crc32(data)
+  const local = Buffer.alloc(30)
+  local.writeUInt32LE(0x04034b50, 0)
+  local.writeUInt16LE(20, 4)
+  local.writeUInt16LE(0, 6)
+  local.writeUInt16LE(0, 8)
+  local.writeUInt16LE(0, 10)
+  local.writeUInt16LE(0, 12)
+  local.writeUInt32LE(crc, 14)
+  local.writeUInt32LE(data.length, 18)
+  local.writeUInt32LE(data.length, 22)
+  local.writeUInt16LE(file.length, 26)
+  local.writeUInt16LE(0, 28)
+  const central = Buffer.alloc(46)
+  central.writeUInt32LE(0x02014b50, 0)
+  central.writeUInt16LE(20, 4)
+  central.writeUInt16LE(20, 6)
+  central.writeUInt16LE(0, 8)
+  central.writeUInt16LE(0, 10)
+  central.writeUInt16LE(0, 12)
+  central.writeUInt16LE(0, 14)
+  central.writeUInt32LE(crc, 16)
+  central.writeUInt32LE(data.length, 20)
+  central.writeUInt32LE(data.length, 24)
+  central.writeUInt16LE(file.length, 28)
+  central.writeUInt16LE(0, 30)
+  central.writeUInt16LE(0, 32)
+  central.writeUInt16LE(0, 34)
+  central.writeUInt16LE(0, 36)
+  central.writeUInt32LE(0, 38)
+  central.writeUInt32LE(0, 42)
+  const centralOffset = local.length + file.length + data.length
+  const end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50, 0)
+  end.writeUInt16LE(0, 4)
+  end.writeUInt16LE(0, 6)
+  end.writeUInt16LE(1, 8)
+  end.writeUInt16LE(1, 10)
+  end.writeUInt32LE(central.length + file.length, 12)
+  end.writeUInt32LE(centralOffset, 16)
+  end.writeUInt16LE(0, 20)
+  return Buffer.concat([local, file, data, central, file, end])
+}
+
 /** A shared skill state where one repo group scopes two sources. */
 function sharedSourceState({ groupEnabled = true, memberMode = 'group' } = {}) {
   return normalizeState({
@@ -1107,6 +1156,201 @@ test('an API group marker with no resolvable group is rejected only when it woul
     assert.equal(selfEdit.status, 200)
     assert.equal(selfEdit.payload.state.skills.local.modesFrom, 'self')
     assert.deepEqual(selfEdit.payload.state.skills.local.modes, ['c'])
+  } finally {
+    await api.dispose()
+  }
+})
+
+
+test('a conservative fallback keeps its old deny when the visible tool list becomes empty', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kv__read' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    const agent = harness.addAgent('a')
+    await harness.activation.reapplyAll()
+    assert.deepEqual(agent.restrictions[0].deny, ['mcp__kv__read'])
+
+    // A transient empty tool surface must not release the only deny we have.
+    schemasRef.current = []
+    await harness.activation.reapplyAll()
+    assert.equal(agent.restrictions[0].disposed, false, 'the previous conservative deny is retained')
+    assert.deepEqual(agent.restrictions[0].deny, ['mcp__kv__read'])
+
+    // If the same tool reappears without another reapply, the retained layer
+    // still denies it.
+    schemasRef.current = [{ name: 'mcp__kv__read' }]
+    assert.equal(agent.restrictions.filter((entry) => entry.disposed === false).length, 1)
+    assert.deepEqual(agent.restrictions[0].deny, ['mcp__kv__read'])
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('re-importing a group-scoped skill through files preserves effective scope and disabled state', async () => {
+  const api = await makeApi(sharedSourceState())
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = api.dir
+  const content = '---\nname: shared\ndescription: probe\n---\nbody\n'
+  try {
+    const upload = await api.call('POST', '/skill/upload', {
+      files: [{ path: 'shared/SKILL.md', content }],
+      overwrite: true,
+    })
+    assert.equal(upload.status, 200)
+    const member = upload.payload.state.skills.shared
+    assert.notEqual(member.sourceId, 'src_a')
+    assert.equal(member.modesFrom, 'self')
+    assert.equal(member.workspacesFrom, 'self')
+    assert.deepEqual(member.modes, ['standard'])
+    assert.deepEqual(member.workspaces, ['/workspace'])
+    assert.equal(member.enabled, true)
+
+    const allowed = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.deepEqual(allowed.payload.pool.skills, ['shared'])
+    const denied = await api.call('GET', '/resolve?mode=ptc&cwd=%2Felsewhere')
+    assert.deepEqual(denied.payload.pool.skills, [])
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await api.dispose()
+  }
+})
+
+test('re-importing a group-scoped skill with an explicit scope stores self, not a group that overrides it', async () => {
+  const api = await makeApi(sharedSourceState())
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = api.dir
+  const content = '---\nname: shared\ndescription: probe\n---\nbody\n'
+  try {
+    const upload = await api.call('POST', '/skill/upload', {
+      files: [{ path: 'shared/SKILL.md', content }],
+      overwrite: true,
+      scope: { modes: ['upload-mode'] },
+    })
+    assert.equal(upload.status, 200)
+    const member = upload.payload.state.skills.shared
+    assert.equal(member.modesFrom, 'self')
+    assert.deepEqual(member.modes, ['upload-mode'])
+    assert.deepEqual(member.workspaces, ['/workspace'], 'unmodified dimension keeps its effective scope')
+    const allowed = await api.call('GET', '/resolve?mode=upload-mode&cwd=%2Fworkspace')
+    assert.deepEqual(allowed.payload.pool.skills, ['shared'])
+    const oldMode = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.deepEqual(oldMode.payload.pool.skills, [])
+    const elsewhere = await api.call('GET', '/resolve?mode=upload-mode&cwd=%2Felsewhere')
+    assert.deepEqual(elsewhere.payload.pool.skills, [])
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await api.dispose()
+  }
+})
+
+test('re-importing a skill whose old group was disabled keeps it disabled', async () => {
+  const api = await makeApi(sharedSourceState({ groupEnabled: false }))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = api.dir
+  const content = '---\nname: shared\ndescription: probe\n---\nbody\n'
+  try {
+    const upload = await api.call('POST', '/skill/upload', {
+      files: [{ path: 'shared/SKILL.md', content }],
+      overwrite: true,
+    })
+    assert.equal(upload.status, 200)
+    const member = upload.payload.state.skills.shared
+    assert.equal(member.enabled, false)
+    const resolve = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.deepEqual(resolve.payload.pool.skills, [])
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await api.dispose()
+  }
+})
+
+test('the ZIP re-import path shares the same effective-scope preservation', async () => {
+  const api = await makeApi(sharedSourceState())
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = api.dir
+  const archive = storedZip('shared', '---\nname: shared\ndescription: probe\n---\nbody\n').toString('base64')
+  try {
+    const upload = await api.call('POST', '/skill/zip', { archiveBase64: archive, overwrite: true })
+    assert.equal(upload.status, 200)
+    const member = upload.payload.state.skills.shared
+    assert.equal(member.modesFrom, 'self')
+    assert.deepEqual(member.modes, ['standard'])
+    assert.deepEqual(member.workspaces, ['/workspace'])
+    const denied = await api.call('GET', '/resolve?mode=ptc&cwd=%2Felsewhere')
+    assert.deepEqual(denied.payload.pool.skills, [])
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await api.dispose()
+  }
+})
+
+test('an empty import: group key is rejected without touching bytes', async () => {
+  const api = await makeApi()
+  try {
+    const before = await readFile(api.file)
+    for (const key of ['import:', 'repo:']) {
+      const response = await api.call('POST', '/group', { key })
+      assert.equal(response.status, 400, key)
+      assert.equal(response.payload.error.code, 'resource-pool/bad-group')
+      assert.deepEqual(await readFile(api.file), before)
+    }
+  } finally {
+    await api.dispose()
+  }
+})
+
+
+test('the panel inheritance action self -> group is accepted when the group resolves', async () => {
+  const state = sharedSourceState({ memberMode: 'self' })
+  state.skills.shared.modes = ['x']
+  state.skills.shared.workspaces = ['/x']
+  const api = await makeApi(state)
+  try {
+    // This is the body the panel's inherit button flushes: current values are
+    // still sent, but modesFrom/workspacesFrom switch to group.
+    const response = await api.call('POST', '/item', {
+      kind: 'skill', name: 'shared', enabled: true,
+      modes: ['x'], workspaces: ['/x'], modesFrom: 'group', workspacesFrom: 'group',
+    })
+    assert.equal(response.status, 200)
+    const member = response.payload.state.skills.shared
+    assert.equal(member.modesFrom, 'group')
+    assert.equal(member.workspacesFrom, 'group')
+    const groupMode = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.deepEqual(groupMode.payload.pool.skills, ['shared'])
+    const ownMode = await api.call('GET', '/resolve?mode=x&cwd=%2Fx')
+    assert.deepEqual(ownMode.payload.pool.skills, [])
+  } finally {
+    await api.dispose()
+  }
+})
+
+test('a marker-only group -> self switch materializes the effective scope instead of widening', async () => {
+  const api = await makeApi(sharedSourceState())
+  try {
+    // The panel's inherit-off action sends the unchanged own (empty) values.
+    const response = await api.call('POST', '/item', {
+      kind: 'skill', name: 'shared', modes: [], workspaces: [], modesFrom: 'self', workspacesFrom: 'self',
+    })
+    assert.equal(response.status, 200)
+    const member = response.payload.state.skills.shared
+    assert.equal(member.modesFrom, 'self')
+    assert.equal(member.workspacesFrom, 'self')
+    assert.deepEqual(member.modes, ['standard'])
+    assert.deepEqual(member.workspaces, ['/workspace'])
+
+    const groupMode = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.deepEqual(groupMode.payload.pool.skills, ['shared'])
+    const other = await api.call('GET', '/resolve?mode=ptc&cwd=%2Felsewhere')
+    assert.deepEqual(other.payload.pool.skills, [])
   } finally {
     await api.dispose()
   }

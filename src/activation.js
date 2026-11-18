@@ -325,6 +325,16 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     const record = agents.get(agent)
     if (record === undefined) throw new Error('agent activation record is missing')
 
+    if (deny.length === 0 && record.disposers.length > 0) {
+      // The host may be between generations. Keep the previous deny: releasing
+      // it would expose its old names before the next non-empty refresh.
+      record.signature = ''
+      record.activated = true
+      record.conservative = true
+      logger?.warn?.('[resource-pool] state unavailable; empty tool surface kept the previous conservative deny')
+      return
+    }
+
     // Register the refreshed deny before releasing the previous fallback, so a
     // tool added between two explicit re-applies is covered as soon as it is
     // visible. This remains a point-in-time static list (see docs).

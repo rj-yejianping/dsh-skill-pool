@@ -9,7 +9,8 @@
  * @module dsh-skill-pool/mount
  */
 
-import { serverToolPrefix, upsertMcpServer } from './uploads.js'
+import { isAmbiguousMcpToolName, mcpServerOf } from './rules.js'
+import { upsertMcpServer } from './uploads.js'
 
 /** Default readiness window for one MCP mount (§6: 20s). */
 export const DEFAULT_PROBE_TIMEOUT_MS = 20_000
@@ -26,10 +27,14 @@ export const DEFAULT_PROBE_INTERVAL_MS = 500
 export function hasServerTools(ctx, serverName) {
   const tools = ctx.get('tools')
   if (tools === undefined || typeof tools.schemas !== 'function') return false
-  const prefix = serverToolPrefix(serverName)
-  if (prefix.length === 0) return false
   try {
-    return tools.schemas().some((schema) => typeof schema?.name === 'string' && schema.name.startsWith(prefix))
+    return tools.schemas().some((schema) => {
+      const name = schema?.name
+      if (typeof name !== 'string' || !name.startsWith('mcp__')) return false
+      // A name that cannot be attributed to exactly one server must not make
+      // another server look ready (e.g. `mcp__a___b` from server `a_`).
+      return !isAmbiguousMcpToolName(name) && mcpServerOf(name) === serverName
+    })
   } catch {
     return false
   }

@@ -2272,6 +2272,7 @@ window.__ModuleLoader__.load({
       const [loading, setLoading] = useState(true)
       const [error, setError] = useState('')
       const [notice, setNotice] = useState('')
+      const [activationWarning, setActivationWarning] = useState(null)
       const [tab, setTab] = useState('resources')
       const [expanded, setExpanded] = useState({})
       const [groupOpen, setGroupOpen] = useState({})

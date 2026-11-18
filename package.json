@@ -47,6 +47,7 @@
     "lint": "node --check index.js && node --check client.js && node --check src/store.js && node --check src/rules.js && node --check src/inventory.js && node --check src/activation.js && node --check src/provider.js && node --check src/skill-content.js && node --check src/web-api.js && node --check src/uploads.js && node --check src/mount.js && node --check src/remount.js && node --check src/library.js",
     "test:feasibility": "node --test test/mcp-feasibility.probe.mjs",
     "test:lifecycle": "node --test test/plugin-lifecycle.probe.mjs",
+    "test:naming": "node --test test/mcp-naming.probe.mjs",
     "verify:feasibility": "node test/verify-feasibility.mjs"
   },
   "dsh": {

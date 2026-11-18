@@ -244,11 +244,18 @@ export function resolvePool(state, { mode, cwd, allModes, allWorkspaces } = {}) 
  */
 export function isAmbiguousMcpToolName(toolName) {
   if (typeof toolName !== 'string' || !toolName.startsWith(MCP_TOOL_PREFIX)) return false
+  // A 12-hex suffix is the host's lossy-normalization/truncation marker. Such a
+  // name may have lost a server separator, so it cannot be prefix-allowed.
+  if (/_[0-9a-f]{12}$/.test(toolName)) return true
   const rest = toolName.slice(MCP_TOOL_PREFIX.length)
-  const separator = rest.indexOf('__')
-  if (separator <= 0) return true
-  if (separator === rest.length - 2) return true
-  return rest.indexOf('__', separator + 2) >= 0
+  // Every position that can split rest into non-empty server + non-empty raw.
+  // Overlapping separators matter: `a___b` can split as (`a`, `_b`) or
+  // (`a_`, `b`), so `indexOf('__', first + 2)` is not enough.
+  const splits = []
+  for (let index = 1; index + 2 < rest.length; index += 1) {
+    if (rest[index] === '_' && rest[index + 1] === '_') splits.push(index)
+  }
+  return splits.length !== 1
 }
 
 /**

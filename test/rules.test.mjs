@@ -98,3 +98,20 @@ test('a member with no group keeps its own scope', () => {
   assert.deepEqual(resolvePool(state, { mode: 'standard' }).skills, ['local'])
   assert.deepEqual(resolvePool(state, { mode: 'cordis' }).skills, [])
 })
+
+test('ambiguous MCP names include overlapping separators and malformed splits', async () => {
+  const { isAmbiguousMcpToolName } = await import('../src/rules.js')
+  for (const name of [
+    'mcp__a___b',          // server a_ / raw b, or server a / raw _b
+    'mcp__alpha__a__x',    // multiple separators
+    'mcp__alpha__',        // empty raw
+    'mcp__alpha',          // no separator
+    'mcp____x',            // empty server
+    'mcp__alpha__' + 'b'.repeat(36) + '_0123456789ab', // lossy hash suffix
+  ]) {
+    assert.equal(isAmbiguousMcpToolName(name), true, name)
+  }
+  for (const name of ['mcp__a__b', 'mcp__alpha__search', 'mcp__a_b__c', 'not-mcp']) {
+    assert.equal(isAmbiguousMcpToolName(name), false, name)
+  }
+})
