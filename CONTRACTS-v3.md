@@ -294,9 +294,12 @@ Fail-closed 增量：
   重放不会无限增长；旧不可见层不能与当前新名单合并。
 - **零限制层失败**：上次成功但 all-allowed（零 restrict 层）后读取失败，会尝试 conservative deny
   当前全部已知 MCP；失败显式 degraded。上次 `mcpGate:false`/无 MCP 成员则不覆盖全局关闭语义。
-- **部分注册失败**：逐工具 restrict 有一个失败时保留全部旧层与已成功新层，清 signature、标记
-  degraded；下一次非空重放收敛。新 Agent 没有旧层时仍拒绝创建。真实 ToolsService+activation
-  探针（含 unregister race）由 `npm run test:activation` 覆盖。
+- **部分注册失败**：逐工具 restrict 有一个失败时保留全部旧层与已成功新层，清 signature，并区分：
+  - 失败名无旧层覆盖 → `activation-incomplete`（under-restriction，工具重新出现后、下次重放前可能可调用）；
+  - 仅保留不可见旧层 → `activation-over-restricted`（over-restriction，可能暂时过度限制）。
+  已覆盖的旧层/成功新层去重，连续失败 active 层数稳定；下一次非空重放收敛。新 Agent 没有旧层时
+  仍拒绝创建。空可见清单不宣称安装 deny。真实 ToolsService+activation 探针（零层/race/多 agent/
+  scope-local OBSERVED GAP）由 `npm run test:activation` 覆盖。
 - `POST /group` 的 `import:`/`repo:` 空名返回 400。
 - **警告持久化**：写成功但重新应用失败返回 200 + 脱敏 `warning`；面板显示可关闭的持久警告条，
   不被后续成功响应或短 toast 覆盖。

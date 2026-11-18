@@ -182,15 +182,18 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         // live Agent could be re-applied exactly without echoing tool names or
         // errors; `degraded` means old deny layers were retained for tools that
         // are not currently visible.
-        warning = {
-          code: 'resource-pool/activation-degraded',
-          message:
-            failed > 0
-              ? `状态已保存，但 ${failed} 个活动会话未能重新应用；它们保留旧限制或仅保守 MCP 拒绝层。`
-              : `状态已保存，但 ${degraded} 个活动会话有暂不可见的旧限制被保留；相关工具重新出现前可能仍被过度限制。`,
-          ...(failed > 0 ? { failed } : {}),
-          ...(degraded > 0 ? { degraded } : {}),
-        }
+        warning = failed > 0
+          ? {
+              code: 'resource-pool/activation-incomplete',
+              message: `状态已保存，但 ${failed} 个活动会话未完整应用 MCP 限制；部分工具可能仍可调用，直到下一次重放。`,
+              failed,
+              ...(degraded > 0 ? { degraded } : {}),
+            }
+          : {
+              code: 'resource-pool/activation-degraded',
+              message: `状态已保存，但 ${degraded} 个活动会话保留了暂不可见工具的旧限制；相关工具重新出现前可能被过度限制。`,
+              degraded,
+            }
       }
     } catch (error) {
       logger?.warn?.(`[resource-pool] re-application failed: ${error instanceof Error ? error.message : String(error)}`)

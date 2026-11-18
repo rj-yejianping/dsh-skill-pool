@@ -154,14 +154,16 @@ test('real activation: a raced restrict registration keeps successes and converg
       }
       return schemas
     }
-    const degraded = await activation.applyToAgent(h.agent, { force: true })
-    assert.equal(degraded.ok, true)
-    assert.equal(degraded.degraded, true)
+    const incomplete = await activation.applyToAgent(h.agent, { force: true })
+    assert.equal(incomplete.ok, false)
+    assert.equal(incomplete.code, 'resource-pool/activation-incomplete')
     assert.deepEqual(h.visible(), [], 'old and successful layers still hide everything currently registered')
 
-    // Re-register the raced tool and retry: the next activation converges.
+    // Re-register the raced tool. Before a retry it is callable: this is the
+    // documented dynamic gap, pinned as OBSERVED GAP rather than claimed safe.
     h.hostCtx.tools.register(definition('mcp__fourth__x'))
     h.toolsView.schemas = normalSchemas
+    assert.deepEqual(h.visible(), ['mcp__fourth__x'], 'OBSERVED GAP: a re-registered raced name is visible before retry')
     const recovered = await activation.applyToAgent(h.agent, { force: true })
     assert.equal(recovered.degraded, undefined)
     assert.deepEqual(h.visible(), [], 'all four denied after convergence')
@@ -170,6 +172,82 @@ test('real activation: a raced restrict registration keeps successes and converg
     assert.deepEqual(h.visible(), ['mcp__fourth__x', 'mcp__kb__search', 'mcp__other__x', 'mcp__third__x'])
   } finally {
     activation.disposeAll()
+    await h.dispose()
+  }
+})
+
+
+test('real activation: all-allowed -> partial failure -> re-register shows an OBSERVED GAP before retry', async () => {
+  const h = await harness(['mcp__kb__search'])
+  const allAllowed = stateWith({ allow: ['kb'] })
+  let state = allAllowed
+  const activation = createActivation({
+    ctx: { get: (name) => (name === 'tools' ? h.toolsView : h.root.get(name)) },
+    getState: async () => state,
+    logger: h.logger,
+    libraryRoot: () => '/nonexistent-library',
+  })
+  try {
+    await activation.applyToAgent(h.agent)
+    assert.deepEqual(h.visible(), ['mcp__kb__search'])
+
+    // A new denied tool appears and is unregistered between schemas()/restrict().
+    state = stateWith({ allow: ['kb'], extra: ['fourth'] })
+    const fourth = h.hostCtx.tools.register(definition('mcp__fourth__x'))
+    const normalSchemas = h.toolsView.schemas
+    let raced = false
+    h.toolsView.schemas = () => {
+      const schemas = normalSchemas()
+      if (!raced) {
+        raced = true
+        fourth()
+      }
+      return schemas
+    }
+    const incomplete = await activation.applyToAgent(h.agent, { force: true })
+    assert.equal(incomplete.ok, false)
+    assert.equal(incomplete.code, 'resource-pool/activation-incomplete')
+    assert.deepEqual(h.visible(), ['mcp__kb__search'])
+
+    h.hostCtx.tools.register(definition('mcp__fourth__x'))
+    h.toolsView.schemas = normalSchemas
+    assert.deepEqual(h.visible().sort(), ['mcp__fourth__x', 'mcp__kb__search'], 'OBSERVED GAP: no deny layer covers the re-registered name before retry')
+
+    await activation.applyToAgent(h.agent, { force: true })
+    assert.deepEqual(h.visible(), ['mcp__kb__search'], 'retry converges and denies the raced tool while kb remains allowed')
+  } finally {
+    activation.disposeAgent(h.agent)
+    await h.dispose()
+  }
+})
+
+test('real activation: two scopes are independent and a scope-local tool bypasses global deny (OBSERVED GAP)', async () => {
+  const h = await harness(['mcp__kb__search'])
+  const key2 = {}
+  const scoped2 = createScope(h.hostCtx, key2)
+  const agent2 = { session: { header: { agentPreset: 'a', cwd: '/workspace' } }, ctx: scoped2.ctx }
+  // Register a scope-local tool in scope 2; scoped registrations are exempt
+  // from tools.restrict (documented limitation).
+  scoped2.ctx.tools.register(definition('mcp__local__x'))
+  const state = stateWith({ deny: ['kb'] })
+  const activation = createActivation({
+    ctx: { get: (name) => (name === 'tools' ? h.toolsView : h.root.get(name)) },
+    getState: async () => state,
+    logger: h.logger,
+    libraryRoot: () => '/nonexistent-library',
+  })
+  try {
+    await activation.applyToAgent(h.agent)
+    await activation.applyToAgent(agent2)
+    assert.deepEqual(h.root.tools.schemas(h.key).map((schema) => schema.name), [], 'agent 1 global deny')
+    assert.deepEqual(
+      h.root.tools.schemas(key2).map((schema) => schema.name),
+      ['mcp__local__x'],
+      'OBSERVED GAP: scope-local registration remains visible despite global deny',
+    )
+  } finally {
+    activation.disposeAgent(h.agent)
+    activation.disposeAgent(agent2)
     await h.dispose()
   }
 })
