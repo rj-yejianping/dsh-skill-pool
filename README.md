@@ -250,7 +250,8 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
 - **降级可见**：面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 工具在失败时返回
   `stateStatus.ok=false`、错误码与恢复说明。写入成功但重新应用失败时，HTTP 仍返回 200（已提交状态保留）
   并附带脱敏的 `warning`；面板显示**持久、可手动关闭**的警告条（不再使用 3.2 秒成功 toast，也不会被
-  后续成功响应清除），不会假装所有活动会话都已生效。
+  后续成功响应清除），不会假装所有活动会话都已生效。服务端只在触发该写操作的响应里返回 warning，
+  后续 GET 不会重发；该 banner 是当前面板会话的状态，用户需手动关闭，页面刷新/重新挂载后消失。
 - **边界**：全新 Host 进程启动后若状态文件已被删除，无法区分"被删"与"真正首次使用"，
   此时按首次运行处理（同进程内的新 `StateStore` 会记得，见上）。
   插件重载会先释放旧限制层；若重载时文件仍损坏，已有会话只能退化为上述保守层，
@@ -292,18 +293,18 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，148 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，151 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 148/148；不代表宿主能力已验证 |
-| `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 4/4；不是宿主能力门禁 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 151/151；不代表宿主能力已验证 |
+| `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 5/5；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
-| `npm run test:activation` | 真实 ToolsService + production activation 探针（零层/竞态/多 agent/scope-local） | 当前环境 4/4；不是宿主能力门禁 |
+| `npm run test:activation` | 真实 ToolsService + production activation 探针（零层/竞态/多 agent/scope-local） | 当前环境 5/5；不是宿主能力门禁 |
 | `npm run test:feasibility` | 可选探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
 | `npm run verify:feasibility` | **发布或能力声明的强制门禁**（Node 包装器，POSIX/Windows 通用） | 缺失、版本不符或任一探针失败均非零退出 |
 

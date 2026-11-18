@@ -263,7 +263,9 @@ Fail-closed 增量：
 规则：
 
 - 写操作：原子落盘 → `reapplyAll()` → 返回新 `state`。若重新应用有失败或 `degraded`（有不可见
-  旧 deny 被保留），仍返回 200 与已提交的 `state`，并附带脱敏 `warning`；不会把已提交的写操作回滚。
+  旧 deny 被保留），仍返回 200 与已提交的 `state`，并附带按实际 warnings code 分类的脱敏 `warning`
+  （incomplete/conservative/degraded；混合会说明）；不会把已提交的写操作回滚。Warning 只在本次
+  写响应返回，后续 GET 不重发；面板会话内持久、需用户关闭，刷新/重新挂载后消失。
 - 所有 scope/enabled 入参在落盘前严格校验：`modes` 必须是合法字符串数组（`[123]`、带空白的模式名
   400），`workspaces` 必须是绝对路径（相对路径 400），`enabled`/settings 开关必须是布尔值；
   省略字段保持"部分更新、保留原值"，空数组仍是显式"全部"。非法输入返回 400 且文件字节不变。

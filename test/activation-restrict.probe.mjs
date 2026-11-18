@@ -251,3 +251,52 @@ test('real activation: two scopes are independent and a scope-local tool bypasse
     await h.dispose()
   }
 })
+
+test('real activation: a partial under-restriction refreshes conservatively on a later corrupt state', async () => {
+  const h = await harness(['mcp__kb__search'])
+  let state = stateWith({ allow: ['kb'] })
+  let corrupt = false
+  const activation = createActivation({
+    ctx: { get: (name) => (name === 'tools' ? h.toolsView : h.root.get(name)) },
+    getState: async () => {
+      if (corrupt) throw new StateReadError('resource-pool/state-invalid-json', 'synthetic corrupt')
+      return state
+    },
+    logger: h.logger,
+    libraryRoot: () => '/nonexistent-library',
+  })
+  try {
+    await activation.applyToAgent(h.agent)
+    assert.deepEqual(h.visible(), ['mcp__kb__search'])
+
+    state = stateWith({ allow: ['kb'], extra: ['newa', 'newb'] })
+    h.hostCtx.tools.register(definition('mcp__newa__x'))
+    const newb = h.hostCtx.tools.register(definition('mcp__newb__x'))
+    const normalSchemas = h.toolsView.schemas
+    let raced = false
+    h.toolsView.schemas = () => {
+      const schemas = normalSchemas()
+      if (!raced) {
+        raced = true
+        newb()
+      }
+      return schemas
+    }
+    const incomplete = await activation.applyToAgent(h.agent, { force: true })
+    assert.equal(incomplete.code, 'resource-pool/activation-incomplete')
+    assert.deepEqual(h.visible(), ['mcp__kb__search'])
+
+    // File breaks; newb is re-registered and a new tool appears. The retained
+    // under-restriction must trigger a conservative refresh covering all three.
+    corrupt = true
+    h.hostCtx.tools.register(definition('mcp__newb__x'))
+    h.hostCtx.tools.register(definition('mcp__newc__x'))
+    h.toolsView.schemas = normalSchemas
+    const refreshed = await activation.applyToAgent(h.agent, { force: true, conservative: true })
+    assert.equal(refreshed.code, 'resource-pool/activation-conservative')
+    assert.deepEqual(h.visible(), [], 'all currently visible MCP tools are conservatively denied')
+  } finally {
+    activation.disposeAgent(h.agent)
+    await h.dispose()
+  }
+})

@@ -290,12 +290,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         // see newly registered MCP tools even while the document is unreadable.
         if (record.conservative && conservative) {
           try {
-            applyConservativeGate(agent)
-            return {
-              ok: false,
-              code: 'resource-pool/activation-conservative',
-              message: 'state unavailable; conservative MCP deny refreshed',
-            }
+            return conservativeResult(agent)
           } catch (gateError) {
             logger?.warn?.(`[resource-pool] conservative MCP gate refresh failed: ${gateError instanceof Error ? gateError.message : String(gateError)}`)
           }
@@ -310,28 +305,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
           // "retained gate" would leave a later failure ungated. Install a
           // conservative deny for all currently known MCP tools instead.
           try {
-            const info = applyConservativeGate(agent)
-            if (info.under) {
-              return {
-                ok: false,
-                code: 'resource-pool/activation-incomplete',
-                message: 'state unavailable; conservative MCP deny is incomplete and a failed tool may be callable',
-              }
-            }
-            if (info.visible === 0) {
-              return {
-                ok: false,
-                code: 'resource-pool/activation-degraded',
-                message: info.kept
-                  ? 'state unavailable; no MCP tools visible, previous layers kept, no new deny installed'
-                  : 'state unavailable; no MCP tools visible, no deny could be installed',
-              }
-            }
-            return {
-              ok: false,
-              code: 'resource-pool/activation-conservative',
-              message: 'state unavailable with no prior MCP restriction; conservative deny applied to visible tools',
-            }
+            return conservativeResult(agent)
           } catch (gateError) {
             logger?.warn?.(
               `[resource-pool] conservative MCP gate failed without a prior layer: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
@@ -355,28 +329,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         // unreadable. Deny every currently visible MCP tool and keep the Agent
         // alive; dynamic additions remain a documented gap.
         try {
-          const info = applyConservativeGate(agent)
-          if (info.under) {
-            return {
-              ok: false,
-              code: 'resource-pool/activation-incomplete',
-              message: 'state unavailable; conservative MCP deny is incomplete and a failed tool may be callable',
-            }
-          }
-          if (info.visible === 0) {
-            return {
-              ok: false,
-              code: 'resource-pool/activation-degraded',
-              message: info.kept
-                ? 'state unavailable; no MCP tools visible, previous layers kept, no new deny installed'
-                : 'state unavailable; no MCP tools visible, no deny could be installed',
-            }
-          }
-          return {
-            ok: false,
-            code: 'resource-pool/activation-conservative',
-            message: 'state unavailable; conservative MCP deny applied to visible tools',
-          }
+          return conservativeResult(agent)
         } catch (gateError) {
           logger?.warn?.(
             `[resource-pool] conservative MCP gate failed: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
@@ -498,6 +451,36 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     } catch (error) {
       for (const entry of pending.reverse()) disposeEntry(entry)
       throw error
+    }
+  }
+
+  /**
+   * Convert one conservative-gate outcome into the exact external result.
+   * A partial failure is under-restriction; empty visibility never claims a
+   * deny was installed; success is the conservative mode result.
+   */
+  const conservativeResult = (agent) => {
+    const info = applyConservativeGate(agent)
+    if (info.under) {
+      return {
+        ok: false,
+        code: 'resource-pool/activation-incomplete',
+        message: 'state unavailable; conservative MCP deny is incomplete and a failed tool may be callable',
+      }
+    }
+    if (info.visible === 0) {
+      return {
+        ok: false,
+        code: 'resource-pool/activation-degraded',
+        message: info.kept
+          ? 'state unavailable; no MCP tools visible, previous layers kept, no new deny installed'
+          : 'state unavailable; no MCP tools visible, no deny could be installed',
+      }
+    }
+    return {
+      ok: false,
+      code: 'resource-pool/activation-conservative',
+      message: 'state unavailable; conservative MCP deny applied to visible tools',
     }
   }
 
@@ -742,7 +725,10 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       // Any retained layer covering a currently invisible name means the last
       // safe activation could not be reconstructed exactly. Keep conservative
       // semantics so a later state failure refreshes coverage for new tools.
-      record.conservative = retainedInvisible
+      // An under-restriction activation has no complete prior gate, so a later
+      // state failure must attempt a conservative refresh even if some new
+      // per-tool layers succeeded and there were no old layers.
+      record.conservative = retainedInvisible || underRestricted
       record.degraded = retainedInvisible
       record.underRestricted = underRestricted
       record.signature = incomplete || retainedInvisible ? '' : signature

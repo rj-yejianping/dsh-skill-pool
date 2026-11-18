@@ -177,23 +177,41 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       const result = await onChanged?.()
       const failed = Number.isFinite(result?.failed) ? result.failed : 0
       const degraded = Number.isFinite(result?.degraded) ? result.degraded : 0
+      const warnings = Array.isArray(result?.warnings) ? result.warnings : []
+      const codes = new Set(warnings.map((entry) => entry?.code).filter((code) => typeof code === 'string'))
       if (failed > 0 || degraded > 0) {
-        // The write is committed and must stay committed. Report that not every
-        // live Agent could be re-applied exactly without echoing tool names or
-        // errors; `degraded` means old deny layers were retained for tools that
-        // are not currently visible.
-        warning = failed > 0
-          ? {
-              code: 'resource-pool/activation-incomplete',
-              message: `状态已保存，但 ${failed} 个活动会话未完整应用 MCP 限制；部分工具可能仍可调用，直到下一次重放。`,
-              failed,
-              ...(degraded > 0 ? { degraded } : {}),
-            }
-          : {
-              code: 'resource-pool/activation-degraded',
-              message: `状态已保存，但 ${degraded} 个活动会话保留了暂不可见工具的旧限制；相关工具重新出现前可能被过度限制。`,
-              degraded,
-            }
+        // Classify by the actual outcome codes, not merely by counts: a
+        // successful conservative fallback is not an under-restriction, and a
+        // mixed result must say both.
+        const under = codes.has('resource-pool/activation-incomplete')
+        const conservative = codes.has('resource-pool/activation-conservative')
+        const over = codes.has('resource-pool/activation-over-restricted') || degraded > 0
+        const noLayer = codes.has('resource-pool/activation-degraded')
+        let message
+        if (under) {
+          message = `状态已保存，但 ${failed} 个活动会话未完整应用 MCP 限制；部分工具可能仍可调用，直到下一次重放。`
+          if (over) message += ' 另有旧限制被保留，相关工具可能暂时被过度限制。'
+        } else if (conservative) {
+          message = '状态已保存；MCP 门控已退化为对可见工具的保守拒绝'
+          if (over) message += '，并保留了暂不可见工具的旧限制（可能暂时过度限制）。'
+          else message += '。'
+        } else if (noLayer) {
+          message = '状态已保存，但当前没有可见 MCP 工具；未安装新的拒绝层，旧层按实际情况保留。'
+        } else if (over) {
+          message = `状态已保存，但 ${degraded} 个活动会话保留了暂不可见工具的旧限制；相关工具重新出现前可能被过度限制。`
+        } else {
+          message = '状态已保存，但部分活动会话未能重新应用；请检查状态工具和运行日志。'
+        }
+        warning = {
+          code: under
+            ? 'resource-pool/activation-incomplete'
+            : conservative
+              ? 'resource-pool/activation-conservative'
+              : 'resource-pool/activation-degraded',
+          message,
+          ...(failed > 0 ? { failed } : {}),
+          ...(degraded > 0 ? { degraded } : {}),
+        }
       }
     } catch (error) {
       logger?.warn?.(`[resource-pool] re-application failed: ${error instanceof Error ? error.message : String(error)}`)

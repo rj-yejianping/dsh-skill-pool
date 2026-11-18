@@ -696,7 +696,7 @@ test('a committed but degraded re-application is reported as a redacted warning'
     onChanged: async () => ({
       total: 1,
       failed: 1,
-      warnings: [{ code: 'resource-pool/activation-degraded', message: 'Bearer hidden-fixture-not-real' }],
+      warnings: [{ code: 'resource-pool/activation-incomplete', message: 'Bearer hidden-fixture-not-real' }],
     }),
   })
   try {
@@ -1666,7 +1666,7 @@ test('a committed write with retained invisible denies returns a degraded warnin
   const api = await makeApi(validState(), {
     onChanged: async () => ({
       total: 1, failed: 0, degraded: 1,
-      warnings: [{ code: 'resource-pool/activation-degraded', message: 'internal detail must not leak' }],
+      warnings: [{ code: 'resource-pool/activation-over-restricted', message: 'internal detail must not leak' }],
     }),
   })
   try {
@@ -1675,6 +1675,7 @@ test('a committed write with retained invisible denies returns a degraded warnin
     assert.equal(response.payload.state.mcp.kb.enabled, false)
     assert.equal(response.payload.warning?.code, 'resource-pool/activation-degraded')
     assert.equal(response.payload.warning?.degraded, 1)
+    assert.match(response.payload.warning?.message ?? '', /过度限制/)
     assert.equal(JSON.stringify(response.payload).includes('internal detail must not leak'), false)
   } finally {
     await api.dispose()
@@ -1935,6 +1936,84 @@ test('an empty conservative snapshot never claims a deny was installed', async (
     assert.equal(result.warnings.some((warning) => warning.code === 'resource-pool/activation-degraded'), true)
     assert.equal(activeLayers(agent), 0)
     assert.equal(result.warnings.some((warning) => /applied|installed/i.test(warning.message) && warning.code === 'resource-pool/activation-conservative'), false)
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('committed warnings classify conservative success separately from under-restriction', async () => {
+  const api = await makeApi(validState(), {
+    onChanged: async () => ({
+      total: 1, failed: 1,
+      warnings: [{ code: 'resource-pool/activation-conservative', message: 'internal' }],
+    }),
+  })
+  try {
+    const response = await api.call('POST', '/item', { kind: 'mcp', name: 'kb', enabled: false })
+    assert.equal(response.payload.warning?.code, 'resource-pool/activation-conservative')
+    assert.match(response.payload.warning?.message ?? '', /保守/)
+    assert.equal(/可调用/.test(response.payload.warning?.message ?? ''), false)
+  } finally {
+    await api.dispose()
+  }
+})
+
+test('committed warnings mention both under- and over-restriction when mixed', async () => {
+  const api = await makeApi(validState(), {
+    onChanged: async () => ({
+      total: 2, failed: 1, degraded: 1,
+      warnings: [
+        { code: 'resource-pool/activation-incomplete', message: 'under' },
+        { code: 'resource-pool/activation-over-restricted', message: 'over' },
+      ],
+    }),
+  })
+  try {
+    const response = await api.call('POST', '/item', { kind: 'mcp', name: 'kb', enabled: false })
+    assert.equal(response.payload.warning?.code, 'resource-pool/activation-incomplete')
+    assert.match(response.payload.warning?.message ?? '', /仍可调用/)
+    assert.match(response.payload.warning?.message ?? '', /过度限制/)
+  } finally {
+    await api.dispose()
+  }
+})
+
+
+test('a partial under-restriction stays conservative for the next corrupt-state refresh', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    const allAllowed = twoMcpState()
+    allAllowed.mcp.kb.modes = []
+    allAllowed.mcp.other.modes = []
+    await store.write(allAllowed)
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(agent.restrictions.length, 0)
+
+    await store.write(twoMcpState())
+    const originalRestrict = agent.ctx.tools.restrict
+    agent.ctx.tools.restrict = (rule) => {
+      if (rule?.deny?.[0] === 'mcp__other__x') throw new Error('other vanished')
+      return originalRestrict(rule)
+    }
+    const incomplete = await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(incomplete.ok, false)
+    assert.equal(incomplete.code, 'resource-pool/activation-incomplete')
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search'])
+
+    // File breaks while the partial under-restriction is the last state. The
+    // record must still be conservative and refresh all visible names.
+    agent.ctx.tools.restrict = originalRestrict
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }, { name: 'mcp__new__x' }]
+    const result = await harness.activation.reapplyAll()
+    assert.equal(result.failed, 1)
+    assert.equal(result.warnings.some((warning) => warning.code === 'resource-pool/activation-conservative'), true)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__new__x', 'mcp__other__x'])
   } finally {
     harness.activation.disposeAll()
     await rm(dir, { recursive: true, force: true })
