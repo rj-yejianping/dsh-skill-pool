@@ -238,7 +238,9 @@ Fail-closed 增量：
 - `tools.schemas()` 不可用而本次又需要 MCP 门控时视为激活失败，不能当作"没有工具要隐藏"；
 - `reapplyAll()` 返回 `{total, failed, degraded, under, over, conservative, noVisible, retainedOldGate, fallbackFailed, warnings}`；
   各维度独立计数（同一 Agent 可 under+over，跨 Agent 不互相覆盖）；HTTP 按计数与固定脱敏文案组合，
-  `warnings` 不作为分类依据；
+  `warnings` 不作为分类依据。`over` 仅当旧层实际阻挡当前不可见名或当前可见且已允许名；旧层名字全是
+  当前可见且应禁时不算 over。`noVisible` 仅在异常降级且无新 deny 时置位；健康空工具面不算故障。
+  `fallbackFailed` 记录结构失败，`retainedOldGate` 表示失败后是否仍有旧层可保留；
 - 状态错误只影响资源池门控，不改变 MCP resources / server instructions 的既有边界。
 
 ## 6. HTTP API

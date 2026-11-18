@@ -301,6 +301,18 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
             return conservativeResult(agent)
           } catch (gateError) {
             logger?.warn?.(`[resource-pool] conservative MCP gate refresh failed: ${gateError instanceof Error ? gateError.message : String(gateError)}`)
+            const retained = record.disposers.some((entry) => RESTRICT_LABELS.has(entry.label))
+            return {
+              ok: false,
+              code: 'resource-pool/activation-degraded',
+              message: 'state unavailable; conservative MCP deny refresh failed and previous layers were retained',
+              fallbackFailed: true,
+              retainedOldGate: retained,
+              underRestricted: false,
+              overRestricted: false,
+              conservative: false,
+              noVisibleTools: false,
+            }
           }
         }
         // A healthy old layer is deliberately still installed. Reporting success
@@ -345,6 +357,17 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
           logger?.warn?.(
             `[resource-pool] conservative MCP gate failed: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
           )
+          return {
+            ok: false,
+            code: 'resource-pool/activation-degraded',
+            message: 'state unavailable; conservative MCP deny could not be installed',
+            fallbackFailed: true,
+            retainedOldGate: false,
+            underRestricted: false,
+            overRestricted: false,
+            conservative: false,
+            noVisibleTools: false,
+          }
         }
       }
       // This is also the only safe response for an Agent with no previous gate:
@@ -375,14 +398,20 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     if (visible.length === 0) {
       // Keep every previous per-tool layer: an absent tool may simply be
       // between generations, and we cannot register its name again now. There
-      // is nothing we can truthfully claim as a newly installed deny.
+      // is nothing we can truthfully claim as a newly installed deny. Any old
+      // denied name is currently invisible, so retaining it is over-restriction
+      // risk (we cannot know whether it is still meant to be denied).
+      const retainedNames = record.disposers
+        .filter((entry) => RESTRICT_LABELS.has(entry.label))
+        .flatMap((entry) => (Array.isArray(entry.deny) ? entry.deny : []))
+      const over = retainedNames.length > 0
       record.signature = ''
       record.activated = true
       record.conservative = true
-      record.degraded = record.disposers.length > 0
+      record.degraded = over
       record.underRestricted = false
       logger?.warn?.('[resource-pool] state unavailable; no visible MCP tools, kept previous conservative deny')
-      return { visible: 0, failed: 0, under: false, kept: record.disposers.length > 0 }
+      return { visible: 0, failed: 0, under: false, over, kept: record.disposers.length > 0 }
     }
 
     const previous = record.disposers
@@ -447,10 +476,13 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         record.disposers = record.disposers.filter((candidate) => candidate !== entry)
       }
 
+      const over = retained.some((entry) =>
+        (Array.isArray(entry.deny) ? entry.deny : []).some((name) => !visibleSet.has(name)),
+      )
       record.signature = ''
       record.activated = true
       record.conservative = true
-      record.degraded = retainedInvisible
+      record.degraded = over
       const under = failedNames.some((name) => !oldCoverage.has(name))
       record.underRestricted = under
       logger?.warn?.(
@@ -458,7 +490,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
           ? `[resource-pool] state unavailable; conservative MCP deny is incomplete (${failedNames.length} failed)`
           : `[resource-pool] state unavailable; conservative MCP deny covers ${visible.length} visible tool${visible.length === 1 ? '' : 's'}`,
       )
-      return { visible: visible.length, failed: failedNames.length, under, kept: retainedInvisible }
+      return { visible: visible.length, failed: failedNames.length, under, over, kept: retainedInvisible }
     } catch (error) {
       for (const entry of pending.reverse()) disposeEntry(entry)
       throw error
@@ -474,7 +506,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     const info = applyConservativeGate(agent)
     const common = {
       underRestricted: info.under === true,
-      overRestricted: info.kept === true,
+      overRestricted: info.over === true,
       conservative: info.visible > 0,
       noVisibleTools: info.visible === 0,
     }
@@ -601,6 +633,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
 
     let retainedInvisible = false
     let underRestricted = false
+    let overRestricted = false
     try {
       // Separate old restriction layers before registering anything.
       const oldRestrictions = []
@@ -703,6 +736,9 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         // per-tool layer (transient host generation change).
         record.disposers = [...pending, ...oldRestrictions]
         retainedInvisible = oldRestrictions.length > 0
+        overRestricted = oldRestrictions.some((entry) =>
+          (Array.isArray(entry.deny) ? entry.deny : []).some((name) => !visibleSet.has(name)),
+        )
       } else if (restrictFailures > 0) {
         // A brand-new Agent has no prior authorization to fall back on: partial
         // MCP coverage must fail creation.
@@ -721,6 +757,12 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         }
         retainedInvisible = oldRestrictions.length > 0
         underRestricted = failedNames.some((name) => !oldCoverage.has(name))
+        const deniedSet = new Set(denyMcp)
+        overRestricted = oldRestrictions.some((entry) =>
+          (Array.isArray(entry.deny) ? entry.deny : []).some(
+            (name) => !visibleSet.has(name) || !deniedSet.has(name),
+          ),
+        )
         record.disposers = [...pending, ...oldRestrictions]
       } else {
         const retained = []
@@ -738,6 +780,12 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
           }
         }
         record.disposers = [...pending, ...retained]
+        const deniedSet = new Set(denyMcp)
+        overRestricted = retained.some((entry) =>
+          (Array.isArray(entry.deny) ? entry.deny : []).some(
+            (name) => !visibleSet.has(name) || !deniedSet.has(name),
+          ),
+        )
       }
 
       record.activated = true
@@ -749,7 +797,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       // state failure must attempt a conservative refresh even if some new
       // per-tool layers succeeded and there were no old layers.
       record.conservative = retainedInvisible || underRestricted
-      record.degraded = retainedInvisible
+      record.degraded = overRestricted
       record.underRestricted = underRestricted
       record.signature = incomplete || retainedInvisible ? '' : signature
     } catch (error) {

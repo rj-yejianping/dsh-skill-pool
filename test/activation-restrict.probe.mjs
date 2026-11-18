@@ -62,13 +62,14 @@ async function harness(names) {
   const key = {}
   let hostCtx
   let scoped
+  const disposers = {}
   await root.plugin({
     name: 'activation-restrict-probe',
     inject: ['tools'],
     apply(ctx) {
       hostCtx = ctx
       scoped = createScope(ctx, key)
-      for (const name of names) ctx.tools.register(definition(name))
+      for (const name of names) disposers[name] = ctx.tools.register(definition(name))
     },
   })
   const agent = {
@@ -82,6 +83,7 @@ async function harness(names) {
     key,
     agent,
     hostCtx,
+    disposers,
     toolsView,
     logger,
     visible() {
@@ -161,7 +163,7 @@ test('real activation: a raced restrict registration keeps successes and converg
     assert.equal(incomplete.ok, false)
     assert.equal(incomplete.code, 'resource-pool/activation-incomplete')
     assert.equal(incomplete.underRestricted, true)
-    assert.equal(incomplete.overRestricted, true)
+    assert.equal(incomplete.overRestricted, false, 'old names are visible and still denied, so this is not over-restriction')
     assert.deepEqual(h.visible(), [], 'old and successful layers still hide everything currently registered')
 
     // Re-register the raced tool. Before a retry it is callable: this is the
@@ -300,6 +302,68 @@ test('real activation: a partial under-restriction refreshes conservatively on a
     const refreshed = await activation.applyToAgent(h.agent, { force: true, conservative: true })
     assert.equal(refreshed.code, 'resource-pool/activation-conservative')
     assert.deepEqual(h.visible(), [], 'all currently visible MCP tools are conservatively denied')
+  } finally {
+    activation.disposeAgent(h.agent)
+    await h.dispose()
+  }
+})
+
+
+test('real activation: overRestricted is true only for genuinely invisible/allowed old names', async () => {
+  const h = await harness(['mcp__kb__search', 'mcp__other__x'])
+  const state = stateWith({ deny: ['kb', 'other'] })
+  const activation = createActivation({
+    ctx: { get: (name) => (name === 'tools' ? h.toolsView : h.root.get(name)) },
+    getState: async () => state,
+    logger: h.logger,
+    libraryRoot: () => '/nonexistent-library',
+  })
+  try {
+    await activation.applyToAgent(h.agent)
+    assert.deepEqual(h.visible(), [])
+    // Unregister other; its old deny layer now covers an invisible name.
+    h.disposers['mcp__other__x']()
+    const over = await activation.applyToAgent(h.agent, { force: true })
+    assert.equal(over.overRestricted, true)
+    assert.equal(over.underRestricted, false)
+    // Re-register other without retry: old layer keeps it hidden.
+    h.hostCtx.tools.register(definition('mcp__other__x'))
+    assert.deepEqual(h.visible(), [])
+    const clean = await activation.applyToAgent(h.agent, { force: true })
+    assert.equal(clean.overRestricted, false)
+    assert.equal(clean.degraded, undefined)
+  } finally {
+    activation.disposeAgent(h.agent)
+    await h.dispose()
+  }
+})
+
+test('real activation: structural fallback failure is flagged fallbackFailed', async () => {
+  const h = await harness(['mcp__kb__search'])
+  let state = stateWith({ allow: ['kb'] })
+  let corrupt = false
+  const activation = createActivation({
+    ctx: { get: (name) => (name === 'tools' ? h.toolsView : h.root.get(name)) },
+    getState: async () => {
+      if (corrupt) throw new StateReadError('resource-pool/state-invalid-json', 'synthetic corrupt')
+      return state
+    },
+    logger: h.logger,
+    libraryRoot: () => '/nonexistent-library',
+  })
+  try {
+    await activation.applyToAgent(h.agent)
+    corrupt = true
+    const normalSchemas = h.toolsView.schemas
+    h.toolsView.schemas = () => {
+      throw new Error('tool surface lost')
+    }
+    const result = await activation.applyToAgent(h.agent, { force: true, conservative: true })
+    assert.equal(result.fallbackFailed, true)
+    assert.equal(result.retainedOldGate, false)
+    assert.equal(result.ok, false)
+    h.toolsView.schemas = normalSchemas
+    void state
   } finally {
     activation.disposeAgent(h.agent)
     await h.dispose()

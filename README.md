@@ -242,10 +242,13 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   一个 `degraded` 或 error 字符串：
   - `under`（under-restriction）：per-tool deny 注册失败，DSH 拒绝未知名；工具重新注册后、下次
     重放前**可能可调用**。
-  - `over`（over-restriction）：保留了暂不可见工具的旧 deny，可能暂时过度限制。
+  - `over`（over-restriction）：旧层实际阻挡了**当前不可见**的名字，或**当前可见且已允许**的名字；
+    旧层里的名字全都当前可见且仍应禁止时**不算 over**。
   - `conservative`：已进入保守 deny 模式（可同时 under/over）。
-  - `noVisible`：当前无可见 MCP 工具，未安装新 deny（不宣称已安装）。
-  - `retainedOldGate` / `fallbackFailed`：激活失败保留旧限制 / 保守层安装失败。
+  - `noVisible`：仅在异常降级、无可见 MCP 工具且未安装新 deny 时置位；健康的空池/首次空工具面
+    是正常状态，不产生该 flag 或 warning。
+  - `retainedOldGate` / `fallbackFailed`：激活失败保留旧限制 / 保守层安装失败（结构失败也会记录，
+    不会只落成 generic error）。
   同一个 Agent 可同时 under+over；跨 Agent 的各维度独立计数，不会被优先级吞掉。HTTP warning 根据
   这些计数与固定脱敏文案组合显示实际组合；仍返回 200 和已提交 state；面板 warning 需手动关闭。
 - **空清单/零层**：没有任何可见 MCP 工具时，不会宣称安装了新 deny；会保留旧层并 reported degraded。
@@ -299,18 +302,18 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，155 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，159 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 155/155；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 159/159；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 5/5；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
-| `npm run test:activation` | 真实 ToolsService + production activation 探针（零层/竞态/多 agent/scope-local） | 当前环境 5/5；不是宿主能力门禁 |
+| `npm run test:activation` | 真实 ToolsService + production activation 探针（零层/竞态/多 agent/scope-local/over） | 当前环境 7/7；不是宿主能力门禁 |
 | `npm run test:feasibility` | 可选探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
 | `npm run verify:feasibility` | **发布或能力声明的强制门禁**（Node 包装器，POSIX/Windows 通用） | 缺失、版本不符或任一探针失败均非零退出 |
 

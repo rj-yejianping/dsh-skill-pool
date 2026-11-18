@@ -1845,7 +1845,7 @@ test('a partial per-tool registration failure keeps successful and old layers an
     assert.equal(incomplete.ok, false)
     assert.equal(incomplete.code, 'resource-pool/activation-incomplete')
     assert.equal(incomplete.underRestricted, true)
-    assert.equal(incomplete.overRestricted, true, 'same Agent can be under- and over-restricted at once')
+    assert.equal(incomplete.overRestricted, false, 'old visible+denied layers are not over-restriction')
     assert.equal(incomplete.conservative, false)
     assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'], 'successful layers and old layers remain; the raced name is not falsely claimed covered')
 
@@ -2117,6 +2117,138 @@ test('reapplyAll records under and conservative dimensions independently across 
     assert.equal(result.noVisible, 0)
     assert.deepEqual(activeDeny(a), ['mcp__kb__search'])
     assert.deepEqual(activeDeny(b), ['mcp__kb__search', 'mcp__other__x'])
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('over-restriction is true only for invisible or currently-allowed names blocked by old layers', async () => {
+  const { dir, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await store.write(twoMcpState())
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(activeLayers(agent), 2)
+
+    const extended = twoMcpState()
+    extended.mcp.third = { enabled: true, modes: ['b'], workspaces: [], installedAt: '2026-11-19T00:00:00.000Z' }
+    await store.write(extended)
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__new__x' }]
+    const originalRestrict = agent.ctx.tools.restrict
+    agent.ctx.tools.restrict = (rule) => {
+      if (rule?.deny?.[0] === 'mcp__new__x') throw new Error('new vanished')
+      return originalRestrict(rule)
+    }
+    // other is now invisible; new failed. Old layers are retained => over true.
+    const result = await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(result.underRestricted, true)
+    assert.equal(result.overRestricted, true)
+    assert.equal(activeDeny(agent).includes('mcp__other__x'), true)
+
+    // The same old layers, but every old name visible and still denied => no
+    // over-restriction despite retaining them.
+    const visibleState = twoMcpState()
+    visibleState.mcp.third = { enabled: true, modes: ['b'], workspaces: [], installedAt: '2026-11-19T00:00:00.000Z' }
+    await store.write(visibleState)
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }, { name: 'mcp__new__x' }]
+    agent.ctx.tools.restrict = (rule) => {
+      if (rule?.deny?.[0] === 'mcp__new__x') throw new Error('new vanished')
+      return originalRestrict(rule)
+    }
+    const visibleDenied = await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(visibleDenied.underRestricted, true)
+    assert.equal(visibleDenied.overRestricted, false)
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('a no-activation conservative failure is structured and does not bypass new-Agent creation failure', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }] }
+  let schemasBroken = false
+  const harness = makeActivation(store, {
+    schemas: () => {
+      if (schemasBroken) throw new Error('no tool surface')
+      return schemasRef.current
+    },
+  })
+  try {
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    const live = harness.addAgent('a')
+    schemasBroken = true
+    const result = await harness.activation.reapplyAll()
+    assert.equal(result.failed, 1)
+    assert.equal(result.fallbackFailed, 1)
+    assert.equal(result.retainedOldGate, 0)
+
+    const fresh = harness.addAgent('a')
+    await assert.rejects(harness.activation.applyToAgent(fresh), (error) => {
+      assert.equal(error.code, 'resource-pool/state-invalid-json')
+      return true
+    })
+    assert.equal(fresh.restrictions.length, 0)
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a failed conservative refresh is flagged fallbackFailed with retainedOldGate', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }] }
+  let schemasBroken = false
+  const harness = makeActivation(store, {
+    schemas: () => {
+      if (schemasBroken) throw new Error('refresh cannot read tool surface')
+      return schemasRef.current
+    },
+  })
+  try {
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    const agent = harness.addAgent('a')
+    await harness.activation.reapplyAll()
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search'])
+    schemasBroken = true
+    // Force a structural fallback failure by making the tool surface unreadable.
+    const result = await harness.activation.reapplyAll()
+    assert.equal(result.failed, 1)
+    assert.equal(result.fallbackFailed, 1)
+    assert.equal(result.retainedOldGate, 1)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search'])
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('a healthy state with no visible MCP tools is normal, not a degraded noVisible fallback', async () => {
+  const { dir, store } = await temporaryStore()
+  const schemasRef = { current: [] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await store.write(validState())
+    const agent = harness.addAgent('a')
+    const applied = await harness.activation.applyToAgent(agent)
+    assert.deepEqual(applied, {
+      ok: true,
+      underRestricted: false,
+      overRestricted: false,
+      conservative: false,
+      noVisibleTools: false,
+    })
+    const result = await harness.activation.reapplyAll()
+    assert.equal(result.failed, 0)
+    assert.equal(result.noVisible, 0)
+    assert.equal(result.warnings.length, 0)
+    assert.equal(activeLayers(agent), 0)
   } finally {
     harness.activation.disposeAll()
     await rm(dir, { recursive: true, force: true })
