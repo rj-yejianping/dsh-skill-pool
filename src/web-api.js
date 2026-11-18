@@ -175,13 +175,21 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     let warning
     try {
       const result = await onChanged?.()
-      if (result !== undefined && Number.isFinite(result?.failed) && result.failed > 0) {
+      const failed = Number.isFinite(result?.failed) ? result.failed : 0
+      const degraded = Number.isFinite(result?.degraded) ? result.degraded : 0
+      if (failed > 0 || degraded > 0) {
         // The write is committed and must stay committed. Report that not every
-        // live Agent could be re-applied without echoing tool names or errors.
+        // live Agent could be re-applied exactly without echoing tool names or
+        // errors; `degraded` means old deny layers were retained for tools that
+        // are not currently visible.
         warning = {
           code: 'resource-pool/activation-degraded',
-          message: `状态已保存，但 ${result.failed} 个活动会话未能重新应用；它们保留旧限制或仅保守 MCP 拒绝层。`,
-          failed: result.failed,
+          message:
+            failed > 0
+              ? `状态已保存，但 ${failed} 个活动会话未能重新应用；它们保留旧限制或仅保守 MCP 拒绝层。`
+              : `状态已保存，但 ${degraded} 个活动会话有暂不可见的旧限制被保留；相关工具重新出现前可能仍被过度限制。`,
+          ...(failed > 0 ? { failed } : {}),
+          ...(degraded > 0 ? { degraded } : {}),
         }
       }
     } catch (error) {

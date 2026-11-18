@@ -214,6 +214,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     record.signature = ''
     record.activated = false
     record.conservative = false
+    record.degraded = false
   }
 
   /** Signature of a decision, used to skip no-op re-applications. */
@@ -243,7 +244,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     if (agent?.ctx === undefined) return
     let record = agents.get(agent)
     if (record === undefined) {
-      record = { disposers: [], signature: '', activated: false, conservative: false, chain: Promise.resolve() }
+      record = { disposers: [], signature: '', activated: false, conservative: false, degraded: false, chain: Promise.resolve() }
       agents.set(agent, record)
     }
     const run = record.chain.then(() => applyNow(agent, record, { force }))
@@ -255,7 +256,14 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     )
     try {
       await run
-      return { ok: true }
+      return record.degraded
+        ? {
+            ok: true,
+            degraded: true,
+            code: 'resource-pool/activation-degraded',
+            message: 'some previously denied tools are not currently visible; their old deny layers were retained',
+          }
+        : { ok: true }
     } catch (error) {
       const hadActivation = record.activated
       logger?.warn?.(`[resource-pool] activation failed: ${error instanceof Error ? error.message : String(error)}`)
@@ -319,40 +327,56 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     }
     const schemas = tools.schemas()
     if (!Array.isArray(schemas)) throw new Error('global tool list is not an array')
-    const deny = schemas
+    const visible = schemas
       .map((schema) => schema?.name)
       .filter((name) => typeof name === 'string' && name.startsWith(MCP_TOOL_PREFIX))
+    const visibleSet = new Set(visible)
     const record = agents.get(agent)
     if (record === undefined) throw new Error('agent activation record is missing')
 
-    if (deny.length === 0 && record.disposers.length > 0) {
-      // The host may be between generations. Keep the previous deny: releasing
-      // it would expose its old names before the next non-empty refresh.
+    if (visible.length === 0) {
+      // Keep every previous per-tool layer: an absent tool may simply be
+      // between generations, and we cannot register its name again now.
       record.signature = ''
       record.activated = true
       record.conservative = true
-      logger?.warn?.('[resource-pool] state unavailable; empty tool surface kept the previous conservative deny')
+      logger?.warn?.('[resource-pool] state unavailable; no visible MCP tools, kept previous conservative deny')
       return
     }
 
-    // Register the refreshed deny before releasing the previous fallback, so a
-    // tool added between two explicit re-applies is covered as soon as it is
-    // visible. This remains a point-in-time static list (see docs).
     const pending = []
-    if (deny.length > 0) {
-      const dispose = agent.ctx.effect(() => agent.ctx.tools.restrict({ deny }), 'resource-pool.mcp-restrict-fallback')
-      pending.push({ dispose: typeof dispose === 'function' ? dispose : () => {}, label: 'mcp-restrict-fallback' })
+    const previous = record.disposers
+    try {
+      // Per-tool layers avoid one invisible name forcing a whole mixed layer to
+      // stay. Register all currently visible names before releasing old layers.
+      for (const name of visible) {
+        const dispose = agent.ctx.effect(
+          () => agent.ctx.tools.restrict({ deny: [name] }),
+          'resource-pool.mcp-restrict-fallback',
+        )
+        pending.push({ dispose: typeof dispose === 'function' ? dispose : () => {}, label: 'mcp-restrict-fallback', deny: [name] })
+      }
+      const retained = []
+      for (const entry of previous) {
+        if (!RESTRICT_LABELS.has(entry.label)) {
+          disposeEntry(entry)
+          continue
+        }
+        const names = Array.isArray(entry.deny) ? entry.deny : []
+        if (names.some((name) => !visibleSet.has(name))) retained.push(entry)
+        else disposeEntry(entry)
+      }
+      record.disposers = [...pending, ...retained]
+      record.signature = ''
+      record.activated = true
+      record.conservative = true
+      logger?.warn?.(
+        `[resource-pool] state unavailable; conservative MCP deny covers ${visible.length} visible tool${visible.length === 1 ? '' : 's'}`,
+      )
+    } catch (error) {
+      for (const entry of pending.reverse()) disposeEntry(entry)
+      throw error
     }
-    for (const entry of record.disposers) disposeEntry(entry)
-    record.disposers = pending
-    record.signature = ''
-    record.activated = true
-    record.conservative = true
-    logger?.warn?.(
-      deny.length > 0
-        ? `[resource-pool] state unavailable; conservative MCP deny covers ${deny.length} visible tool${deny.length === 1 ? '' : 's'}`
-        : '[resource-pool] state unavailable; no visible MCP tools to deny for an ungated Agent',
-    )
   }
 
   /** Build one Agent's registrations. Runs serialized per Agent. */
@@ -390,6 +414,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     const allowedSkills = new Set(allowed)
     let denyMcp = []
     let observedMcp = 0
+    const visibleMcpNames = []
     if (pool.gateMcp) {
       // A missing/unreadable global tool surface is not "nothing to hide": it
       // means the MCP gate cannot be established. Treat it as an activation
@@ -410,6 +435,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         const name = schema?.name
         if (typeof name !== 'string' || !name.startsWith(MCP_TOOL_PREFIX)) continue
         observedMcp += 1
+        visibleMcpNames.push(name)
         if (isAmbiguousMcpToolName(name)) {
           // The public name cannot be attributed to one server; deny rather than
           // allow by a prefix that an external server could share.
@@ -431,10 +457,14 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     const previous = record.disposers
     const pending = []
     let incomplete = false
-    const addEffect = (register, label, { critical = false } = {}) => {
+    const addEffect = (register, label, { critical = false, deny } = {}) => {
       try {
         const dispose = agent.ctx.effect(register, `resource-pool.${label}`)
-        pending.push({ dispose: typeof dispose === 'function' ? dispose : () => {}, label })
+        pending.push({
+          dispose: typeof dispose === 'function' ? dispose : () => {},
+          label,
+          ...(Array.isArray(deny) ? { deny: [...deny] } : {}),
+        })
         return true
       } catch (error) {
         if (critical) throw error
@@ -444,8 +474,20 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       }
     }
 
+    let retainedInvisible = false
     try {
-      if (denyMcp.length > 0) addEffect(() => agent.ctx.tools.restrict({ deny: denyMcp }), 'mcp-restrict', { critical: true })
+      // Register per-tool deny layers for every currently visible denied name.
+      // Do this before touching the previous layers (register before release).
+      // A name that is not visible now cannot be named in `restrict()`.
+      if (pool.gateMcp && observedMcp > 0) {
+        for (const name of denyMcp) {
+          addEffect(
+            () => agent.ctx.tools.restrict({ deny: [name] }),
+            'mcp-restrict',
+            { critical: true, deny: [name] },
+          )
+        }
+      }
 
       // Skill providers and prompt sections are keyed by name, so the old
       // registration of that kind must be gone before the new one is inserted.
@@ -464,7 +506,6 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         } else {
           const root = libraryRoot()
           addEffect(
-            // Registered from `agent.ctx`: the layer belongs to this Agent alone.
             () => skills.registerProvider((control) => createLibraryProvider({ root, allowed: allowedSkills, logger, control })),
             'skill-provider',
           )
@@ -498,38 +539,48 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         )
       }
 
-      // If the host is between tool generations, an empty snapshot cannot prove
-      // that a previously hidden tool is now allowed. Keep the old restrict
-      // layer (intersection) until a non-empty snapshot or an explicit
-      // `mcpGate: false` makes the intent visible. User-driven state changes
-      // that still need a gate will be reflected by the next non-empty apply.
-      // `denyMcp.length === 0` alone cannot distinguish "no MCP tools visible"
-      // from "all visible MCP tools are now allowed". Only the former is a
-      // transient snapshot; the latter is an intentional widening and must
-      // release the old deny.
-      const keepOldRestrictions = observedMcp === 0 && pool.gateMcp && oldRestrictions.length > 0
-      const keptConservative =
-        keepOldRestrictions && oldRestrictions.some((entry) => entry.label === 'mcp-restrict-fallback')
-      if (keepOldRestrictions) {
-        record.disposers = [...pending, ...oldRestrictions]
-        logger?.warn?.('[resource-pool] empty MCP tool snapshot; kept the previous restrict layer')
-      } else {
+      const visibleSet = new Set(visibleMcpNames)
+      if (!pool.gateMcp) {
+        // Explicit no-gate intent: release every layer, including names that
+        // are not currently visible.
         for (const entry of oldRestrictions) disposeEntry(entry)
         record.disposers = pending
+      } else if (observedMcp === 0) {
+        // No MCP tool is visible: we cannot name anything new, so keep every old
+        // per-tool layer (transient host generation change).
+        record.disposers = [...pending, ...oldRestrictions]
+        retainedInvisible = oldRestrictions.length > 0
+      } else {
+        const retained = []
+        for (const entry of oldRestrictions) {
+          const names = Array.isArray(entry.deny) ? entry.deny : []
+          // A name not visible now cannot be re-registered; keep the old layer
+          // that covers it. If it also covered a currently visible allowed name,
+          // the old layer must stay too (it cannot be split), so the result is
+          // reported as degraded rather than claimed fully applied.
+          if (names.some((name) => !visibleSet.has(name))) {
+            retained.push(entry)
+            retainedInvisible = true
+          } else {
+            disposeEntry(entry)
+          }
+        }
+        record.disposers = [...pending, ...retained]
       }
+
       record.activated = true
-      // A retained conservative fallback stays conservative: if the file breaks
-      // again with new tools visible, the next failure must refresh the fallback
-      // rather than treat the retained layer as a healthy activation.
-      record.conservative = keptConservative
-      // Leave the signature unset when a non-critical registration failed or a
-      // conservative fallback was retained, so a later explicit re-apply retries
-      // instead of treating the incomplete layer as final.
-      record.signature = incomplete || keptConservative ? '' : signature
+      // Any retained layer covering a currently invisible name means the last
+      // safe activation could not be reconstructed exactly. Keep conservative
+      // semantics so a later state failure refreshes coverage for new tools.
+      record.conservative = retainedInvisible
+      record.degraded = retainedInvisible
+      record.signature = incomplete || retainedInvisible ? '' : signature
     } catch (error) {
       // No successful commit: remove anything this attempt registered and leave
-      // the previous gate (still in `record.disposers`) in force.
+      // the previous gate (still in `record.disposers`) in force. Clear the
+      // signature so a later ordinary re-apply retries the failed layer set.
       for (const entry of pending.reverse()) disposeEntry(entry)
+      record.signature = ''
       throw error
     }
 
@@ -556,15 +607,16 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       }),
     )
     const failed = results.filter((result) => result !== undefined && result.ok === false)
+    const degraded = results.filter((result) => result?.ok === true && result.degraded === true)
     const seen = new Set()
     const warnings = []
-    for (const result of failed) {
+    for (const result of [...failed, ...degraded]) {
       const key = `${result.code}|${result.message}`
       if (seen.has(key)) continue
       seen.add(key)
       warnings.push({ code: result.code, message: result.message })
     }
-    return { total: live.length, failed: failed.length, warnings }
+    return { total: live.length, failed: failed.length, degraded: degraded.length, warnings }
   }
 
   /** Release one Agent's registrations. */

@@ -296,6 +296,14 @@ function makeAgent({ mode, cwd, failRestrict = false }) {
   return agent
 }
 
+/** Effective deny names from all still-active per-tool restriction layers. */
+function activeDeny(agent) {
+  return agent.restrictions
+    .filter((entry) => entry.disposed === false)
+    .flatMap((entry) => entry.deny ?? [])
+    .sort()
+}
+
 /** An activation manager over a real store whose `getState` is the host getter. */
 function makeActivation(store, { schemas = () => [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }] } = {}) {
   const agents = []
@@ -330,15 +338,14 @@ test('a corrupt state never releases an existing Agent gate and fails new Agent 
     await store.write(validState())
     const existing = harness.addAgent('a')
     await harness.activation.applyToAgent(existing)
-    assert.equal(existing.restrictions.length, 1)
-    assert.deepEqual(existing.restrictions[0].deny, ['mcp__kb__search', 'mcp__other__x'])
+    assert.deepEqual(activeDeny(existing), ['mcp__kb__search', 'mcp__other__x'])
 
     await writeFile(file, '{"version":4,"mcp":', 'utf8')
 
-    // Re-applying to a live Agent keeps its previous restriction.
+    // Re-applying to a live Agent keeps its previous restriction layers.
     await harness.activation.applyToAgent(existing, { force: true })
-    assert.equal(existing.restrictions[0].disposed, false, 'the old deny layer is still installed')
-    assert.deepEqual(existing.restrictions[0].deny, ['mcp__kb__search', 'mcp__other__x'])
+    assert.equal(existing.restrictions.every((entry) => entry.disposed === false), true)
+    assert.deepEqual(activeDeny(existing), ['mcp__kb__search', 'mcp__other__x'])
 
     // A new Agent cannot be created with unknown state.
     const fresh = harness.addAgent('a')
@@ -354,11 +361,12 @@ test('a corrupt state never releases an existing Agent gate and fails new Agent 
     // Correcting the file restores normal activation.
     await writeFile(file, JSON.stringify(validState()), 'utf8')
     await harness.activation.applyToAgent(fresh)
-    assert.equal(fresh.restrictions.length, 1)
-    assert.deepEqual(fresh.restrictions[0].deny, ['mcp__kb__search', 'mcp__other__x'])
+    assert.deepEqual(activeDeny(fresh), ['mcp__kb__search', 'mcp__other__x'])
+    const beforeRecovery = existing.restrictions.length
     await harness.activation.applyToAgent(existing, { force: true })
-    assert.equal(existing.restrictions.length, 2)
-    assert.equal(existing.restrictions[0].disposed, true, 'the stale layer is replaced after recovery')
+    assert.equal(existing.restrictions.length > beforeRecovery, true)
+    assert.equal(existing.restrictions.slice(0, beforeRecovery).every((entry) => entry.disposed === true), true, 'stale layers are replaced after recovery')
+    assert.deepEqual(activeDeny(existing), ['mcp__kb__search', 'mcp__other__x'])
   } finally {
     harness.activation.disposeAll()
     await rm(dir, { recursive: true, force: true })
@@ -372,7 +380,7 @@ test('a failed restrict registration keeps the old gate and fails a new Agent', 
     await store.write(validState())
     const existing = harness.addAgent('a')
     await harness.activation.applyToAgent(existing)
-    assert.equal(existing.restrictions.length, 1)
+    assert.deepEqual(activeDeny(existing), ['mcp__kb__search', 'mcp__other__x'])
 
     // Force a change so the existing signature is recomputed, then make the
     // critical restrict registration fail.
@@ -387,7 +395,8 @@ test('a failed restrict registration keeps the old gate and fails a new Agent', 
     assert.equal(failing.restrictions.length, 0)
 
     await harness.activation.applyToAgent(existing, { force: true })
-    assert.equal(existing.restrictions[0].disposed, false, 'the previous gate was not released before the new one was safe')
+    assert.equal(existing.restrictions.every((entry) => entry.disposed === false), true, 'the previous gate was not released before the new one was safe')
+    assert.deepEqual(activeDeny(existing), ['mcp__kb__search', 'mcp__other__x'])
   } finally {
     harness.activation.disposeAll()
     await rm(dir, { recursive: true, force: true })
@@ -567,18 +576,15 @@ test('reapplyAll conservatively denies visible MCP tools for a live Agent with n
     await writeFile(file, '{"version":4,"mcp":', 'utf8')
     const live = harness.addAgent('a')
     await harness.activation.reapplyAll()
-    assert.equal(live.restrictions.length, 1, 'the live Agent is not left ungated')
-    assert.deepEqual(live.restrictions[0].deny, ['mcp__kb__search', 'mcp__other__x'])
-    assert.equal(live.restrictions[0].disposed, false)
+    assert.deepEqual(activeDeny(live), ['mcp__kb__search', 'mcp__other__x'], 'the live Agent is not left ungated')
+    const fallbackCount = live.restrictions.length
 
-    // A repaired document replaces the fallback only after the normal layer is
-    // installed; the fallback is treated as a restriction, not as disposable
-    // metadata.
+    // A repaired document replaces the fallback only after the new normal layers
+    // are installed; the old fallback layers are then disposed.
     await store.write(validState())
     await harness.activation.reapplyAll()
-    assert.equal(live.restrictions[0].disposed, true)
-    assert.equal(live.restrictions.length, 2)
-    assert.deepEqual(live.restrictions[1].deny, ['mcp__kb__search', 'mcp__other__x'])
+    assert.equal(live.restrictions.slice(0, fallbackCount).every((entry) => entry.disposed === true), true)
+    assert.deepEqual(activeDeny(live), ['mcp__kb__search', 'mcp__other__x'])
   } finally {
     harness.activation.disposeAll()
     await rm(dir, { recursive: true, force: true })
@@ -710,12 +716,12 @@ test('reapplyAll reports a failed count when an existing healthy layer is kept',
     await store.write(validState())
     const agent = harness.addAgent('a')
     await harness.activation.applyToAgent(agent)
-    assert.equal(agent.restrictions.length, 1)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'])
 
     await writeFile(file, '{"version":4,"mcp":', 'utf8')
     const result = await harness.activation.reapplyAll()
     assert.equal(result.failed, 1)
-    assert.equal(agent.restrictions[0].disposed, false)
+    assert.equal(agent.restrictions.every((entry) => entry.disposed === false), true)
   } finally {
     harness.activation.disposeAll()
     await rm(dir, { recursive: true, force: true })
@@ -737,14 +743,13 @@ test('conservative fallback refreshes on every explicit reapply when new MCP too
 
     schemasRef.current = [{ name: 'mcp__kb__search' }]
     await harness.activation.reapplyAll()
-    assert.equal(agent.restrictions.length, 1, 'a later explicit reapply sees the new tool')
-    assert.deepEqual(agent.restrictions[0].deny, ['mcp__kb__search'])
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search'], 'a later explicit reapply sees the new tool')
+    const firstGeneration = agent.restrictions.length
 
     schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__new__x' }]
     await harness.activation.reapplyAll()
-    assert.equal(agent.restrictions.length, 2)
-    assert.equal(agent.restrictions[0].disposed, true, 'the old fallback is released after the new one is safe')
-    assert.deepEqual(agent.restrictions[1].deny, ['mcp__kb__search', 'mcp__new__x'])
+    assert.equal(agent.restrictions.slice(0, firstGeneration).every((entry) => entry.disposed === true), true, 'old fallback layers are released after the new ones are safe')
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__new__x'])
   } finally {
     harness.activation.disposeAll()
     await rm(dir, { recursive: true, force: true })
@@ -1548,24 +1553,189 @@ test('a recovered-but-empty snapshot stays conservative after the file breaks ag
     await writeFile(file, '{"version":4,"mcp":', 'utf8')
     const agent = harness.addAgent('a')
     await harness.activation.reapplyAll()
-    assert.deepEqual(agent.restrictions[0].deny, ['mcp__kv__read'])
+    assert.deepEqual(activeDeny(agent), ['mcp__kv__read'])
 
     // File repaired, but the host is between generations: keep the fallback.
     await store.write(validState())
     schemasRef.current = []
     await harness.activation.reapplyAll()
-    assert.equal(agent.restrictions[0].disposed, false)
-    assert.equal(agent.restrictions[0].deny.includes('mcp__kv__read'), true)
+    assert.equal(agent.restrictions.every((entry) => entry.disposed === false), true)
+    assert.deepEqual(activeDeny(agent), ['mcp__kv__read'])
 
     // File breaks again and a new MCP tool appears. The retained fallback must
     // still be classified conservative so the new tool is denied too.
     await writeFile(file, '{"version":4,"mcp":', 'utf8')
     schemasRef.current = [{ name: 'mcp__kv__read' }, { name: 'mcp__new__write' }]
     await harness.activation.reapplyAll()
-    assert.equal(agent.restrictions[0].disposed, true)
-    assert.deepEqual(agent.restrictions.at(-1).deny, ['mcp__kv__read', 'mcp__new__write'])
+    assert.deepEqual(activeDeny(agent), ['mcp__kv__read', 'mcp__new__write'])
   } finally {
     harness.activation.disposeAll()
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+/** Two MCP members, both initially denied in mode a. */
+function twoMcpState() {
+  return normalizeState({
+    version: 4,
+    settings: { enabled: true, mcpGate: true, injectSummary: false, gateDefaultSkills: false },
+    skills: {}, sources: {}, groups: {},
+    mcp: {
+      kb: { enabled: true, modes: ['b'], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z' },
+      other: { enabled: true, modes: ['b'], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z' },
+    },
+  })
+}
+
+test('a partial snapshot keeps an invisible old deny and reports degraded instead of losing it', async () => {
+  const { dir, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await store.write(twoMcpState())
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'])
+    const firstGeneration = agent.restrictions.length
+
+    // kb becomes allowed and is visible; other is still denied but temporarily
+    // absent from the host snapshot.
+    const widened = twoMcpState()
+    widened.mcp.kb.modes = []
+    await store.write(widened)
+    schemasRef.current = [{ name: 'mcp__kb__search' }]
+    const result = await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(result.degraded, true, 'the invisible old deny is retained and reported')
+    assert.deepEqual(activeDeny(agent), ['mcp__other__x'])
+    assert.equal(agent.restrictions.slice(0, firstGeneration).some((entry) => entry.deny.includes('mcp__kb__search') && entry.disposed === true), true, 'the now-allowed visible kb layer is released')
+
+    // other reappears without a reapply: the retained layer still hides it.
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }]
+    assert.deepEqual(activeDeny(agent), ['mcp__other__x'])
+
+    // A non-empty, fully visible reapply reconstructs the exact layers.
+    const finalResult = await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(finalResult.degraded, undefined)
+    assert.deepEqual(activeDeny(agent), ['mcp__other__x'])
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a partial snapshot with a non-empty new deny keeps invisible old coverage', async () => {
+  const { dir, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await store.write(twoMcpState())
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'])
+    const firstGeneration = agent.restrictions.length
+
+    // Both are still denied, but the new (non-empty) snapshot only knows kb.
+    schemasRef.current = [{ name: 'mcp__kb__search' }]
+    const result = await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(result.degraded, true)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'])
+
+    // other reappears without reapply: retained old layer still hides it.
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }]
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'])
+
+    await harness.activation.applyToAgent(agent, { force: true })
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'])
+    assert.equal(agent.restrictions.slice(0, firstGeneration).every((entry) => entry.disposed === true), true)
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('a committed write with retained invisible denies returns a degraded warning', async () => {
+  const api = await makeApi(validState(), {
+    onChanged: async () => ({
+      total: 1, failed: 0, degraded: 1,
+      warnings: [{ code: 'resource-pool/activation-degraded', message: 'internal detail must not leak' }],
+    }),
+  })
+  try {
+    const response = await api.call('POST', '/item', { kind: 'mcp', name: 'kb', enabled: false })
+    assert.equal(response.status, 200)
+    assert.equal(response.payload.state.mcp.kb.enabled, false)
+    assert.equal(response.payload.warning?.code, 'resource-pool/activation-degraded')
+    assert.equal(response.payload.warning?.degraded, 1)
+    assert.equal(JSON.stringify(response.payload).includes('internal detail must not leak'), false)
+  } finally {
+    await api.dispose()
+  }
+})
+
+
+test('a re-import into an equivalent enabled group keeps the old effective disabled state', async () => {
+  const api = await makeApi(sharedSourceState({ groupEnabled: false }))
+  try {
+    const hooks = api.testHooks
+    const current = await api.store.read({ fresh: true })
+    const previous = hooks.captureEffectiveScopes(current, ['shared'])
+    const other = {
+      id: 'src_other', kind: 'git', label: 'other', url: 'https://github.com/example/other',
+      provider: 'github', project: 'example/other', branch: 'main', subdir: '',
+      skills: ['shared'], excluded: [], createdAt: '2026-11-19T00:00:00.000Z',
+    }
+    let next = upsertSource(current, other)
+    next = {
+      ...next,
+      groups: {
+        ...next.groups,
+        'repo:example/other': { key: 'repo:example/other', kind: 'repo', enabled: true, modes: ['standard'], workspaces: ['/workspace'] },
+      },
+    }
+    next = hooks.installItems(next, ['shared'], {
+      scope: undefined, sourceId: 'src_other', digests: {}, installedAt: '2026-11-19T00:00:00.000Z', previous,
+    })
+    assert.equal(next.skills.shared.enabled, false, 'old disabled is conservatively preserved')
+    const rules = await import('../src/rules.js')
+    assert.deepEqual(rules.resolvePool(next, { mode: 'standard', cwd: '/workspace' }).skills, [], 'the new enabled group does not auto-enable the member')
+
+    const explicitEnable = upsertItem(next, 'skill', 'shared', { ...next.skills.shared, enabled: true }, {})
+    assert.deepEqual(rules.resolvePool(explicitEnable, { mode: 'standard', cwd: '/workspace' }).skills, ['shared'], 'an explicit member enable restores visibility')
+  } finally {
+    await api.dispose()
+  }
+})
+
+test('a re-import into an equivalent disabled group hides an old enabled member until that group is re-enabled', async () => {
+  const api = await makeApi(sharedSourceState({ groupEnabled: true }))
+  try {
+    const hooks = api.testHooks
+    const current = await api.store.read({ fresh: true })
+    const previous = hooks.captureEffectiveScopes(current, ['shared'])
+    const other = {
+      id: 'src_other', kind: 'git', label: 'other', url: 'https://github.com/example/other',
+      provider: 'github', project: 'example/other', branch: 'main', subdir: '',
+      skills: ['shared'], excluded: [], createdAt: '2026-11-19T00:00:00.000Z',
+    }
+    let next = upsertSource(current, other)
+    next = {
+      ...next,
+      groups: {
+        ...next.groups,
+        'repo:example/other': { key: 'repo:example/other', kind: 'repo', enabled: false, modes: ['standard'], workspaces: ['/workspace'] },
+      },
+    }
+    next = hooks.installItems(next, ['shared'], {
+      scope: undefined, sourceId: 'src_other', digests: {}, installedAt: '2026-11-19T00:00:00.000Z', previous,
+    })
+    assert.equal(next.skills.shared.enabled, true)
+    const rules = await import('../src/rules.js')
+    assert.deepEqual(rules.resolvePool(next, { mode: 'standard', cwd: '/workspace' }).skills, [], 'new group disabled hides it')
+    const enabled = upsertGroup(next, { key: 'repo:example/other', enabled: true })
+    assert.deepEqual(rules.resolvePool(enabled, { mode: 'standard', cwd: '/workspace' }).skills, ['shared'], 're-enabling the new group restores it')
+  } finally {
+    await api.dispose()
   }
 })

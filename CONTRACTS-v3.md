@@ -236,7 +236,7 @@ Fail-closed 增量：
 - 已有保守层时，每次显式 `reapplyAll`/preset 重放都重新枚举当前可见 `mcp__*` 并**先注册后释放**，
   不会因为一次空清单就把 `activated` 当成健康激活而永不刷新；
 - `tools.schemas()` 不可用而本次又需要 MCP 门控时视为激活失败，不能当作"没有工具要隐藏"；
-- `reapplyAll()` 返回 `{total, failed, warnings}`；`warnings` 只含固定/脱敏消息，供 HTTP warning 使用；
+- `reapplyAll()` 返回 `{total, failed, degraded, warnings}`；`warnings` 只含固定/脱敏消息，供 HTTP warning 使用；
 - 状态错误只影响资源池门控，不改变 MCP resources / server instructions 的既有边界。
 
 ## 6. HTTP API
@@ -262,8 +262,8 @@ Fail-closed 增量：
 
 规则：
 
-- 写操作：原子落盘 → `reapplyAll()` → 返回新 `state`。若重新应用有失败，仍返回 200 与已提交的
-  `state`，并附带脱敏 `warning`；不会把已提交的写操作回滚。
+- 写操作：原子落盘 → `reapplyAll()` → 返回新 `state`。若重新应用有失败或 `degraded`（有不可见
+  旧 deny 被保留），仍返回 200 与已提交的 `state`，并附带脱敏 `warning`；不会把已提交的写操作回滚。
 - 所有 scope/enabled 入参在落盘前严格校验：`modes` 必须是合法字符串数组（`[123]`、带空白的模式名
   400），`workspaces` 必须是绝对路径（相对路径 400），`enabled`/settings 开关必须是布尔值；
   省略字段保持"部分更新、保留原值"，空数组仍是显式"全部"。非法输入返回 400 且文件字节不变。
@@ -278,8 +278,9 @@ Fail-closed 增量：
 - **重新导入/更新**：`installItems` 在换 sourceId 前捕获 effective enabled/modes/workspaces；
   若新来源没有等价组，物化为 `self`；显式 import `scope` 落 `self` 并优先。若仍是**同一个有效组**，
   保留成员 own `enabled`（组关闭再开启可恢复）；换到另一个**维度值等价**的可解析组时继续继承，
-  新组 `enabled` 开关优先（disabled 即隐藏，重新开启恢复）；组丢失或维度不等价则物化旧
-  effective scope/enabled 为 `self`，不采用可能扩大权限的新组值。
+  但 own enabled 固定为旧 effective enabled：旧 disabled 保守保持（新组 enabled 不自动打开，
+  需用户显式启用成员）；旧 enabled + 新组 disabled 则隐藏，新组重新开启恢复。组丢失或维度不等价
+  则物化旧 effective scope/enabled 为 `self`，不采用可能扩大权限的新组值。
   文件/ZIP/Git/source update 共用该路径；真实 `/source/update` 路由有本地 GitLab 归档测试，
   覆盖组禁用期间更新后组重新启用恢复成员。
 - **空工具快照 vs 全部允许**：只有 `tools.schemas()` 中 MCP 工具观察数为 0 且仍需门控时保留
@@ -287,6 +288,10 @@ Fail-closed 增量：
   `mcpGate:false`/无 MCP 成员立即释放。若保留的是 conservative fallback，仍保持 conservative
   标志并清空 signature，文件再次损坏+新工具出现时会再次刷新；真实 DSH 限制层（含先注册新 deny
   再释放旧层）由 `npm run test:restrict` 覆盖；静态 deny 对新公共名的残余动态缺口不变。
+- **按工具保留不可见旧 deny**：新的 deny 层按当前可见待禁工具逐工具注册；旧层包含当前不可见
+  工具名时保留该层（无法注册未知名），否则释放。旧层混合不可见名与可见已允许名时不可拆分，
+  保留整层并计入 `degraded`，HTTP 返回脱敏 warning，不声称完全应用。层数上界为曾见 MCP 工具数，
+  重放不会无限增长。
 - `POST /group` 的 `import:`/`repo:` 空名返回 400。
 - **警告持久化**：写成功但重新应用失败返回 200 + 脱敏 `warning`；面板显示可关闭的持久警告条，
   不被后续成功响应或短 toast 覆盖。

@@ -124,9 +124,10 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
   `enabled`/`modes`/`workspaces` 保留下来；新来源没有可解析组时落成 `self`，不会把空列表
   解释成"所有模式/所有工作区"。显式 `scope` 优先并落成 `self`；旧组被禁用时仍保持禁用。
   文件、ZIP、Git 与来源更新共用同一条 `installItems` 路径。若来源更新后仍是**同一个有效组**，
-  成员的 own `enabled` 保持不变，组关闭再打开会恢复该成员。若换到**另一个可解析且维度值等价**
-  的组，保留成员 own 标志并继续 group 继承，**新组的 enabled 开关优先**（新组 disabled 就隐藏，
-  重新启用才恢复）；若组丢失或维度值不等价，则把旧 effective scope/enabled 物化为 `self`，
+  成员的 own `enabled` 保持不变，组关闭再打开会恢复该成员。若换到**另一个维度值等价的可解析组**，
+  成员 own `enabled` 固定为**旧 effective enabled**：旧组 disabled 就保守保持 disabled（新组即使
+  enabled 也不会自动打开，需用户显式启用成员）；旧组 enabled 而新组 disabled 则新组关闭会隐藏，
+  新组重新启用才恢复。若组丢失或维度值不等价，则把旧 effective scope/enabled 物化为 `self`，
   旧有效范围优先，不采用可能扩大权限的新组值。
   真实 `/source/update` 路由（临时本地 GitLab 归档/commits 服务）有独立测试覆盖同组恢复。
 - **检查更新**：按来源查询远端提交（GitHub/GitLab commits API），**不下载归档**即可判断；
@@ -221,6 +222,14 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   若被保留的是**保守 fallback**（状态曾不可读），本次仍保持 `conservative` 标志并清空
   signature：文件再次损坏且出现新 MCP 工具时，会再次刷新保守 deny 覆盖新工具，而不是误当成
   健康激活。
+- **按工具分层保留不可见旧 deny**：每个当前可见的待禁工具各一层；旧层中若有当前不可见的工具名，
+  该层保留（DSH restrict 不能注册未知名），可见且已允许的工具层则释放。这样部分快照不会丢掉
+  “暂时未注册的 other”旧 deny，other 同名重现时仍被隐藏；等它重新可见后再重建精确层。
+  若旧层同时含不可见名和当前可见且已允许名，无法拆分，只能保留整层（暂时过度限制），并通过
+  `degraded` 计数/HTTP warning 明确报告，而不是声称完全应用。层数上界是“曾见过的 MCP 工具名数”，
+  不会随重放无限增长。
+- **degraded 语义**：`reapplyAll` 返回 `failed` 与 `degraded`；`committed` 写入成功但存在
+  不可见旧限制保留时返回脱敏 warning，面板持久提示；已提交状态不变。
   真实 DSH 限制层的注册/交集/卸载/重注册，以及“先注册新 deny 再释放旧层”由
   `npm run test:restrict` 验证；新注册的公共名在再次重放前仍可能绕过静态 deny，这是明确残余缺口。
 - **降级可见**：面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 工具在失败时返回
@@ -268,14 +277,14 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，136 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，141 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 136/136；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 141/141；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 4/4；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
