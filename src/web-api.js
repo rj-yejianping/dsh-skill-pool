@@ -58,6 +58,9 @@ const GIT_TOKEN_PREFIX = 'RESOURCE_POOL_GIT_'
 // 64MB archive cap in base64 plus JSON overhead; see library.MAX_ARCHIVE_BYTES.
 const MAX_BODY_BYTES = 96 * 1024 * 1024
 
+/** Maximum length of one user-written MCP purpose summary (mirrors store.js). */
+const DESCRIPTION_LIMIT = 300
+
 /** JSON response helper. */
 function json(value, status = 200) {
   return Response.json(value, { status, headers: { 'cache-control': 'no-store' } })
@@ -89,6 +92,48 @@ async function readBody(request) {
 }
 
 /**
+ * Project one MCP member onto the fields the Settings page may see.
+ *
+ * `definition` carries URLs, commands, headers and environment variables —
+ * including `Authorization` tokens — and never belongs in a browser response.
+ * An explicit allow-list (purpose + activation scope) also keeps any future
+ * connection field from leaking by accident.
+ *
+ * @param {unknown} member - stored MCP member.
+ * @returns {object} browser-safe member.
+ */
+function publicMcpMember(member) {
+  const source = isObject(member) ? member : {}
+  const out = {
+    enabled: source.enabled !== false,
+    modes: Array.isArray(source.modes) ? [...source.modes] : [],
+    workspaces: Array.isArray(source.workspaces) ? [...source.workspaces] : [],
+  }
+  if (typeof source.installedAt === 'string' && source.installedAt.length > 0) out.installedAt = source.installedAt
+  if (typeof source.description === 'string' && source.description.length > 0) out.description = source.description
+  return out
+}
+
+/**
+ * Project a state document for the browser, dropping every MCP connection
+ * definition while keeping purposes, scopes and the other sections intact.
+ *
+ * Every response that carries `state` — the overview and every mutation — goes
+ * through this one function, so a new route cannot accidentally expose
+ * credentials just by returning the document it just persisted.
+ *
+ * @param {unknown} state - normalized document.
+ * @returns {object} browser-safe document.
+ */
+export function publicState(state) {
+  const source = isObject(state) ? state : {}
+  const mcp = {}
+  const members = isObject(source.mcp) ? source.mcp : {}
+  for (const [name, member] of Object.entries(members)) mcp[name] = publicMcpMember(member)
+  return { ...source, mcp }
+}
+
+/**
  * Register the panel's HTTP routes.
  *
  * @param {object} options - registration options.
@@ -117,7 +162,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     } catch (error) {
       logger?.warn?.(`[resource-pool] re-application failed: ${error instanceof Error ? error.message : String(error)}`)
     }
-    return json({ ok: true, state, ...extra })
+    return json({ ok: true, state: publicState(state), ...extra })
   }
 
   /** Resolve one stored Git token from the credential store. */
@@ -185,6 +230,12 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       if (body[key] === undefined) continue
       if (body[key] !== 'group' && body[key] !== 'self') throw new Error(`${key} 必须是 'group' 或 'self'`)
       patch[key] = body[key]
+    }
+    if (body.description !== undefined) {
+      if (typeof body.description !== 'string') throw new Error('description 必须是字符串')
+      const description = body.description.trim()
+      if (description.length > DESCRIPTION_LIMIT) throw new Error(`description 最多 ${DESCRIPTION_LIMIT} 个字符`)
+      patch.description = description
     }
     return patch
   }
@@ -283,7 +334,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     try {
       const state = await readState()
       const inventory = await buildInventory(ctx, { state, libraryRoot: skillsRoot() })
-      return json({ ok: true, meta, state, inventory, mounts: mounts.status() })
+      return json({ ok: true, meta, state: publicState(state), inventory, mounts: mounts.status() })
     } catch (error) {
       logger?.warn?.(`[resource-pool] overview failed: ${error instanceof Error ? error.message : String(error)}`)
       return failure('resource-pool/read-failed', '无法读取技能池状态', 500)
@@ -306,21 +357,40 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     } catch (error) {
       return failure('resource-pool/bad-scope', error instanceof Error ? error.message : String(error))
     }
+    // The purpose summary is MCP-only metadata. Rejecting it here (rather than
+    // letting `upsertItem` widen one member into another kind) keeps a typo from
+    // changing what the pool contains.
+    const editingDescription = patch.description !== undefined
+    if (editingDescription && kind !== 'mcp') {
+      return failure('resource-pool/bad-description', '只有 MCP 成员支持用途摘要')
+    }
     try {
       const state = await store.update((current) => {
         const existing = kind === 'skill' ? current.skills[name] : current.mcp[name]
+        // A description belongs to an existing member: an editor focused on a
+        // removed row must not resurrect it as a new pool entry.
+        if (editingDescription && !isObject(existing)) {
+          throw Object.assign(new Error('只能为已存在的 MCP 成员填写用途摘要'), {
+            code: 'resource-pool/unknown-item',
+            status: 400,
+          })
+        }
         const extra = {
           sourceId: existing?.sourceId,
           digest: existing?.digest,
           installedAt: existing?.installedAt,
           modesFrom: patch.modesFrom !== undefined ? patch.modesFrom : existing?.modesFrom,
           workspacesFrom: patch.workspacesFrom !== undefined ? patch.workspacesFrom : existing?.workspacesFrom,
+          // Only send the field when this request edits it: an omitted
+          // description must keep the stored purpose (Task 1 semantics).
+          ...(editingDescription ? { description: patch.description } : {}),
         }
         return upsertItem(current, kind, name, itemScope(current, kind, name, patch), extra)
       })
       return committed(state)
     } catch (error) {
-      return failure('resource-pool/save-failed', error instanceof Error ? error.message : String(error), 500)
+      const code = typeof error?.code === 'string' ? error.code : 'resource-pool/save-failed'
+      return failure(code, error instanceof Error ? error.message : String(error), error?.status === 400 ? 400 : 500)
     }
   }
 
@@ -746,7 +816,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     if (Object.keys(checks).length === 0) {
       // Nothing to record (no Git sources): the document is unchanged, so the
       // pool does not need re-applying.
-      return json({ ok: true, state: current, results })
+      return json({ ok: true, state: publicState(current), results })
     }
     try {
       const state = await store.update((doc) => {

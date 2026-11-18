@@ -70,6 +70,10 @@ window.__ModuleLoader__.load({
         previewFailed: '解析失败',
         rowModes: '模式',
         rowWorkspaces: '工作区',
+        rowDescription: '用途摘要',
+        rowDescriptionHint: '会发送给 AI，请勿填写凭据或连接信息。',
+        rowDescriptionPlaceholder: '一句话说明这个 MCP 连接能做什么',
+        descriptionCount: '{count}/300',
         allModes: '全部模式',
         allWorkspaces: '全部工作区',
         editConditions: '设置条件',
@@ -272,6 +276,10 @@ window.__ModuleLoader__.load({
         previewFailed: 'Resolve failed',
         rowModes: 'Modes',
         rowWorkspaces: 'Workspaces',
+        rowDescription: 'Purpose summary',
+        rowDescriptionHint: 'Sent to the AI. Do not include credentials or connection details.',
+        rowDescriptionPlaceholder: 'One line about what this MCP connection is for',
+        descriptionCount: '{count}/300',
         allModes: 'All modes',
         allWorkspaces: 'All workspaces',
         editConditions: 'Conditions',
@@ -594,7 +602,7 @@ window.__ModuleLoader__.load({
 
     function normalizeEntry(raw) {
       const source = asObject(raw)
-      return {
+      const entry = {
         enabled: source.enabled !== false,
         modes: asStringArray(source.modes),
         workspaces: uniqueStrings(asArray(source.workspaces).map(normalizePath)),
@@ -604,6 +612,10 @@ window.__ModuleLoader__.load({
         digest: asString(source.digest),
         installedAt: asString(source.installedAt),
       }
+      // Keep "absent" distinct from "empty": a condition save must not send an
+      // empty description for a member that never had one (and vice versa).
+      if (typeof source.description === 'string') entry.description = source.description
+      return entry
     }
 
     function normalizeSettings(raw) {
@@ -2078,6 +2090,8 @@ window.__ModuleLoader__.load({
       const mounted = useRef(true)
       const loadingRef = useRef(false)
       const pendingRef = useRef(new Map())
+      const editSeqRef = useRef(new Map())
+      const writeChainsRef = useRef(new Map())
       const timersRef = useRef(new Map())
       const groupTimersRef = useRef(new Map())
       const noticeTimer = useRef(null)
@@ -2093,6 +2107,8 @@ window.__ModuleLoader__.load({
           for (const timer of timersRef.current.values()) clearTimeout(timer)
           timersRef.current.clear()
           pendingRef.current.clear()
+          editSeqRef.current.clear()
+          writeChainsRef.current.clear()
           if (noticeTimer.current) clearTimeout(noticeTimer.current)
         }
       }, [])
@@ -2160,37 +2176,63 @@ window.__ModuleLoader__.load({
           pendingRef.current.delete(key)
           markSaving(key, true)
           const entry = job.entry
-          try {
-            const payload = await request(`${API}/item`, {
-              method: 'POST',
-              body: {
-                kind: job.kind,
-                name: job.name,
-                enabled: entry.enabled !== false,
-                modes: asStringArray(entry.modes),
-                workspaces: uniqueStrings(asArray(entry.workspaces).map(normalizePath)),
-                modesFrom: entry.modesFrom === 'self' ? 'self' : 'group',
-                workspacesFrom: entry.workspacesFrom === 'self' ? 'self' : 'group',
-              },
-            })
+          const sequence = editSeqRef.current.get(key) ?? 0
+          // One in-flight save per member: an older request must never land after
+          // a newer one and restore the previous description or conditions.
+          const previous = writeChainsRef.current.get(key) ?? Promise.resolve()
+          const run = previous.then(async () => {
             if (!mounted.current) return
-            clearRowError(key)
-            if (payload.state) {
-              const nextState = normalizeState(payload.state)
-              const canonical = job.kind === MCP ? nextState.mcp[job.name] : nextState.skills[job.name]
-              setBoard((current) => {
-                if (!current) return current
-                return { ...current, state: canonical ? withEntry(current.state, job.kind, job.name, canonical) : nextState }
+            try {
+              const payload = await request(`${API}/item`, {
+                method: 'POST',
+                body: {
+                  kind: job.kind,
+                  name: job.name,
+                  enabled: entry.enabled !== false,
+                  modes: asStringArray(entry.modes),
+                  workspaces: uniqueStrings(asArray(entry.workspaces).map(normalizePath)),
+                  modesFrom: entry.modesFrom === 'self' ? 'self' : 'group',
+                  workspacesFrom: entry.workspacesFrom === 'self' ? 'self' : 'group',
+                  // Only send a description this member actually has: an absent
+                  // field keeps the stored purpose instead of clearing it.
+                  ...(job.kind === MCP && typeof entry.description === 'string'
+                    ? { description: entry.description }
+                    : {}),
+                },
               })
+              if (!mounted.current) return
+              // The user kept typing while this request was in flight: the local
+              // draft is newer than this response, so never replace it.
+              if ((editSeqRef.current.get(key) ?? 0) !== sequence) return
+              clearRowError(key)
+              if (payload.state) {
+                const nextState = normalizeState(payload.state)
+                const canonical = job.kind === MCP ? nextState.mcp[job.name] : nextState.skills[job.name]
+                setBoard((current) => {
+                  if (!current) return current
+                  return { ...current, state: canonical ? withEntry(current.state, job.kind, job.name, canonical) : nextState }
+                })
+              }
+            } catch (cause) {
+              if (mounted.current && (editSeqRef.current.get(key) ?? 0) === sequence) {
+                setRowError(key, messageOf(cause))
+                if (loadBoardRef.current) void loadBoardRef.current({ silent: true })
+              }
+            } finally {
+              // A queued newer save keeps the row marked as saving until it lands.
+              if (
+                mounted.current &&
+                !pendingRef.current.has(key) &&
+                (editSeqRef.current.get(key) ?? 0) === sequence
+              ) {
+                markSaving(key, false)
+              }
             }
-          } catch (cause) {
-            if (mounted.current) {
-              setRowError(key, messageOf(cause))
-              if (loadBoardRef.current) void loadBoardRef.current({ silent: true })
-            }
-          } finally {
-            if (mounted.current && !pendingRef.current.has(key)) markSaving(key, false)
-          }
+          })
+          writeChainsRef.current.set(key, run.catch(() => {}))
+          // The chain is already settled for later saves; an unexpected local
+          // rendering error must not surface as an unhandled rejection.
+          await run.catch(() => {})
         },
         [clearRowError, markSaving, setRowError],
       )
@@ -2199,6 +2241,7 @@ window.__ModuleLoader__.load({
         (kind, name, entry) => {
           const key = `${kind}:${name}`
           pendingRef.current.set(key, { kind, name, entry })
+          editSeqRef.current.set(key, (editSeqRef.current.get(key) ?? 0) + 1)
           const timer = timersRef.current.get(key)
           if (timer) clearTimeout(timer)
           markSaving(key, true)
@@ -2441,6 +2484,9 @@ window.__ModuleLoader__.load({
                 ? patch.workspacesFrom
                 : base.workspacesFrom,
           }
+          // An empty string clears the purpose; an absent patch keeps the local
+          // draft untouched. Both stay distinct so autosave cannot invent one.
+          if (typeof patch.description === 'string') next.description = patch.description
           setBoard((current) => (current ? { ...current, state: withEntry(current.state, kind, name, next) } : current))
           clearRowError(`${kind}:${name}`)
           queueItem(kind, name, next)
@@ -2452,6 +2498,9 @@ window.__ModuleLoader__.load({
         async (kind, name) => {
           const key = `${kind}:${name}`
           if (pendingRef.current.size > 0) await flushPending()
+          // Ignore any save that is already in flight for this member: it must
+          // not put the row back after the delete response arrives.
+          editSeqRef.current.set(key, (editSeqRef.current.get(key) ?? 0) + 1)
           const timer = timersRef.current.get(key)
           if (timer) {
             clearTimeout(timer)
@@ -2984,6 +3033,32 @@ window.__ModuleLoader__.load({
                     }),
                 }),
           ),
+          // The purpose is model-facing input: it is stored as metadata (never in
+          // the connection definition) and appears in this Agent's prompt summary.
+          isMcp
+            ? h(
+                'div',
+                { style: { gridColumn: '1 / -1', minWidth: 0 } },
+                h(
+                  Field,
+                  { label: TEXT.rowDescription, hint: TEXT.rowDescriptionHint },
+                  h('textarea', {
+                    style: { ...S.textarea, minHeight: '56px' },
+                    rows: 2,
+                    maxLength: 300,
+                    value: asString(entry.description),
+                    placeholder: TEXT.rowDescriptionPlaceholder,
+                    'aria-label': `${TEXT.rowDescription}. ${TEXT.rowDescriptionHint}`,
+                    onChange: (event) => updateEntry(kind, name, { description: event.target.value }),
+                  }),
+                  h(
+                    'span',
+                    { style: S.fieldHint },
+                    tf('descriptionCount', { count: asString(entry.description).length }),
+                  ),
+                ),
+              )
+            : null,
         )
       }
 
