@@ -110,6 +110,24 @@ function optionalString(value, limit = 4096) {
   return value.trim().slice(0, limit)
 }
 
+/** Maximum length of the user-written purpose summary of an MCP member. */
+const DESCRIPTION_LIMIT = 300
+
+/**
+ * Normalize the user-written purpose summary of one MCP member.
+ *
+ * This text is model-facing metadata, kept next to (never inside) the connection
+ * definition: it must not be able to smuggle connection fields, and an empty
+ * value means "no summary" so a document never grows an empty key.
+ *
+ * @param {unknown} value - candidate description.
+ * @returns {string} trimmed, length-capped description ('' when absent).
+ */
+function cleanDescription(value) {
+  if (typeof value !== 'string') return ''
+  return value.trim().slice(0, DESCRIPTION_LIMIT)
+}
+
 /** Timestamp helper: keep a stored value, else use now. */
 function timestamp(value) {
   const text = optionalString(value, 64)
@@ -232,6 +250,10 @@ function itemExtras(kind, extra, base) {
     // the connection definition that makes the member survive a Host restart.
     const defined = cleanMcpDefinition(provided.definition) ?? cleanMcpDefinition(previous.definition)
     if (defined !== undefined) out.definition = defined
+    // The user's purpose summary is metadata, stored apart from the definition:
+    // an omitted description keeps the stored one, an empty string clears it.
+    out.description =
+      typeof provided.description === 'string' ? cleanDescription(provided.description) : cleanDescription(previous.description)
   }
   out.installedAt = pick('installedAt') || new Date().toISOString()
   return out
@@ -298,6 +320,10 @@ function normalizeMember(kind, raw) {
       raw.workspacesFrom === 'self' ? 'self' : raw.workspacesFrom === 'group' ? 'group' : member.workspaces.length > 0 ? 'self' : 'group'
   }
   if (kind === 'mcp') {
+    // The user-written summary is metadata, never part of the connection
+    // definition, so normalization keeps the two fields independent.
+    const description = cleanDescription(raw.description)
+    if (description.length > 0) member.description = description
     const definition = cleanMcpDefinition(raw.definition)
     if (definition !== undefined) member.definition = definition
   }
@@ -740,26 +766,68 @@ export class StateStore {
     return this.cached
   }
 
-  /** Persist a normalized document and update the cache. */
-  async write(state) {
-    const normalized = normalizeState(state)
-    const run = this.writeChain.then(async () => {
-      await mkdir(dirname(this.file), { recursive: true })
-      const temporary = `${this.file}.${process.pid}.${Date.now()}.tmp`
-      // 0600: an MCP member may carry an `Authorization` header, so the pool
-      // document holds the same secrets a profile patch would.
-      await writeFile(temporary, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
-      await rename(temporary, this.file)
-      this.cached = normalized
-      return normalized
-    })
-    this.writeChain = run.then(() => undefined, () => undefined)
+  /**
+   * Queue one operation behind every write/update already scheduled.
+   *
+   * A rejection settles only the operation's own promise: the queue itself is
+   * reset to a fulfilled promise, so one failed save never wedges later ones.
+   *
+   * @param {() => Promise<object>} task - operation to run once its turn comes.
+   * @returns {Promise<object>} the operation's result.
+   */
+  #enqueue(task) {
+    const run = this.writeChain.then(task)
+    this.writeChain = run.then(
+      () => undefined,
+      () => undefined,
+    )
     return run
   }
 
-  /** Apply one mutation to a fresh read and persist the result. */
+  /**
+   * Persist one normalized document atomically, then update the cache.
+   *
+   * Only the queue may call this: `write`/`update` enqueue, so calling them from
+   * inside a queued task would wait on itself and deadlock.
+   *
+   * @param {object} normalized - normalized document.
+   * @returns {Promise<object>} the persisted document.
+   */
+  async #persist(normalized) {
+    await mkdir(dirname(this.file), { recursive: true })
+    const temporary = `${this.file}.${process.pid}.${Date.now()}.tmp`
+    // 0600: an MCP member may carry an `Authorization` header, so the pool
+    // document holds the same secrets a profile patch would.
+    await writeFile(temporary, `${JSON.stringify(normalized, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 })
+    await rename(temporary, this.file)
+    this.cached = normalized
+    return normalized
+  }
+
+  /** Persist a normalized document, queued behind earlier writes/updates. */
+  async write(state) {
+    const normalized = normalizeState(state)
+    return this.#enqueue(() => this.#persist(normalized))
+  }
+
+  /**
+   * Apply one mutation to a fresh read and persist the result as one queued
+   * read-modify-write.
+   *
+   * The fresh read happens inside the queue, after every earlier write/update
+   * has settled. Two concurrent updates therefore see each other's result
+   * instead of overwriting it, and direct `write` calls keep their call order.
+   * The body uses `#persist` directly (not `write`) to avoid enqueueing behind
+   * itself, which would deadlock the queue.
+   *
+   * @param {(state: object) => object|Promise<object>} mutate - pure mutation.
+   * @returns {Promise<object>} the persisted document.
+   */
   async update(mutate) {
-    const current = await this.read({ fresh: true })
-    return this.write(mutate(current))
+    return this.#enqueue(async () => {
+      const current = await this.read({ fresh: true })
+      const next = await mutate(current)
+      return this.#persist(normalizeState(next))
+    })
   }
 }
