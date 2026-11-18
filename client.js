@@ -620,6 +620,61 @@ window.__ModuleLoader__.load({
       return entry
     }
 
+    /**
+     * Remember that *this tab* edited a member's purpose summary.
+     *
+     * Conditions are resent on every autosave because they are this tab's whole
+     * view of the row. The purpose is not: another tab may have changed it
+     * meanwhile, and copying our stale copy on an unrelated condition toggle
+     * would silently revert that. An empty string is a real edit (clear), so the
+     * patch value decides, never a value comparison.
+     */
+    function markDescriptionEdited(dirty, key, patch) {
+      if (typeof patch?.description === 'string') dirty.add(key)
+      return dirty.has(key)
+    }
+
+    /**
+     * Build the `/item` request body for one pending row save.
+     *
+     * The purpose field is included only while the row's edit flag is set; after
+     * a successful save (and when no newer edit exists) the flag is cleared, so
+     * a later condition-only save omits it. A failed save keeps the flag and the
+     * local draft, so the next save retries the text instead of losing it.
+     */
+    function buildItemSaveBody(job, dirty) {
+      const entry = asObject(job.entry)
+      const body = {
+        kind: job.kind,
+        name: job.name,
+        enabled: entry.enabled !== false,
+        modes: asStringArray(entry.modes),
+        workspaces: uniqueStrings(asArray(entry.workspaces).map(normalizePath)),
+        modesFrom: entry.modesFrom === 'self' ? 'self' : 'group',
+        workspacesFrom: entry.workspacesFrom === 'self' ? 'self' : 'group',
+      }
+      const key = `${job.kind}:${job.name}`
+      const includeDescription =
+        job.kind === MCP && dirty !== null && typeof dirty?.has === 'function' && dirty.has(key) === true
+      if (includeDescription && typeof entry.description === 'string') {
+        // `''` is an intentional clear; a missing property means "not edited".
+        body.description = entry.description
+      }
+      return body
+    }
+
+    /**
+     * Acknowledge a purpose edit only after the save that carried it lands.
+     *
+     * `sequence` is the edit revision captured when the request was flushed;
+     * `currentSequence` includes any edit made while it was in flight. A stale
+     * response must keep the flag so the newer save (or a retry) still sends it.
+     */
+    function settleDescriptionDirty(dirty, key, sequence, currentSequence) {
+      if (sequence !== currentSequence) return false
+      return dirty.delete(key)
+    }
+
     function normalizeSettings(raw) {
       const source = asObject(raw)
       return {
@@ -2202,6 +2257,8 @@ window.__ModuleLoader__.load({
       const editSeqRef = useRef(new Map())
       const writeChainsRef = useRef(new Map())
       const draftsRef = useRef(new Map())
+      // Rows whose purpose summary this tab edited but has not saved yet.
+      const descriptionDirtyRef = useRef(new Set())
       const removingRef = useRef(new Set())
       const boardRevisionRef = useRef(0)
       const timersRef = useRef(new Map())
@@ -2222,6 +2279,7 @@ window.__ModuleLoader__.load({
           editSeqRef.current.clear()
           writeChainsRef.current.clear()
           draftsRef.current.clear()
+          descriptionDirtyRef.current.clear()
           removingRef.current.clear()
           if (noticeTimer.current) clearTimeout(noticeTimer.current)
         }
@@ -2289,8 +2347,12 @@ window.__ModuleLoader__.load({
           }
           pendingRef.current.delete(key)
           markSaving(key, true)
-          const entry = job.entry
           const sequence = editSeqRef.current.get(key) ?? 0
+          // Snapshot the request body now. A purpose edit made *after* this
+          // flush must travel with the newer queued save, never be squeezed into
+          // this older request (whose entry may not even contain it).
+          const body = buildItemSaveBody(job, descriptionDirtyRef.current)
+          const descriptionSent = Object.hasOwn(body, 'description')
           // One in-flight save per member: an older request must never land after
           // a newer one and restore the previous description or conditions.
           const previous = writeChainsRef.current.get(key) ?? Promise.resolve()
@@ -2299,25 +2361,17 @@ window.__ModuleLoader__.load({
             try {
               const payload = await request(`${API}/item`, {
                 method: 'POST',
-                body: {
-                  kind: job.kind,
-                  name: job.name,
-                  enabled: entry.enabled !== false,
-                  modes: asStringArray(entry.modes),
-                  workspaces: uniqueStrings(asArray(entry.workspaces).map(normalizePath)),
-                  modesFrom: entry.modesFrom === 'self' ? 'self' : 'group',
-                  workspacesFrom: entry.workspacesFrom === 'self' ? 'self' : 'group',
-                  // Only send a description this member actually has: an absent
-                  // field keeps the stored purpose instead of clearing it.
-                  ...(job.kind === MCP && typeof entry.description === 'string'
-                    ? { description: entry.description }
-                    : {}),
-                },
+                // Conditions always; purpose only when this row's edit flag was
+                // set for the snapshot above. A condition-only save must not
+                // copy a stale purpose over a change made in another tab.
+                body,
               })
               if (!mounted.current) return
               // The user kept typing while this request was in flight: the local
               // draft is newer than this response, so never replace it.
-              if ((editSeqRef.current.get(key) ?? 0) !== sequence) return
+              const currentSequence = editSeqRef.current.get(key) ?? 0
+              if (currentSequence !== sequence) return
+              if (descriptionSent) settleDescriptionDirty(descriptionDirtyRef.current, key, sequence, currentSequence)
               draftsRef.current.delete(key)
               // Any GET that started before this save response carries older
               // rows; let it refresh the derived views but keep this state.
@@ -2436,7 +2490,10 @@ window.__ModuleLoader__.load({
               // silently.
               const orphans = orphanedDrafts(loaded.state, draftsRef.current)
               if (orphans.length > 0) {
-                for (const orphan of orphans) draftsRef.current.delete(orphan.key)
+                for (const orphan of orphans) {
+                  draftsRef.current.delete(orphan.key)
+                  descriptionDirtyRef.current.delete(orphan.key)
+                }
                 setError(draftLossMessage(orphans))
               }
             }
@@ -2607,11 +2664,15 @@ window.__ModuleLoader__.load({
           // Once removal owns this row, later edits must not schedule a save that
           // could recreate it; the row is disappearing.
           if (removingRef.current.has(key)) return
+          // The local draft is newer than the last rendered document (a save may
+          // be debounced or in flight), so an edit that only touches conditions
+          // must build on it instead of dropping the typed purpose.
+          const draft = draftsRef.current.get(key)
           const source =
             kind === MCP
               ? boardRef.current && boardRef.current.state.mcp[name]
               : boardRef.current && boardRef.current.state.skills[name]
-          const base = source || blankEntry()
+          const base = draft || source || blankEntry()
           const next = {
             ...base,
             enabled: typeof patch.enabled === 'boolean' ? patch.enabled : base.enabled,
@@ -2627,8 +2688,10 @@ window.__ModuleLoader__.load({
                 : base.workspacesFrom,
           }
           // An empty string clears the purpose; an absent patch keeps the local
-          // draft untouched. Both stay distinct so autosave cannot invent one.
+          // draft untouched. Both stay distinct so autosave cannot invent one,
+          // and only an actual edit sets this row's purpose dirty flag.
           if (typeof patch.description === 'string') next.description = patch.description
+          markDescriptionEdited(descriptionDirtyRef.current, key, patch)
           draftsRef.current.set(key, next)
           setBoard((current) => (current ? { ...current, state: withEntry(current.state, kind, name, next) } : current))
           clearRowError(key)
@@ -2649,6 +2712,7 @@ window.__ModuleLoader__.load({
             // edits so no save can be scheduled once the delete is under way.
             editSeqRef.current.set(key, (editSeqRef.current.get(key) ?? 0) + 1)
             draftsRef.current.delete(key)
+            descriptionDirtyRef.current.delete(key)
             const timer = timersRef.current.get(key)
             if (timer) {
               clearTimeout(timer)
@@ -4652,7 +4716,15 @@ window.__ModuleLoader__.load({
       inject: ['slots'],
       // Pure reconciliation used by `loadBoard`; exposed so the Node test can
       // exercise the production function without a browser renderer.
-      boardState: { applyLoadedBoard, applyItemSave, draftLossMessage, orphanedDrafts },
+      boardState: {
+        applyLoadedBoard,
+        applyItemSave,
+        draftLossMessage,
+        orphanedDrafts,
+        buildItemSaveBody,
+        markDescriptionEdited,
+        settleDescriptionDirty,
+      },
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(

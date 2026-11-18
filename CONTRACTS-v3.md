@@ -79,6 +79,8 @@
   "mcp": {
     "<server>": {
       "enabled": true, "modes": [], "workspaces": [], "installedAt": "...",
+      // 用户填写的用途摘要（模型可见的元数据；不进入 definition，可缺省）
+      "description": "Search the internal knowledge base",
       // 连接定义：Host 重启后由资源池据此重建 rp-<server> 的 Loader 行
       "definition": {
         "transport": "streamable-http" | "stdio",
@@ -110,6 +112,16 @@
 ```
 
 版本不符的旧文档一律重置为默认（`normalizeState` 既有行为）。
+
+**读取失败与损坏**：
+
+- 普通读取（`read()`，含面板 GET）宽松回退为默认文档：非法 JSON、JSON 非对象、非 `ENOENT`
+  的 I/O 错误都只影响本次显示，不写盘。
+- 写操作（`store.update`）在覆盖前**严格读取**：上述任一情况直接失败，**不修改原文件字节**。
+  HTTP 返回 500（如 `resource-pool/save-failed`），错误消息只说明无法读取/不是合法 JSON，
+  **不回显文件内容、definition 或其中的凭据**；`ENOENT` 仍视为空文档。
+- 恢复前应先**备份** `state.json`（`0600`，可能含 MCP 令牌），再人工修复或从备份还原；
+  插件不会自动备份，也不会自动重写损坏文件。
 
 ### 2.2 资源目录（独立文件夹，不与系统技能混放）
 
@@ -186,7 +198,7 @@ resolvePool(state, {mode, cwd}) -> {gated, skills: string[], mcpServers: string[
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
 | GET | `` | — | `{ok, meta, state, inventory, mounts}` |
-| POST | `/item` | `{kind:'skill'\|'mcp', name, enabled?, modes?, workspaces?}` | `{ok, state}` |
+| POST | `/item` | `{kind:'skill'\|'mcp', name, enabled?, modes?, workspaces?, modesFrom?, workspacesFrom?, description?}` | `{ok, state}` |
 | POST | `/item/remove` | `{kind, name}` | `{ok, state, removed}` |
 | POST | `/settings` | `{patch}` | `{ok, state}` |
 | GET | `/resolve?mode=&cwd=` | — | `{ok, pool}` |
@@ -204,6 +216,7 @@ resolvePool(state, {mode, cwd}) -> {gated, skills: string[], mcpServers: string[
 
 - 写操作：原子落盘 → `reapplyAll()` → 返回新 `state`。
 - `POST /item` **只编辑已存在的成员**：成员不存在（包括只改条件的请求）返回 400 `resource-pool/unknown-item`，不会新建成员；新建只由导入接口完成。这样删除期间迟到的保存不能把成员重新创建出来。
+- `POST /item` 的 `description` 是**仅 MCP 成员**可写的用途摘要：必须是字符串（否则 400），保存前 `trim`，最长 300 字符（超长 400，code `resource-pool/bad-scope`）；非 MCP 成员携带它返回 400 `resource-pool/bad-description`。`""` 是显式清除（落盘删除该键，公开投影不再有 `description`）；**缺省该属性不是编辑**，保留已存储的用途。条件保存（不带 `description`）因此不会覆盖另一端刚改的用途；客户端只在**本标签页实际编辑过**该行用途时才发送此属性（含清空），并在保存失败/响应乱序时保留脏标记以便重试。
 - 所有返回 `state` 的响应（概览与全部写操作）都经过公开投影：MCP 成员只含 `enabled`、`modes`、`workspaces`、`installedAt`、`description`，**绝不包含 `definition`**（URL/命令/headers/env 中的凭据）。落盘状态仍保留 `definition` 供启动重挂载；投影只影响浏览器响应。
 - MCP 用途摘要进入系统提示时，当前 Agent 可用的服务名列表单独、权威地给出；各服务的用途作为独立 JSON 数据（`purpose: null` 表示未填写用途摘要）。该数据明确标记为用户提供、不可信、不是指令、不是授权依据；JSON 编码只是结构边界，**不是注入防护，也不保证内容安全**。
 - `scope` 缺省为 `{modes:[],workspaces:[]}`。
@@ -216,13 +229,23 @@ resolvePool(state, {mode, cwd}) -> {gated, skills: string[], mcpServers: string[
 
 ```jsonc
 {
-  "skills": [{ "name","description","path","sourceId","sourceLabel","enabled","modes","workspaces","digest","installedAt","modelInvocable" }],
+  "skills": [{ "name","description","path","sourceId","sourceLabel","groupKey","groupName",
+               "enabled","effectiveEnabled","modes","workspaces","modesFrom","workspacesFrom",
+               "effectiveModes","effectiveWorkspaces","digest","installedAt","modelInvocable","missing" }],
   "nativeSkills": [{ "name","description","source","provider" }],   // 系统/预设自带，只读展示
-  "mcp": [{ "server","tools":["..."],"managed":bool,"entryId","enabled","modes","workspaces","installedAt" }],
-  "modes": ["default", "..."],
-  "workspaces": ["/abs/path", "..."]
+  "mcp": [{ "server","description","tools":["..."],"managed":bool,"entryId",
+            "enabled","modes","workspaces","installedAt" }],
+  "modes": ["standard", "..."],                    // 真实预设 id，不含 default 兜底
+  "workspaces": ["/abs/path", "..."],
+  "defaultMode": "standard"                        // 预设注册表默认值，可空
 }
 ```
+
+- `mcp[].description` 是用途摘要（`trim`、最长 300，未填写为 `''`），**不是**连接定义；
+  inventory 与任何 `state` 响应都不含 `definition`。
+- `mcp[].tools` 只包含当前可观察到的 `mcp__<server>__*` 公开名；挂载状态在 `/mounts`，
+  且断线时 schema/工具名可能仍是上一代（不能把"有 schema"当作在线）。
+- 该接口只读；条件与用途通过 `POST /item` 写入，不经过 inventory。
 
 ## 7. 资源库函数签名（`src/library.js`，供 web-api 调用）
 

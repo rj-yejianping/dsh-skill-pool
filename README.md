@@ -48,6 +48,23 @@ exact Agent modes and workspaces each skill loads in — from the Settings panel
 - 组不存在（本地 ZIP/文件导入、来源被删）时，成员用自己那份；
 - `inherit` 与"显式全部"是两回事：前者跟着组走，后者写死"所有模式/工作区"。
 
+## MCP 用途摘要（会发给 AI）
+
+MCP 成员的展开行可以填一句**用途摘要**（最多 300 字符，保存时去掉首尾空白；清空后保存即删除该字段）。
+它只是池成员的元数据，存于 `state.json` 的 `mcp.<server>.description`，**不写进连接定义**
+（URL/命令/请求头/env 都不受影响），也不是凭据来源。
+
+每个 Agent 的系统提示只列出它**当前可用**的 MCP 服务名，并把各服务的用途作为独立 JSON 数据附上；
+该数据明确标注为**用户提供、不可信、不是指令、不是授权依据**，`purpose: null` 表示未填写。
+JSON 编码只是结构边界，**不是注入防护，也不保证内容安全**，所以请勿在用途里写凭据或连接信息。
+
+自动保存的编辑语义：
+
+- 启用、模式、工作区等**条件每次保存都会发送**；用途摘要**只有本标签页真正编辑过它时**才发送。
+  因此 A 标签页只切换启用状态，不会用自己文档里的旧用途覆盖 B 标签页刚改的用途。
+- 清空保存会发送空字符串（真正的清除）；没编辑则不发送该字段，服务端保留原值。
+- 连续输入与请求在途时，旧响应不会覆盖更新的输入；保存失败后，本标签页下一次保存会继续携带未保存的用途。
+
 ## 删除与排除
 
 - **删除一个技能** = 删磁盘文件 + 移出池 + 在它所属来源的 `excluded[]` 里记一笔。
@@ -150,6 +167,7 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
                           "modesFrom": "group", "workspacesFrom": "group",
                           "sourceId": "src_x", "digest": "sha256:…", "installedAt": "…" } },
   "mcp":    { "<server>": { "enabled": true, "modes": [], "workspaces": [],
+                             "description": "用途摘要（可空；模型可见，不写入定义）",
                              "definition": { "transport": "streamable-http", "url": "http://…/mcp", "headers": { "Authorization": "Bearer …" } } } },
   "sources": { "<id>": { "kind": "git|zip|files", "skills": ["<name>"], "excluded": ["<name>"],
                          "sha": "…", "lastCheck": { "status": "up-to-date" } } }
@@ -161,6 +179,11 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
 
 状态文件与技能目录、MCP 连接记录分离：删掉状态文件只重置配置（库目录里的文件仍在，
 但不再被供给——重新导入即可）。
+
+**状态损坏时写操作 fail-closed**：更新（`/item`、导入、删除等）会拒绝覆盖读不懂的文件，
+返回 500 且错误只说明"无法读取/不是合法 JSON"，**不回显文件内容或任何凭据**；原文件逐字节保留，
+不会被自动重写。普通 GET 的宽松读取会回退到默认文档（只影响本次显示，不写盘）。恢复前请先**自行备份**
+`state.json`（它按 `0600` 写入，可能含 MCP 令牌），再人工修复或从自己的备份恢复；插件**不会**自动生成备份。
 
 `groups` 里每项还有 `enabled`（默认 `true`），生效条件 = 成员开关 **且** 组开关。
 
@@ -174,11 +197,38 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 没有 `definition` 的历史成员（0.3.5 及更早导入的）会被跳过，重新导入一次即补上。
 状态文件因此按 `0600` 写入——`definition.headers` 里可能有令牌。
 
+## MCP 可行性验证（发布门禁）
+
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，72 个可移植测试）
+不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
+（默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
+`DSH_FEASIBILITY_ROOT` 指向别的安装树）。
+
+| 命令 | 作用 | 结果 |
+|---|---|---|
+| `npm test` | 可移植单测，**不含**宿主探针 | 72/72；不代表宿主能力已验证 |
+| `npm run test:feasibility` | 可选探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
+| `npm run verify:feasibility` | **发布或能力声明的强制门禁**（Node 包装器，POSIX/Windows 通用） | 缺失、版本不符或任一探针失败均非零退出 |
+
+> `test:feasibility` 的绿色或跳过**不能**当成能力证据。发布前必须运行
+> `npm run verify:feasibility`；通过表示 21/21 在当前安装的真实运行时通过。
+> 21 项里包含刻意固定 **OBSERVED FAIL** 的检查：它们通过只说明已知缺陷仍可复现，不代表该能力可用。
+> 实测结论与未测项见 `docs/mcp-feasibility-results.md`。
+
+探针只使用临时目录和受控 MCP 子进程：不加载用户 profile、不写用户状态、不访问 OpenViking，
+不需要真实凭据。
+
 ## 已知限制
 
+- **MCP 只有 Server 级门控**：**没有**单工具开关（界面开关 / per-tool switch），也**没有** MCP
+  渐进披露（按服务按需展开）。任务 4/5 在本版本**未实现**，不是隐藏的实验开关。
+- 现有可行性证据不支持上述能力：当前代 public 名称无法可靠反查 server/raw；动态新增工具可绕过静态
+  deny 名单；隐藏业务工具不影响 MCP resources 与 server instructions；断线后 schema/提示可能陈旧。
+  详见 `docs/mcp-feasibility-results.md`。
+- **GUI 与真实模型运行时未验证**：用途摘要/条件的浏览器交互、真实 Agent 循环的模型请求装配、
+  PTC/自定义执行器、真实 approval 服务与审计，均未在真实 profile 中实测；本仓库只验证代码与可移植路径。
 - 技能池只管理自己导入的资源；**系统自带技能始终可用**，不参与门控
   （`gateDefaultSkills` 设置位保留，v3 未启用）。
-- MCP 的门控粒度是 **Server**，不是单个工具。
 - 工作区按**会话创建时的工作目录**判定；子会话继承父工作区。路径比较是词法的，不解析符号链接。
 - 技能文件被外部手改后，下一次重新应用（任一保存、重启插件）才保证刷新。
 - 自建 GitHub Enterprise 需要显式选择类型（未知域名默认按 GitLab 处理）。
@@ -188,8 +238,11 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 ## 开发
 
 ```
-npm run lint   # node --check 全部源码
-npm test       # node --test test/*.test.mjs
+npm run lint                # node --check 全部源码
+npm test                    # 可移植单测 test/*.test.mjs（不含宿主探针）
+npm run test:feasibility    # 可选宿主探针；缺失运行时会跳过，不能当发布证据
+npm run verify:feasibility  # 强制宿主门禁：缺失/版本不符/失败均非零退出
+node test-persisted-mcp.mjs # MCP 定义持久化/重挂载检查
 ```
 
 契约见 `CONTRACTS-v3.md`（v2 在 `CONTRACTS.md`，v1 在 `CONTRACTS-v1.md`）。

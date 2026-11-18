@@ -211,7 +211,12 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     return scope
   }
 
-  /** Read the `/item` condition patch (`{enabled?, modes?, workspaces?}`). */
+  /**
+   * Read the `/item` patch: conditions plus the MCP-only purpose summary.
+   *
+   * `description` trims; `''` clears. An absent property is not an edit and
+   * leaves the stored purpose untouched.
+   */
   const readItemPatch = (body) => {
     const patch = {}
     if (body.enabled !== undefined) {

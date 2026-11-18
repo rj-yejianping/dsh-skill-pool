@@ -17,7 +17,7 @@ capability was verified. See “Host-bound probe and release gate” below.
 
 | Command | Purpose | Installed runtime present | Runtime absent or wrong version |
 | --- | --- | --- | --- |
-| `npm test` | ordinary portable suite; excludes the probe | 64/64 pass | 64/64 pass (no capability claim) |
+| `npm test` | ordinary portable suite; excludes the probe | 72/72 pass | 72/72 pass (no capability claim) |
 | `npm run test:feasibility` | optional focused probe; reports skips | 21/21 pass | 21 skipped; prints `[unverified] ...`; exit 0 |
 | `npm run verify:feasibility` | **strict capability gate** | 21/21 pass | fails nonzero |
 
@@ -25,6 +25,12 @@ capability was verified. See “Host-bound probe and release gate” below.
 claim**. The ordinary suite passing without it proves only the portable code, not
 MCP feasibility. The skip path is explicit (`unverified — ...` per test), never a
 hidden pass.
+
+The strict command is a dependency-free Node wrapper (`test/verify-feasibility.mjs`)
+that sets `DSH_FEASIBILITY_REQUIRED=1`, spawns `node --test` on the probe and
+forwards its exit code, so it works on POSIX shells and Windows `cmd` alike. A
+runtime at a different DSH version counts as unavailable: the optional command
+skips with `unverified`, the strict command fails nonzero.
 
 ## Environment and isolation
 
@@ -371,12 +377,12 @@ From the repository root (`pkg/dsh-skill-pool` in the plan; this worktree root):
 ```sh
 node --test test/mcp-feasibility.probe.mjs   # real root: 21/21 pass
 npm run test:feasibility                     # real root: 21/21; absent: 21 skipped + [unverified], exit 0
-npm run verify:feasibility                   # real root: 21/21; absent/wrong: nonzero
+npm run verify:feasibility                   # real root: 21/21; absent/wrong version: nonzero
 DSH_FEASIBILITY_ROOT=/nonexistent node --test test/mcp-feasibility.probe.mjs
 # 21 skipped, exit 0 (optional probe, clearly unverified)
 DSH_FEASIBILITY_ROOT=/nonexistent npm run verify:feasibility
-# exit nonzero (strict gate)
-npm test                                     # 64/64 pass; probe is excluded
+# exit nonzero (strict gate; the wrapper sets DSH_FEASIBILITY_REQUIRED=1)
+npm test                                     # 72/72 pass; probe is excluded
 npm run lint                                 # exit 0
 node test-persisted-mcp.mjs                  # all persisted-MCP checks passed
 ```
@@ -384,8 +390,10 @@ node test-persisted-mcp.mjs                  # all persisted-MCP checks passed
 The probe locates the installed runtime at
 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh` by default and accepts
 `DSH_FEASIBILITY_ROOT` to point at another installed DSH tree. It requires the
-expected host version (`0.2.2-rc.3`). The default `npm test` script’s
-`test/*.test.mjs` glob does not match `mcp-feasibility.probe.mjs`, so the
-ordinary suite can pass without the host and makes no capability claim. The
-optional focused command prints the skip reason; the strict command
-(`DSH_FEASIBILITY_REQUIRED=1`) fails nonzero instead of skipping.
+expected host version (`0.2.2-rc.3`) exactly; another installed version is
+reported as an unverified/failed runtime, never silently accepted. The default
+`npm test` script’s `test/*.test.mjs` glob does not match
+`mcp-feasibility.probe.mjs`, so the ordinary suite can pass without the host and
+makes no capability claim. The optional focused command prints the skip reason;
+the strict command (`DSH_FEASIBILITY_REQUIRED=1`, set by the cross-platform Node
+wrapper) fails nonzero instead of skipping.
