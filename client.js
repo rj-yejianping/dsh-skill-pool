@@ -902,6 +902,44 @@ window.__ModuleLoader__.load({
       return { ...state, [key]: next }
     }
 
+    /**
+     * Overlay unsaved row drafts on a document loaded from the Host.
+     *
+     * A debounced/in-flight/failed save is a local draft that the server does
+     * not know yet; a GET response must not make the user's text disappear.
+     */
+    function mergeRowDrafts(loadedState, drafts) {
+      let next = loadedState
+      if (!drafts || typeof drafts[Symbol.iterator] !== 'function') return next
+      for (const [key, entry] of drafts) {
+        if (typeof key !== 'string' || entry === null || typeof entry !== 'object') continue
+        if (key.startsWith('mcp:')) next = withEntry(next, MCP, key.slice(4), entry)
+        else if (key.startsWith('skill:')) next = withEntry(next, 'skill', key.slice(6), entry)
+      }
+      return next
+    }
+
+    /**
+     * Decide what a completed GET may replace.
+     *
+     * A load started at revision R may only apply its document when no local
+     * edit or save response landed meanwhile; otherwise it keeps the current
+     * rows and refreshes only the derived views. When the revision still
+     * matches, per-row drafts are merged over the server document so a
+     * failure-triggered reload cannot drop an unsaved edit.
+     *
+     * @param {object|null} current - board currently rendered.
+     * @param {{state: object, inventory: object, mounts: object, meta: object}} loaded - response.
+     * @param {{startedRevision: number, currentRevision: number, drafts: Map<string, object>}} options - race inputs.
+     * @returns {object} board to render.
+     */
+    function applyLoadedBoard(current, loaded, options) {
+      if (!current) return loaded
+      const refreshed = { ...current, inventory: loaded.inventory, mounts: loaded.mounts, meta: loaded.meta }
+      if (options.startedRevision !== options.currentRevision) return refreshed
+      return { ...loaded, state: mergeRowDrafts(loaded.state, options.drafts) }
+    }
+
     function summarizeList(values, allLabel, labeler, limit) {
       const list = asStringArray(values)
       if (list.length === 0) return allLabel
@@ -2092,6 +2130,9 @@ window.__ModuleLoader__.load({
       const pendingRef = useRef(new Map())
       const editSeqRef = useRef(new Map())
       const writeChainsRef = useRef(new Map())
+      const draftsRef = useRef(new Map())
+      const removingRef = useRef(new Set())
+      const boardRevisionRef = useRef(0)
       const timersRef = useRef(new Map())
       const groupTimersRef = useRef(new Map())
       const noticeTimer = useRef(null)
@@ -2109,6 +2150,8 @@ window.__ModuleLoader__.load({
           pendingRef.current.clear()
           editSeqRef.current.clear()
           writeChainsRef.current.clear()
+          draftsRef.current.clear()
+          removingRef.current.clear()
           if (noticeTimer.current) clearTimeout(noticeTimer.current)
         }
       }, [])
@@ -2204,6 +2247,10 @@ window.__ModuleLoader__.load({
               // The user kept typing while this request was in flight: the local
               // draft is newer than this response, so never replace it.
               if ((editSeqRef.current.get(key) ?? 0) !== sequence) return
+              draftsRef.current.delete(key)
+              // Any GET that started before this save response carries older
+              // rows; let it refresh the derived views but keep this state.
+              boardRevisionRef.current += 1
               clearRowError(key)
               if (payload.state) {
                 const nextState = normalizeState(payload.state)
@@ -2242,6 +2289,7 @@ window.__ModuleLoader__.load({
           const key = `${kind}:${name}`
           pendingRef.current.set(key, { kind, name, entry })
           editSeqRef.current.set(key, (editSeqRef.current.get(key) ?? 0) + 1)
+          boardRevisionRef.current += 1
           const timer = timersRef.current.get(key)
           if (timer) clearTimeout(timer)
           markSaving(key, true)
@@ -2295,6 +2343,7 @@ window.__ModuleLoader__.load({
           if (pendingRef.current.size > 0) await flushPending()
           if (loadingRef.current) return
           loadingRef.current = true
+          const startedRevision = boardRevisionRef.current
           if (!silent) {
             setLoading(true)
             setError('')
@@ -2302,20 +2351,26 @@ window.__ModuleLoader__.load({
           try {
             const payload = await request(API, { method: 'GET' })
             if (!mounted.current) return
-            const nextState = normalizeState(payload.state)
-            const nextInventory = normalizeInventory(payload.inventory)
-            const nextMounts = normalizeMount(payload.mounts || payload.mount)
-            setBoard({
-              state: nextState,
-              inventory: nextInventory,
-              mounts: nextMounts,
+            const loaded = {
+              state: normalizeState(payload.state),
+              inventory: normalizeInventory(payload.inventory),
+              mounts: normalizeMount(payload.mounts || payload.mount),
               meta: asObject(payload.meta),
-            })
+            }
+            setBoard((current) =>
+              applyLoadedBoard(current, loaded, {
+                startedRevision,
+                currentRevision: boardRevisionRef.current,
+                drafts: draftsRef.current,
+              }),
+            )
             if (!previewInitialized.current) {
               previewInitialized.current = true
               const mode =
-                asString(nextInventory.defaultMode) || (nextInventory.modes[0] && nextInventory.modes[0].id) || ''
-              const cwd = (nextInventory.workspaces[0] && nextInventory.workspaces[0].path) || ''
+                asString(loaded.inventory.defaultMode) ||
+                (loaded.inventory.modes[0] && loaded.inventory.modes[0].id) ||
+                ''
+              const cwd = (loaded.inventory.workspaces[0] && loaded.inventory.workspaces[0].path) || ''
               setPreviewMode(mode)
               setPreviewCwd(cwd)
             }
@@ -2465,6 +2520,10 @@ window.__ModuleLoader__.load({
 
       const updateEntry = useCallback(
         (kind, name, patch) => {
+          const key = `${kind}:${name}`
+          // Once removal owns this row, later edits must not schedule a save that
+          // could recreate it; the row is disappearing.
+          if (removingRef.current.has(key)) return
           const source =
             kind === MCP
               ? boardRef.current && boardRef.current.state.mcp[name]
@@ -2487,8 +2546,9 @@ window.__ModuleLoader__.load({
           // An empty string clears the purpose; an absent patch keeps the local
           // draft untouched. Both stay distinct so autosave cannot invent one.
           if (typeof patch.description === 'string') next.description = patch.description
+          draftsRef.current.set(key, next)
           setBoard((current) => (current ? { ...current, state: withEntry(current.state, kind, name, next) } : current))
-          clearRowError(`${kind}:${name}`)
+          clearRowError(key)
           queueItem(kind, name, next)
         },
         [clearRowError, queueItem],
@@ -2497,22 +2557,35 @@ window.__ModuleLoader__.load({
       const removeItem = useCallback(
         async (kind, name) => {
           const key = `${kind}:${name}`
-          if (pendingRef.current.size > 0) await flushPending()
-          // Ignore any save that is already in flight for this member: it must
-          // not put the row back after the delete response arrives.
-          editSeqRef.current.set(key, (editSeqRef.current.get(key) ?? 0) + 1)
-          const timer = timersRef.current.get(key)
-          if (timer) {
-            clearTimeout(timer)
-            timersRef.current.delete(key)
-          }
-          pendingRef.current.delete(key)
-          markSaving(key, false)
+          if (removingRef.current.has(key)) return
+          removingRef.current.add(key)
           setBusyKey('remove:' + key, true)
           setError('')
           try {
+            // Removal owns this row: discard its queued draft and ignore later
+            // edits so no save can be scheduled once the delete is under way.
+            editSeqRef.current.set(key, (editSeqRef.current.get(key) ?? 0) + 1)
+            draftsRef.current.delete(key)
+            const timer = timersRef.current.get(key)
+            if (timer) {
+              clearTimeout(timer)
+              timersRef.current.delete(key)
+            }
+            pendingRef.current.delete(key)
+            markSaving(key, false)
+
+            // Settle the row's last in-flight write before removing it. Without
+            // this, the older `/item` request can be processed after the delete
+            // and (on an older server) recreate the member.
+            const inFlight = writeChainsRef.current.get(key)
+            if (inFlight) await inFlight.catch(() => {})
+            if (pendingRef.current.size > 0) await flushPending()
+            // Any GET already running must not restore the row from older data.
+            boardRevisionRef.current += 1
+
             const payload = await request(`${API}/item/remove`, { method: 'POST', body: { kind, name } })
             if (!mounted.current) return
+            boardRevisionRef.current += 1
             if (payload.state) {
               setBoard((current) => (current ? { ...current, state: normalizeState(payload.state) } : current))
             } else {
@@ -2527,8 +2600,11 @@ window.__ModuleLoader__.load({
             else flash(TEXT.itemRemoved)
             await loadBoard({ silent: true })
           } catch (cause) {
+            // The member is still present; let a stale reload refresh views only.
+            boardRevisionRef.current += 1
             if (mounted.current) setRowError(key, messageOf(cause))
           } finally {
+            removingRef.current.delete(key)
             if (mounted.current) setBusyKey('remove:' + key, false)
           }
         },
@@ -4491,6 +4567,9 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['slots'],
+      // Pure reconciliation used by `loadBoard`; exposed so the Node test can
+      // exercise the production function without a browser renderer.
+      boardState: { applyLoadedBoard },
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
           ctx.slots.register(

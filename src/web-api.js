@@ -367,13 +367,16 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     try {
       const state = await store.update((current) => {
         const existing = kind === 'skill' ? current.skills[name] : current.mcp[name]
-        // A description belongs to an existing member: an editor focused on a
-        // removed row must not resurrect it as a new pool entry.
-        if (editingDescription && !isObject(existing)) {
-          throw Object.assign(new Error('只能为已存在的 MCP 成员填写用途摘要'), {
-            code: 'resource-pool/unknown-item',
-            status: 400,
-          })
+        // `/item` only edits an existing member: a save that was queued before a
+        // delete (or a focused row for a member that is already gone) must fail
+        // instead of recreating the member after the removal.
+        if (!isObject(existing)) {
+          throw Object.assign(
+            new Error(
+              editingDescription ? '只能为已存在的 MCP 成员填写用途摘要' : `成员 ${name} 不存在；/item 只能编辑已有成员`,
+            ),
+            { code: 'resource-pool/unknown-item', status: 400 },
+          )
         }
         const extra = {
           sourceId: existing?.sourceId,
