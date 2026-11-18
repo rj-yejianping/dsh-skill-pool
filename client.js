@@ -664,6 +664,27 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Parse the host's redacted re-application warning. Kept as a pure helper so
+     * the panel tests can assert it persists until explicitly dismissed.
+     */
+    function activationWarningOf(payload) {
+      const warning = asObject(payload && payload.warning)
+      const message = asString(warning.message).trim()
+      if (message.length === 0) return null
+      return { code: asString(warning.code), message }
+    }
+
+    /** Merge a response warning without clearing an existing one on success. */
+    function mergeActivationWarning(current, payload) {
+      return activationWarningOf(payload) || current || null
+    }
+
+    /** An explicit close clears the banner; nothing time-based does. */
+    function dismissActivationWarning() {
+      return null
+    }
+
+    /**
      * Acknowledge a purpose edit only after the save that carried it lands.
      *
      * `sequence` is the edit revision captured when the request was flushed;
@@ -1231,6 +1252,20 @@ window.__ModuleLoader__.load({
         borderRadius: '8px',
         padding: '7px 10px',
         fontSize: '13px',
+      },
+      activationWarning: {
+        border: '1px solid var(--rp-warn, var(--dsw-alias-state-warn-primary))',
+        background: 'var(--rp-card)',
+        color: 'var(--rp-warn, var(--dsw-alias-state-warn-primary))',
+        borderRadius: '8px',
+        padding: '7px 10px',
+        fontSize: '13px',
+        lineHeight: 1.5,
+        wordBreak: 'break-word',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: '10px',
       },
       noticeText: { fontSize: '13px', color: 'var(--dsw-alias-state-success-primary)', alignSelf: 'center' },
       empty: { fontSize: '13px', color: 'var(--dsw-alias-label-secondary)', padding: '14px 4px', lineHeight: 1.6 },
@@ -2301,9 +2336,10 @@ window.__ModuleLoader__.load({
        * warning instead of silently claiming every session was updated.
        */
       const surfaceWarning = useCallback((payload) => {
-        const message = asString(payload && payload.warning && payload.warning.message)
-        if (message.length > 0) flash(message)
-      }, [flash])
+        // Persistent and closable: a re-application failure must stay visible
+        // even after the next successful request and beyond the 3.2s toast.
+        setActivationWarning((current) => mergeActivationWarning(current, payload))
+      }, [])
 
       const setBusyKey = useCallback((key, value) => {
         const name = asString(key)
@@ -4124,6 +4160,18 @@ window.__ModuleLoader__.load({
             )
           : null,
         notice ? h('div', { style: S.notice, role: 'status' }, notice) : null,
+        activationWarning
+          ? h(
+              'div',
+              { style: S.activationWarning, role: 'alert' },
+              h('span', { style: { minWidth: 0 } }, activationWarning.message),
+              h(
+                'button',
+                { type: 'button', style: S.buttonSmall, onClick: () => setActivationWarning(dismissActivationWarning()) },
+                TEXT.close,
+              ),
+            )
+          : null,
         board
           ? h(
               React.Fragment,
@@ -4745,6 +4793,9 @@ window.__ModuleLoader__.load({
         buildItemSaveBody,
         markDescriptionEdited,
         settleDescriptionDirty,
+        activationWarningOf,
+        mergeActivationWarning,
+        dismissActivationWarning,
       },
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>

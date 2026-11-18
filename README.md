@@ -181,7 +181,8 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
 状态文件与技能目录、MCP 连接记录分离。**首次使用**（文件从未存在）视为合法的空配置；
 但文件存在却读不懂，或本进程已经观察过的文件随后消失，都按异常处理，不会退回默认配置。
 同一 Node 进程内新建的 `StateStore`（例如插件热重载）会通过进程内记录继续记住"该文件曾经存在"；
-这不会创建任何 marker 文件。全新 Host 进程仍无法区分"文件被删"与"真正首次使用"，见下方边界。
+**非 `ENOENT` 的读取错误（如 EISDIR/权限错误）也会写入该进程内记录**，因此路径随后被删除时不会
+被当成首启。这不会创建任何 marker 文件。全新 Host 进程仍无法区分"文件被删"与"真正首次使用"，见下方边界。
 
 **读取和写入都 fail-closed**：普通读取（含面板 GET、`/resolve`、Agent 激活）与更新（`/item`、导入、删除等）
 都会先校验完整文档（v4 严格校验，v3 走显式迁移）。非法 JSON、JSON 非对象、不支持的版本、缺少必需段，
@@ -206,7 +207,8 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   不会发布一个没有 MCP 门控的会话。修复文件后，下一次保存或插件重载会恢复正常。
 - **降级可见**：面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 工具在失败时返回
   `stateStatus.ok=false`、错误码与恢复说明。写入成功但重新应用失败时，HTTP 仍返回 200（已提交状态保留）
-  并附带脱敏的 `warning`，面板以提示条显示；不会假装所有活动会话都已生效。
+  并附带脱敏的 `warning`；面板显示**持久、可手动关闭**的警告条（不再使用 3.2 秒成功 toast，也不会被
+  后续成功响应清除），不会假装所有活动会话都已生效。
 - **边界**：全新 Host 进程启动后若状态文件已被删除，无法区分"被删"与"真正首次使用"，
   此时按首次运行处理（同进程内的新 `StateStore` 会记得，见上）。
   插件重载会先释放旧限制层；若重载时文件仍损坏，已有会话只能退化为上述保守层，
@@ -219,6 +221,14 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
 旧 API 可能写入过任意 group key：只要键本身安全（非原型污染、无控制字符），这类组会作为
 **惰性遗留项**保留，但只有 `repo:<project>` / `import:<sourceId>` 才能被来源引用；
 新的 `POST /group` 会拒绝其它 key（400），不再制造无法引用的组。
+
+**无组/无来源成员的旧格式**：`modesFrom`/`workspacesFrom` 为 `group` 但没有可解析的组，是插件
+长期写入的合法默认标记（无组时按成员自己的列表回落；自己的列表为空即"全部"）。strict reader
+不会把这种正常旧配置误判为损坏。新的 API 写入则更严格：
+- 修改 `modes`/`workspaces` 却仍让该维度保持 `group`（组可解析）会返回 400，提示同时提交
+  `modesFrom:'self'` / `workspacesFrom:'self'`，避免"改了但没生效"；
+- 没有有效组却提交修改后的 `group` 标记同样 400，提示改用 `self`，避免产生无法解析的继承；
+- 只改 `enabled`/用途等部分更新仍保留原标记与原语义，不会被误报为配置损坏。
 
 v3 文档会被**迁移**到 v4 而不是丢弃：按仓库推出组、把成员已一致的取值灌给组并让成员继承，
 因此迁移前后每个会话看到的资源完全相同；组内本来就不一致的维度留空，成员保留自己的取值。
@@ -236,14 +246,14 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，109 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，114 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 109/109；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 114/114；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 4/4；不是宿主能力门禁 |
 | `npm run test:feasibility` | 可选探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
 | `npm run verify:feasibility` | **发布或能力声明的强制门禁**（Node 包装器，POSIX/Windows 通用） | 缺失、版本不符或任一探针失败均非零退出 |

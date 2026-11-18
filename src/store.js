@@ -1114,6 +1114,7 @@ export class StateStore {
     } catch (error) {
       if (error?.code !== 'ENOENT') {
         this.everObserved = true
+        observedStateFiles.add(this.key)
         throw new StateReadError('resource-pool/state-unreadable', 'state file could not be read; refusing to overwrite or use it')
       }
       if (this.everLoaded || this.everObserved || observedStateFiles.has(this.key)) {
@@ -1192,6 +1193,7 @@ export class StateStore {
         return this.cached
       }
       this.everObserved = true
+      observedStateFiles.add(this.key)
       throw new StateReadError('resource-pool/state-unreadable', 'state file could not be read; refusing to overwrite it')
     }
     this.everObserved = true

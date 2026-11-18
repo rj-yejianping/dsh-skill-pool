@@ -31,7 +31,7 @@ import {
   upsertSource,
 } from './store.js'
 import { buildInventory } from './inventory.js'
-import { effectiveEnabled, effectiveScope, resolvePool } from './rules.js'
+import { effectiveEnabled, effectiveScope, groupOfMember, resolvePool } from './rules.js'
 import { DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS, mountServer } from './mount.js'
 import {
   buildMcpConfig,
@@ -255,6 +255,61 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     return workspaces
   }
 
+  /** Whether two string lists contain the same values (order/duplicates ignored). */
+  const sameStringList = (left, right) => {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false
+    const a = [...new Set(left)].sort()
+    const b = [...new Set(right)].sort()
+    return a.length === b.length && a.every((value, index) => value === b[index])
+  }
+
+  /**
+   * Refuse scope edits whose inheritance marker would silently discard them.
+   *
+   * The panel always switches the edited dimension to `self`, but API callers
+   * may send only `modes`/`workspaces`. When the member inherits a resolvable
+   * group, that edit would be ignored; when there is no resolvable group, the
+   * marker is ambiguous and can become wider if a group appears later. Existing
+   * unchanged legacy markers (enabled-only panel saves) still pass.
+   */
+  const assertScopePatch = (state, existing, patch) => {
+    const group = groupOfMember(state, existing)
+    const hasGroup = group !== undefined
+    const modesChanged = patch.modes !== undefined && !sameStringList(patch.modes, existing.modes)
+    const workspacesChanged =
+      patch.workspaces !== undefined && !sameStringList(patch.workspaces, existing.workspaces)
+    const desiredModesFrom = patch.modesFrom !== undefined
+      ? patch.modesFrom
+      : existing.modesFrom === 'self' ? 'self' : 'group'
+    const desiredWorkspacesFrom = patch.workspacesFrom !== undefined
+      ? patch.workspacesFrom
+      : existing.workspacesFrom === 'self' ? 'self' : 'group'
+
+    if (desiredModesFrom === 'group' && (modesChanged || (patch.modesFrom === 'group' && existing.modesFrom !== 'group'))) {
+      throw Object.assign(
+        new Error(
+          hasGroup
+            ? "该成员的模式条件由组继承；修改 modes 时请同时提交 modesFrom: 'self'，否则修改不会生效。"
+            : "该成员没有可解析的组，不能保存 modesFrom: 'group' 与修改后的 modes；请提交 modesFrom: 'self'。",
+        ),
+        { code: 'resource-pool/bad-scope', status: 400 },
+      )
+    }
+    if (
+      desiredWorkspacesFrom === 'group' &&
+      (workspacesChanged || (patch.workspacesFrom === 'group' && existing.workspacesFrom !== 'group'))
+    ) {
+      throw Object.assign(
+        new Error(
+          hasGroup
+            ? "该成员的工作区条件由组继承；修改 workspaces 时请同时提交 workspacesFrom: 'self'，否则修改不会生效。"
+            : "该成员没有可解析的组，不能保存 workspacesFrom: 'group' 与修改后的 workspaces；请提交 workspacesFrom: 'self'。",
+        ),
+        { code: 'resource-pool/bad-scope', status: 400 },
+      )
+    }
+  }
+
   /** Read one `scope` object (`{modes, workspaces}`); undefined when absent. */
   const readScope = (value) => {
     if (value === undefined || value === null) return undefined
@@ -435,6 +490,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
             { code: 'resource-pool/unknown-item', status: 400 },
           )
         }
+        if (kind === 'skill') assertScopePatch(current, existing, patch)
         const extra = {
           sourceId: existing?.sourceId,
           digest: existing?.digest,

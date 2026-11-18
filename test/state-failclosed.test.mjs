@@ -7,7 +7,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -1003,5 +1003,111 @@ test('state error messages never echo map keys, newlines or long sensitive text'
     })
   } finally {
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('a non-ENOENT read error is remembered process-wide before the path disappears', async () => {
+  const { dir, file } = await temporaryStore()
+  try {
+    await mkdir(file)
+    const first = new StateStore({ file })
+    await rejectsClosed(first.read({ fresh: true }), 'resource-pool/state-unreadable')
+    await rm(file, { recursive: true, force: true })
+
+    const second = new StateStore({ file })
+    await rejectsClosed(second.read({ fresh: true }), 'resource-pool/state-missing')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a group marker without a resolvable group remains a valid legacy fallback to own scope', async () => {
+  const { dir, file, store } = await temporaryStore()
+  try {
+    const state = validState()
+    state.skills.local = {
+      enabled: true,
+      modes: [],
+      workspaces: [],
+      modesFrom: 'group',
+      workspacesFrom: 'group',
+      installedAt: '',
+    }
+    await writeFile(file, JSON.stringify(state), 'utf8')
+    const read = await store.read({ fresh: true })
+    assert.deepEqual(read.skills.local.modes, [])
+    // This is the documented no-group fallback: own scope, which here is "all".
+    assert.equal(read.skills.local.modesFrom, 'group')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an API mode edit that would be ignored by a resolvable group is rejected instead of silently discarded', async () => {
+  const api = await makeApi(sharedSourceState({ groupEnabled: true }))
+  try {
+    const before = await readFile(api.file)
+    const inherited = await api.call('POST', '/item', {
+      kind: 'skill', name: 'shared', modes: ['x'],
+    })
+    assert.equal(inherited.status, 400)
+    assert.equal(inherited.payload.error.code, 'resource-pool/bad-scope')
+    assert.match(inherited.payload.error.message, /self/)
+    assert.deepEqual(await readFile(api.file), before)
+
+    const ignoredWorkspaces = await api.call('POST', '/item', {
+      kind: 'skill', name: 'shared', workspaces: ['/other'],
+    })
+    assert.equal(ignoredWorkspaces.status, 400)
+    assert.match(ignoredWorkspaces.payload.error.message, /workspacesFrom: 'self'/)
+
+    const selfEdit = await api.call('POST', '/item', {
+      kind: 'skill', name: 'shared', modes: ['x'], modesFrom: 'self',
+    })
+    assert.equal(selfEdit.status, 200)
+    assert.deepEqual(selfEdit.payload.state.skills.shared.modes, ['x'])
+    assert.equal(selfEdit.payload.state.skills.shared.modesFrom, 'self')
+  } finally {
+    await api.dispose()
+  }
+})
+
+test('an API group marker with no resolvable group is rejected only when it would change scope', async () => {
+  const fixture = validState()
+  // A normal no-source skill with the legacy default marker and an empty own
+  // scope. Missing group falls back to the member's own list by contract.
+  fixture.skills.local = {
+    enabled: true, modes: [], workspaces: [], modesFrom: 'group', workspacesFrom: 'group', installedAt: '',
+  }
+  const api = await makeApi(fixture)
+  try {
+    // No source and no group: changing modes while continuing to claim group
+    // inheritance is ambiguous, so reject it.
+    const ambiguous = await api.call('POST', '/item', {
+      kind: 'skill', name: 'local', modes: ['c'], modesFrom: 'group',
+    })
+    assert.equal(ambiguous.status, 400)
+    assert.equal(ambiguous.payload.error.code, 'resource-pool/bad-scope')
+    assert.equal(/state/i.test(ambiguous.payload.error.message), false, 'this is not a corrupt-state error')
+
+    // An enabled-only panel save sends the unchanged legacy marker and values;
+    // it must keep working (partial-update compatibility).
+    const enabledOnly = await api.call('POST', '/item', {
+      kind: 'skill', name: 'local', enabled: false, modes: [], workspaces: [], modesFrom: 'group', workspacesFrom: 'group',
+    })
+    assert.equal(enabledOnly.status, 200)
+    assert.equal(enabledOnly.payload.state.skills.local.enabled, false)
+    assert.deepEqual(enabledOnly.payload.state.skills.local.modes, [])
+
+    // Explicitly switching to self is the documented way to change the scope.
+    const selfEdit = await api.call('POST', '/item', {
+      kind: 'skill', name: 'local', modes: ['c'], modesFrom: 'self',
+    })
+    assert.equal(selfEdit.status, 200)
+    assert.equal(selfEdit.payload.state.skills.local.modesFrom, 'self')
+    assert.deepEqual(selfEdit.payload.state.skills.local.modes, ['c'])
+  } finally {
+    await api.dispose()
   }
 })

@@ -217,3 +217,14 @@ test('the discarded-draft warning preserves the unsaved text visibly', () => {
   assert.ok(message.includes('Unsaved knowledge base text'), message)
   assert.ok(message.toLowerCase().includes('unsaved'), message)
 })
+
+
+test('an activation warning persists across unrelated successes and is explicitly dismissible', () => {
+  const warning = { code: 'resource-pool/activation-degraded', message: '状态已保存，但仍有会话未生效' }
+  assert.deepEqual(plugin.boardState.activationWarningOf({ warning }), warning)
+  assert.equal(plugin.boardState.activationWarningOf({ ok: true }), null)
+  assert.deepEqual(plugin.boardState.mergeActivationWarning(null, { warning }), warning)
+  // A later successful response without a warning must not clear the banner.
+  assert.deepEqual(plugin.boardState.mergeActivationWarning(warning, { state: {} }), warning)
+  assert.equal(plugin.boardState.dismissActivationWarning(), null)
+})
