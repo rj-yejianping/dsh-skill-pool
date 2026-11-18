@@ -221,13 +221,20 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   也立即释放。保留期间是交集，下一次非空快照重放时按新状态注册/释放。
   若被保留的是**保守 fallback**（状态曾不可读），本次仍保持 `conservative` 标志并清空
   signature：文件再次损坏且出现新 MCP 工具时，会再次刷新保守 deny 覆盖新工具，而不是误当成
-  健康激活。
+  健康激活。健康但**零 restrict 层**的 all-allowed 激活（上次成功时全部允许）在之后读取失败时
+  不能算“保留旧门控”：会尝试对当前已知全部 MCP 工具安装保守 deny；这一步失败会返回显式
+  degraded，不静默放行。上次成功明确 `mcpGate:false`/无 MCP 成员时保持全局关闭语义，不安装。
 - **按工具分层保留不可见旧 deny**：每个当前可见的待禁工具各一层；旧层中若有当前不可见的工具名，
   该层保留（DSH restrict 不能注册未知名），可见且已允许的工具层则释放。这样部分快照不会丢掉
   “暂时未注册的 other”旧 deny，other 同名重现时仍被隐藏；等它重新可见后再重建精确层。
   若旧层同时含不可见名和当前可见且已允许名，无法拆分，只能保留整层（暂时过度限制），并通过
   `degraded` 计数/HTTP warning 明确报告，而不是声称完全应用。层数上界是“曾见过的 MCP 工具名数”，
-  不会随重放无限增长。
+  不会随重放无限增长；旧不可见层不能与当前新名单合并（DSH 不能注册未知名）。
+  **注册过程中单个 per-tool 失败**时：保留所有旧层 + 已成功的新层，清 signature/保持 degraded；
+  下一次非空重放重试并收敛。新 Agent 没有旧授权可依赖时，部分 MCP 覆盖失败仍拒绝创建。
+- **恢复路径**：修复文件后显式保存/重放，等所有相关工具重新可见，会释放旧不可见层并重建精确
+  per-tool 层，degraded 警告随之消失。插件重载会先释放全部层；若状态仍坏则退化为保守层。
+  rescope/preset 重放与保存重放走同一逻辑。
 - **degraded 语义**：`reapplyAll` 返回 `failed` 与 `degraded`；`committed` 写入成功但存在
   不可见旧限制保留时返回脱敏 warning，面板持久提示；已提交状态不变。
   真实 DSH 限制层的注册/交集/卸载/重注册，以及“先注册新 deny 再释放旧层”由
@@ -277,17 +284,18 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，141 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，145 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 141/141；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 145/145；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 4/4；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
+| `npm run test:activation` | 真实 ToolsService + production activation 探针（零层 fallback/注册竞态） | 当前环境 2/2；不是宿主能力门禁 |
 | `npm run test:feasibility` | 可选探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
 | `npm run verify:feasibility` | **发布或能力声明的强制门禁**（Node 包装器，POSIX/Windows 通用） | 缺失、版本不符或任一探针失败均非零退出 |
 
@@ -338,6 +346,7 @@ npm run verify:feasibility  # 强制宿主门禁：缺失/版本不符/失败均
 npm run test:lifecycle      # index.js 生命周期/恢复/保守回退探针（需要 DSH）
 npm run test:naming         # 真实 publicToolName 歧义/截断哈希探针（需要 DSH）
 npm run test:restrict       # 真实 tools.restrict 注册/卸载/重注册探针（需要 DSH）
+npm run test:activation     # 真实 ToolsService + activation 零层/竞态探针（需要 DSH）
 node test-persisted-mcp.mjs # MCP 定义持久化/重挂载检查
 ```
 

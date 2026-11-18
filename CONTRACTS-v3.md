@@ -291,7 +291,12 @@ Fail-closed 增量：
 - **按工具保留不可见旧 deny**：新的 deny 层按当前可见待禁工具逐工具注册；旧层包含当前不可见
   工具名时保留该层（无法注册未知名），否则释放。旧层混合不可见名与可见已允许名时不可拆分，
   保留整层并计入 `degraded`，HTTP 返回脱敏 warning，不声称完全应用。层数上界为曾见 MCP 工具数，
-  重放不会无限增长。
+  重放不会无限增长；旧不可见层不能与当前新名单合并。
+- **零限制层失败**：上次成功但 all-allowed（零 restrict 层）后读取失败，会尝试 conservative deny
+  当前全部已知 MCP；失败显式 degraded。上次 `mcpGate:false`/无 MCP 成员则不覆盖全局关闭语义。
+- **部分注册失败**：逐工具 restrict 有一个失败时保留全部旧层与已成功新层，清 signature、标记
+  degraded；下一次非空重放收敛。新 Agent 没有旧层时仍拒绝创建。真实 ToolsService+activation
+  探针（含 unregister race）由 `npm run test:activation` 覆盖。
 - `POST /group` 的 `import:`/`repo:` 空名返回 400。
 - **警告持久化**：写成功但重新应用失败返回 200 + 脱敏 `warning`；面板显示可关闭的持久警告条，
   不被后续成功响应或短 toast 覆盖。

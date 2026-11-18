@@ -215,6 +215,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     record.activated = false
     record.conservative = false
     record.degraded = false
+    record.mcpGateActive = false
   }
 
   /** Signature of a decision, used to skip no-op re-applications. */
@@ -244,7 +245,15 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     if (agent?.ctx === undefined) return
     let record = agents.get(agent)
     if (record === undefined) {
-      record = { disposers: [], signature: '', activated: false, conservative: false, degraded: false, chain: Promise.resolve() }
+      record = {
+        disposers: [],
+        signature: '',
+        activated: false,
+        conservative: false,
+        degraded: false,
+        mcpGateActive: false,
+        chain: Promise.resolve(),
+      }
       agents.set(agent, record)
     }
     const run = record.chain.then(() => applyNow(agent, record, { force }))
@@ -285,6 +294,30 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         // A healthy old layer is deliberately still installed. Reporting success
         // would hide a degraded state; rejecting would make the Agent unusable
         // even though its previous, authorized gate still protects it.
+        const hasRestrictLayer = record.disposers.some((entry) => RESTRICT_LABELS.has(entry.label))
+        if (conservative && record.mcpGateActive !== false && !hasRestrictLayer) {
+          // The previous successful activation intentionally allowed every
+          // visible tool (so it had zero restrict layers). Treating that as a
+          // "retained gate" would leave a later failure ungated. Install a
+          // conservative deny for all currently known MCP tools instead.
+          try {
+            applyConservativeGate(agent)
+            return {
+              ok: false,
+              code: 'resource-pool/activation-conservative',
+              message: 'state unavailable with no prior MCP restriction; conservative deny applied',
+            }
+          } catch (gateError) {
+            logger?.warn?.(
+              `[resource-pool] conservative MCP gate failed without a prior layer: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
+            )
+            return {
+              ok: false,
+              code: 'resource-pool/activation-degraded',
+              message: 'state unavailable and no prior MCP restriction could be installed',
+            }
+          }
+        }
         return {
           ok: false,
           code: 'resource-pool/activation-degraded',
@@ -479,13 +512,29 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       // Register per-tool deny layers for every currently visible denied name.
       // Do this before touching the previous layers (register before release).
       // A name that is not visible now cannot be named in `restrict()`.
+      let restrictFailures = 0
       if (pool.gateMcp && observedMcp > 0) {
         for (const name of denyMcp) {
-          addEffect(
-            () => agent.ctx.tools.restrict({ deny: [name] }),
-            'mcp-restrict',
-            { critical: true, deny: [name] },
-          )
+          try {
+            const dispose = agent.ctx.effect(
+              () => agent.ctx.tools.restrict({ deny: [name] }),
+              'resource-pool.mcp-restrict',
+            )
+            pending.push({
+              dispose: typeof dispose === 'function' ? dispose : () => {},
+              label: 'mcp-restrict',
+              deny: [name],
+            })
+          } catch (error) {
+            // A tool may have been unregistered between schemas() and this
+            // restrict() call. Keep the layers that did register; the old
+            // layers are retained below and the result is reported degraded.
+            restrictFailures += 1
+            incomplete = true
+            logger?.warn?.(
+              `[resource-pool] one MCP restrict layer could not be registered (retaining old layers): ${error instanceof Error ? error.message : String(error)}`,
+            )
+          }
         }
       }
 
@@ -550,6 +599,13 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         // per-tool layer (transient host generation change).
         record.disposers = [...pending, ...oldRestrictions]
         retainedInvisible = oldRestrictions.length > 0
+      } else if (restrictFailures > 0) {
+        // A brand-new Agent has no prior authorization to fall back on: partial
+        // MCP coverage must fail creation. An already-active Agent keeps its
+        // old layers plus any successful new layers and reports degraded.
+        if (!record.activated) throw new Error('MCP restrict registration failed for a new Agent')
+        retainedInvisible = true
+        record.disposers = [...pending, ...oldRestrictions]
       } else {
         const retained = []
         for (const entry of oldRestrictions) {
@@ -569,6 +625,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       }
 
       record.activated = true
+      record.mcpGateActive = pool.gateMcp
       // Any retained layer covering a currently invisible name means the last
       // safe activation could not be reconstructed exactly. Keep conservative
       // semantics so a later state failure refreshes coverage for new tools.

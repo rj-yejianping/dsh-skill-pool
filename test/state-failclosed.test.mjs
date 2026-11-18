@@ -298,10 +298,9 @@ function makeAgent({ mode, cwd, failRestrict = false }) {
 
 /** Effective deny names from all still-active per-tool restriction layers. */
 function activeDeny(agent) {
-  return agent.restrictions
+  return [...new Set(agent.restrictions
     .filter((entry) => entry.disposed === false)
-    .flatMap((entry) => entry.deny ?? [])
-    .sort()
+    .flatMap((entry) => entry.deny ?? []))].sort()
 }
 
 /** An activation manager over a real store whose `getState` is the host getter. */
@@ -1737,5 +1736,109 @@ test('a re-import into an equivalent disabled group hides an old enabled member 
     assert.deepEqual(rules.resolvePool(enabled, { mode: 'standard', cwd: '/workspace' }).skills, ['shared'], 're-enabling the new group restores it')
   } finally {
     await api.dispose()
+  }
+})
+
+
+test('a healthy zero-layer all-allowed activation falls back conservatively when state breaks', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    const allAllowed = validState()
+    allAllowed.mcp.kb.modes = []
+    await store.write(allAllowed)
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(agent.restrictions.length, 0, 'all MCP tools were allowed, so no restrict layer exists')
+
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__new__x' }]
+    const result = await harness.activation.reapplyAll()
+    assert.equal(result.failed, 1)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__new__x'], 'zero-layer activation gets a conservative deny')
+    assert.equal(result.warnings.some((warning) => warning.code === 'resource-pool/activation-conservative'), true)
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an explicit global MCP gate-off is not overridden by the zero-layer fallback', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    const off = validState()
+    off.settings.mcpGate = false
+    await store.write(off)
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(agent.restrictions.length, 0)
+
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__new__x' }]
+    await harness.activation.reapplyAll()
+    assert.deepEqual(activeDeny(agent), [], 'explicit gate-off semantics are preserved')
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a failed conservative fallback without old layers is reported, not silent', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    const allAllowed = validState()
+    allAllowed.mcp.kb.modes = []
+    await store.write(allAllowed)
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    agent.ctx.tools.restrict = () => {
+      throw new Error('host lost the tool during registration')
+    }
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    const result = await harness.activation.reapplyAll()
+    assert.equal(result.failed, 1)
+    assert.equal(result.warnings.some((warning) => warning.code === 'resource-pool/activation-degraded'), true)
+    assert.deepEqual(activeDeny(agent), [])
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a partial per-tool registration failure keeps successful and old layers and converges next time', async () => {
+  const { dir, store } = await temporaryStore()
+  const schemasRef = { current: [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await store.write(twoMcpState())
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'])
+
+    const extended = twoMcpState()
+    extended.mcp.third = { enabled: true, modes: ['b'], workspaces: [], installedAt: '2026-11-19T00:00:00.000Z' }
+    await store.write(extended)
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__other__x' }, { name: 'mcp__third__x' }]
+    const originalRestrict = agent.ctx.tools.restrict
+    agent.ctx.tools.restrict = (rule) => {
+      if (rule?.deny?.[0] === 'mcp__third__x') throw new Error('tool vanished between schemas and restrict')
+      return originalRestrict(rule)
+    }
+    const degraded = await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(degraded.degraded, true)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x'], 'successful layers and old layers remain; the raced name is not falsely claimed covered')
+
+    agent.ctx.tools.restrict = originalRestrict
+    const recovered = await harness.activation.applyToAgent(agent, { force: true })
+    assert.equal(recovered.degraded, undefined)
+    assert.deepEqual(activeDeny(agent), ['mcp__kb__search', 'mcp__other__x', 'mcp__third__x'])
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
   }
 })

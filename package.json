@@ -49,6 +49,7 @@
     "test:lifecycle": "node --test test/plugin-lifecycle.probe.mjs",
     "test:naming": "node --test test/mcp-naming.probe.mjs",
     "test:restrict": "node --test test/restrict-lifecycle.probe.mjs",
+    "test:activation": "node --test test/activation-restrict.probe.mjs",
     "verify:feasibility": "node test/verify-feasibility.mjs"
   },
   "dsh": {
