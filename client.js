@@ -2295,6 +2295,16 @@ window.__ModuleLoader__.load({
         }, 3200)
       }, [])
 
+      /**
+       * A successful write can still leave live sessions on their previous
+       * gate (the host keeps the committed state). Show the server's redacted
+       * warning instead of silently claiming every session was updated.
+       */
+      const surfaceWarning = useCallback((payload) => {
+        const message = asString(payload && payload.warning && payload.warning.message)
+        if (message.length > 0) flash(message)
+      }, [flash])
+
       const setBusyKey = useCallback((key, value) => {
         const name = asString(key)
         if (name.length === 0) return
@@ -2367,6 +2377,7 @@ window.__ModuleLoader__.load({
                 body,
               })
               if (!mounted.current) return
+              surfaceWarning(payload)
               // The user kept typing while this request was in flight: the local
               // draft is newer than this response, so never replace it.
               const currentSequence = editSeqRef.current.get(key) ?? 0
@@ -2407,7 +2418,7 @@ window.__ModuleLoader__.load({
           // rendering error must not surface as an unhandled rejection.
           await run.catch(() => {})
         },
-        [clearRowError, markSaving, setRowError],
+        [clearRowError, markSaving, setRowError, surfaceWarning],
       )
 
       const queueItem = useCallback(
@@ -2732,6 +2743,7 @@ window.__ModuleLoader__.load({
 
             const payload = await request(`${API}/item/remove`, { method: 'POST', body: { kind, name } })
             if (!mounted.current) return
+            surfaceWarning(payload)
             boardRevisionRef.current += 1
             if (payload.state) {
               setBoard((current) => (current ? { ...current, state: normalizeState(payload.state) } : current))
@@ -2755,7 +2767,7 @@ window.__ModuleLoader__.load({
             if (mounted.current) setBusyKey('remove:' + key, false)
           }
         },
-        [clearRowError, flash, flushPending, loadBoard, markSaving, setBusyKey, setRowError],
+        [clearRowError, flash, flushPending, loadBoard, markSaving, setBusyKey, setRowError, surfaceWarning],
       )
 
       const saveSettings = useCallback(
@@ -2776,6 +2788,7 @@ window.__ModuleLoader__.load({
               )
             }
             flash(TEXT.settingsSaved)
+            surfaceWarning(payload)
           } catch (cause) {
             if (mounted.current) {
               setError(messageOf(cause))
@@ -2785,7 +2798,7 @@ window.__ModuleLoader__.load({
             if (mounted.current) setBusyKey('settings', false)
           }
         },
-        [flash, loadBoard, setBusyKey],
+        [flash, loadBoard, setBusyKey, surfaceWarning],
       )
 
       /** Persist the pending scope of one group (debounced by `updateGroup`). */
@@ -2810,6 +2823,7 @@ window.__ModuleLoader__.load({
             if (payload.state) {
               setBoard((board) => (board ? { ...board, state: normalizeState(payload.state) } : board))
             }
+            surfaceWarning(payload)
           } catch (cause) {
             if (mounted.current) {
               setError(messageOf(cause))
@@ -2819,7 +2833,7 @@ window.__ModuleLoader__.load({
             if (mounted.current) setBusyKey('group:' + key, false)
           }
         },
-        [setBusyKey],
+        [setBusyKey, surfaceWarning],
       )
 
       /** Optimistically edit a group, then persist it once the user pauses. */
@@ -2886,6 +2900,7 @@ window.__ModuleLoader__.load({
                   : current,
               )
             }
+            surfaceWarning(payload)
             if (seg === 'mcp') {
               if (mounted.current) void loadBoard({ silent: true })
             }
@@ -2894,7 +2909,7 @@ window.__ModuleLoader__.load({
             if (mounted.current) setBusyKey('import', false)
           }
         },
-        [loadBoard, setBusyKey],
+        [loadBoard, setBusyKey, surfaceWarning],
       )
 
       const pollMounts = useCallback(async () => {
@@ -2938,6 +2953,7 @@ window.__ModuleLoader__.load({
             const upToDate = results.filter((row) => asString(row && row.status) === 'up-to-date').length
             const failed = results.filter((row) => asString(row && row.status) === 'error').length
             flash(tf('checkResult', { updated, upToDate, failed }))
+            surfaceWarning(payload)
             await loadBoard({ silent: true })
           } catch (cause) {
             if (mounted.current) setError(messageOf(cause))
@@ -2945,7 +2961,7 @@ window.__ModuleLoader__.load({
             if (mounted.current) setBusyKey(busyKey, false)
           }
         },
-        [flash, loadBoard, setBusyKey],
+        [flash, loadBoard, setBusyKey, surfaceWarning],
       )
 
       const updateSource = useCallback(
@@ -2979,6 +2995,7 @@ window.__ModuleLoader__.load({
                     : TEXT.noticeSourceUpdated,
               )
             }
+            surfaceWarning(payload)
             await loadBoard({ silent: true })
           } catch (cause) {
             if (mounted.current) setError(messageOf(cause))
@@ -2986,7 +3003,7 @@ window.__ModuleLoader__.load({
             if (mounted.current) setBusyKey('source:update:' + id, false)
           }
         },
-        [flash, loadBoard, setBusyKey],
+        [flash, loadBoard, setBusyKey, surfaceWarning],
       )
 
       /** Update every Git import of one repository group, one after another. */
@@ -2999,6 +3016,7 @@ window.__ModuleLoader__.load({
           let installed = 0
           let failures = 0
           let changed = 0
+          let warningPayload = null
           try {
             for (const id of list) {
               try {
@@ -3007,6 +3025,7 @@ window.__ModuleLoader__.load({
                 if (payload.state) {
                   setBoard((current) => (current ? { ...current, state: normalizeState(payload.state) } : current))
                 }
+                if (payload.warning) warningPayload = payload
                 if (payload.changed !== false) changed += 1
                 installed += asArray(payload.installed).length
                 failures += asArray(payload.failures).length
@@ -3019,12 +3038,13 @@ window.__ModuleLoader__.load({
             if (failures === 0) {
               flash(changed === 0 ? TEXT.noticeSourceUpToDate : tf('noticeGroupUpdated', { count: installed }))
             }
+            if (warningPayload) surfaceWarning(warningPayload)
             await loadBoard({ silent: true })
           } finally {
             if (mounted.current) setBusyKey(busyKey, false)
           }
         },
-        [flash, loadBoard, setBusyKey],
+        [flash, loadBoard, setBusyKey, surfaceWarning],
       )
 
       const deleteSource = useCallback(
@@ -3044,6 +3064,7 @@ window.__ModuleLoader__.load({
                 ? TEXT.noticeSourceDeleted + tf('sourceSkipped', { count: skipped.length })
                 : TEXT.noticeSourceDeleted,
             )
+            surfaceWarning(payload)
             await loadBoard({ silent: true })
           } catch (cause) {
             if (mounted.current) setError(messageOf(cause))
@@ -3051,7 +3072,7 @@ window.__ModuleLoader__.load({
             if (mounted.current) setBusyKey('source:delete:' + id, false)
           }
         },
-        [flash, loadBoard, setBusyKey],
+        [flash, loadBoard, setBusyKey, surfaceWarning],
       )
 
       // ----------------------------------------------------------- renderers

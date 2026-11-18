@@ -17,7 +17,7 @@ capability was verified. See “Host-bound probe and release gate” below.
 
 | Command | Purpose | Installed runtime present | Runtime absent or wrong version |
 | --- | --- | --- | --- |
-| `npm test` | ordinary portable suite; excludes the probe | 91/91 pass | 91/91 pass (no capability claim) |
+| `npm test` | ordinary portable suite; excludes the probe | 109/109 pass | 109/109 pass (no capability claim) |
 | `npm run test:feasibility` | optional focused probe; reports skips | 21/21 pass | 21 skipped; prints `[unverified] ...`; exit 0 |
 | `npm run verify:feasibility` | **strict capability gate** | 21/21 pass | fails nonzero |
 
@@ -192,7 +192,11 @@ reveal the **original global MCP tool**, with no local re-registration:
 because the existing deny list did not contain the new name. The new tool was
 also callable before expansion. After unmount/remount with the layer active, the
 same names were hidden again for A and visible for B. An allow-list design might
-avoid the new-name window but was not tested.
+avoid the new-name window but was not tested. The plugin's state-fail-closed
+mitigation does not close this gap: it denies ambiguous `mcp__*` names and, while
+the state is unreadable, refreshes a deny-all-visible-MCP fallback only on each
+explicit re-apply. A tool registered between re-applies can still be visible, and
+the static deny cannot prove a complete loader/service list.
 
 **Scoped shadow (unsafe alternative).** A same-name registration in the agent
 scope whose body delegates to the captured global definition executed a tool
@@ -382,7 +386,8 @@ DSH_FEASIBILITY_ROOT=/nonexistent node --test test/mcp-feasibility.probe.mjs
 # 21 skipped, exit 0 (optional probe, clearly unverified)
 DSH_FEASIBILITY_ROOT=/nonexistent npm run verify:feasibility
 # exit nonzero (strict gate; the wrapper sets DSH_FEASIBILITY_REQUIRED=1)
-npm test                                     # 91/91 pass; probe is excluded
+npm test                                     # 109/109 pass; probe is excluded
+npm run test:lifecycle                       # index.js lifecycle/recovery/fallback probe (needs DSH)
 npm run lint                                 # exit 0
 node test-persisted-mcp.mjs                  # all persisted-MCP checks passed
 ```

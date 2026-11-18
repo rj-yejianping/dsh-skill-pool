@@ -27,7 +27,7 @@
 
 import { librarySkillsRoot } from './library.js'
 import { createLibraryProvider } from './provider.js'
-import { mcpServerOf, MCP_TOOL_PREFIX, resolvePool } from './rules.js'
+import { isAmbiguousMcpToolName, mcpServerOf, MCP_TOOL_PREFIX, resolvePool } from './rules.js'
 
 const SECTION_NAME = 'resource-pool:active'
 
@@ -213,6 +213,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     record.disposers = []
     record.signature = ''
     record.activated = false
+    record.conservative = false
   }
 
   /** Signature of a decision, used to skip no-op re-applications. */
@@ -242,7 +243,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     if (agent?.ctx === undefined) return
     let record = agents.get(agent)
     if (record === undefined) {
-      record = { disposers: [], signature: '', activated: false, chain: Promise.resolve() }
+      record = { disposers: [], signature: '', activated: false, conservative: false, chain: Promise.resolve() }
       agents.set(agent, record)
     }
     const run = record.chain.then(() => applyNow(agent, record, { force }))
@@ -253,15 +254,34 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       () => undefined,
     )
     try {
-      return await run
+      await run
+      return { ok: true }
     } catch (error) {
       const hadActivation = record.activated
       logger?.warn?.(`[resource-pool] activation failed: ${error instanceof Error ? error.message : String(error)}`)
       if (hadActivation) {
-        // The old layer is deliberately still installed. Reporting success would
-        // hide a degraded state; rejecting would make the Agent unusable even
-        // though its previous, authorized gate still protects it.
-        return
+        // A conservative fallback is refreshable: every explicit re-apply must
+        // see newly registered MCP tools even while the document is unreadable.
+        if (record.conservative && conservative) {
+          try {
+            applyConservativeGate(agent)
+            return {
+              ok: false,
+              code: 'resource-pool/activation-conservative',
+              message: 'state unavailable; conservative MCP deny refreshed',
+            }
+          } catch (gateError) {
+            logger?.warn?.(`[resource-pool] conservative MCP gate refresh failed: ${gateError instanceof Error ? gateError.message : String(gateError)}`)
+          }
+        }
+        // A healthy old layer is deliberately still installed. Reporting success
+        // would hide a degraded state; rejecting would make the Agent unusable
+        // even though its previous, authorized gate still protects it.
+        return {
+          ok: false,
+          code: 'resource-pool/activation-degraded',
+          message: 'activation failed; previous gate retained',
+        }
       }
       if (conservative) {
         // A live Agent with no layer of ours (for example one that existed before
@@ -270,7 +290,11 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
         // alive; dynamic additions remain a documented gap.
         try {
           applyConservativeGate(agent)
-          return
+          return {
+            ok: false,
+            code: 'resource-pool/activation-conservative',
+            message: 'state unavailable; conservative MCP deny applied',
+          }
         } catch (gateError) {
           logger?.warn?.(
             `[resource-pool] conservative MCP gate failed: ${gateError instanceof Error ? gateError.message : String(gateError)}`,
@@ -300,19 +324,24 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       .filter((name) => typeof name === 'string' && name.startsWith(MCP_TOOL_PREFIX))
     const record = agents.get(agent)
     if (record === undefined) throw new Error('agent activation record is missing')
-    if (deny.length === 0) {
-      record.disposers = []
-      record.signature = ''
-      record.activated = true
-      logger?.warn?.('[resource-pool] state unavailable; no visible MCP tools to deny for an ungated Agent')
-      return
+
+    // Register the refreshed deny before releasing the previous fallback, so a
+    // tool added between two explicit re-applies is covered as soon as it is
+    // visible. This remains a point-in-time static list (see docs).
+    const pending = []
+    if (deny.length > 0) {
+      const dispose = agent.ctx.effect(() => agent.ctx.tools.restrict({ deny }), 'resource-pool.mcp-restrict-fallback')
+      pending.push({ dispose: typeof dispose === 'function' ? dispose : () => {}, label: 'mcp-restrict-fallback' })
     }
-    const dispose = agent.ctx.effect(() => agent.ctx.tools.restrict({ deny }), 'resource-pool.mcp-restrict-fallback')
-    record.disposers = [{ dispose: typeof dispose === 'function' ? dispose : () => {}, label: 'mcp-restrict-fallback' }]
+    for (const entry of record.disposers) disposeEntry(entry)
+    record.disposers = pending
     record.signature = ''
     record.activated = true
+    record.conservative = true
     logger?.warn?.(
-      `[resource-pool] state unavailable; applied conservative MCP deny (${deny.length} tool${deny.length === 1 ? '' : 's'}) to an ungated Agent`,
+      deny.length > 0
+        ? `[resource-pool] state unavailable; conservative MCP deny covers ${deny.length} visible tool${deny.length === 1 ? '' : 's'}`
+        : '[resource-pool] state unavailable; no visible MCP tools to deny for an ungated Agent',
     )
   }
 
@@ -365,10 +394,21 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       }
       if (!Array.isArray(schemas)) throw new Error('MCP gate is required but the global tool list is not an array')
       const allowedServers = new Set(pool.mcpServers)
+      let ambiguous = 0
       for (const schema of schemas) {
         const name = schema?.name
         if (typeof name !== 'string' || !name.startsWith(MCP_TOOL_PREFIX)) continue
+        if (isAmbiguousMcpToolName(name)) {
+          // The public name cannot be attributed to one server; deny rather than
+          // allow by a prefix that an external server could share.
+          ambiguous += 1
+          denyMcp.push(name)
+          continue
+        }
         if (!allowedServers.has(mcpServerOf(name))) denyMcp.push(name)
+      }
+      if (ambiguous > 0) {
+        logger?.warn?.(`[resource-pool] denied ${ambiguous} ambiguous MCP tool name${ambiguous === 1 ? '' : 's'} to avoid cross-server prefix allow`)
       }
     }
 
@@ -451,6 +491,7 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
       for (const entry of oldRestrictions) disposeEntry(entry)
       record.disposers = pending
       record.activated = true
+      record.conservative = false
       // Leave the signature unset when a non-critical registration failed, so
       // the next ordinary re-apply retries it instead of treating the incomplete
       // layer as final.
@@ -472,14 +513,28 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
     const registry = ctx.get('agents')
     const live = typeof registry?.list === 'function' ? registry.list() : []
     // A failure for one Agent must not stop the others, and it must not be
-    // reported as a successful application for that Agent.
-    await Promise.all(
-      live.map((agent) =>
-        applyToAgent(agent, { force: true, conservative: true }).catch((error) => {
+    // reported as a successful application for that Agent. Messages are fixed
+    // so callers can show a warning without echoing tool names or state bytes.
+    const results = await Promise.all(
+      live.map(async (agent) => {
+        try {
+          return await applyToAgent(agent, { force: true, conservative: true })
+        } catch (error) {
           logger?.warn?.(`[resource-pool] re-apply failed: ${error instanceof Error ? error.message : String(error)}`)
-        }),
-      ),
+          return { ok: false, code: 'resource-pool/activation-failed', message: 'activation failed' }
+        }
+      }),
     )
+    const failed = results.filter((result) => result !== undefined && result.ok === false)
+    const seen = new Set()
+    const warnings = []
+    for (const result of failed) {
+      const key = `${result.code}|${result.message}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      warnings.push({ code: result.code, message: result.message })
+    }
+    return { total: live.length, failed: failed.length, warnings }
   }
 
   /** Release one Agent's registrations. */

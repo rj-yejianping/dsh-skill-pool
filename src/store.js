@@ -33,12 +33,30 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve as resolvePath } from 'node:path'
 import { homedir } from 'node:os'
 import { groupKeyOfSource } from './rules.js'
 
 /** Current document version. */
 export const STATE_VERSION = 4
+
+/**
+ * Absolute state-file paths this Node process has observed.
+ *
+ * A new `StateStore` (for example after an in-process plugin reload) must not
+ * forget that a file existed and mistake its disappearance for a first run.
+ * This is an in-memory set: it creates no file, survives module reloads in the
+ * same process through `globalThis`, and intentionally cannot survive a Host
+ * restart (a deleted file and a genuine first run are then indistinguishable).
+ */
+const OBSERVED_STATE_FILES_KEY = Symbol.for('dsh-skill-pool.observed-state-files')
+const observedStateFiles =
+  globalThis[OBSERVED_STATE_FILES_KEY] instanceof Set
+    ? globalThis[OBSERVED_STATE_FILES_KEY]
+    : (globalThis[OBSERVED_STATE_FILES_KEY] = new Set())
+
+/** Group keys that would mutate the normalized map's prototype. */
+const FORBIDDEN_GROUP_KEYS = new Set(['__proto__', 'prototype', 'constructor'])
 
 /** The one older version this module upgrades instead of discarding. */
 export const LEGACY_VERSION = 3
@@ -630,7 +648,9 @@ export class StateReadError extends Error {
    * @param {string} message - safe explanation, never document content.
    */
   constructor(code, message) {
-    super(message)
+    // Keep diagnostics fixed, single-line and bounded: map keys and version
+    // values come from the file and may contain secrets or newlines.
+    super(String(message).replace(/[\r\n]+/g, ' ').slice(0, 240))
     this.name = 'StateReadError'
     this.code = code
     this.status = 500
@@ -718,9 +738,9 @@ function validateDefinition(raw, what) {
 }
 
 /** Validate one pool member (`skills` / `mcp`). */
-function validateMember(raw, what, { version, kind }) {
+function validateMember(raw, what, { version, kind, sources }) {
   requireObject(raw, what)
-  optionalBoolean(raw.enabled, `${what}.enabled`)
+  if (typeof raw.enabled !== 'boolean') invalidDocument(`${what}.enabled must be a boolean`)
   requireNameList(raw.modes, `${what}.modes`)
   requirePathList(raw.workspaces, `${what}.workspaces`)
   optionalStringField(raw.installedAt, `${what}.installedAt`, 64)
@@ -728,6 +748,16 @@ function validateMember(raw, what, { version, kind }) {
   if (kind === 'skill') {
     optionalStringField(raw.sourceId, `${what}.sourceId`, 128)
     optionalStringField(raw.digest, `${what}.digest`, 128)
+    if (
+      version === STATE_VERSION &&
+      typeof raw.sourceId === 'string' &&
+      raw.sourceId.length > 0 &&
+      isObject(sources) &&
+      !Object.hasOwn(sources, raw.sourceId) &&
+      (raw.modesFrom !== 'self' || raw.workspacesFrom !== 'self')
+    ) {
+      invalidDocument(`${what}.sourceId references a missing source while its scope inherits; refusing to resolve the inheritance`)
+    }
   }
   if (kind === 'mcp') {
     optionalStringField(raw.description, `${what}.description`, DESCRIPTION_LIMIT)
@@ -740,7 +770,7 @@ function validateMembers(raw, what, options) {
   requireObject(raw, what)
   for (const [key, value] of Object.entries(raw)) {
     if (cleanName(key) !== key) invalidDocument(`${what} contains an invalid member key`)
-    validateMember(value, `${what}.${key}`, options)
+    validateMember(value, `${what} member`, options)
   }
 }
 
@@ -775,7 +805,7 @@ function validateSource(raw, key, what) {
 /** Validate the `sources` map. */
 function validateSources(raw) {
   requireObject(raw, 'sources')
-  for (const [key, value] of Object.entries(raw)) validateSource(value, key, `sources.${key}`)
+  for (const [key, value] of Object.entries(raw)) validateSource(value, key, 'sources entry')
 }
 
 /** Validate one group record (`repo:<project>` / `import:<sourceId>`). */
@@ -783,19 +813,31 @@ function validateGroup(raw, key, what) {
   requireObject(raw, what)
   if (raw.key !== undefined && raw.key !== key) invalidDocument(`${what}.key must match its map key`)
   if (raw.kind !== undefined && !GROUP_KINDS.includes(raw.kind)) invalidDocument(`${what}.kind is unsupported`)
-  optionalBoolean(raw.enabled, `${what}.enabled`)
+  if (typeof raw.enabled !== 'boolean') invalidDocument(`${what}.enabled must be a boolean`)
   requireNameList(raw.modes, `${what}.modes`)
   requirePathList(raw.workspaces, `${what}.workspaces`)
-  if (typeof key !== 'string' || !(key.startsWith('repo:') || key.startsWith('import:')) || key.length <= 5 || key.length > 512) {
+  if (
+    typeof key !== 'string' ||
+    key.length === 0 ||
+    key.length > 512 ||
+    /[\u0000-\u001f\u007f]/.test(key) ||
+    FORBIDDEN_GROUP_KEYS.has(key) ||
+    key in Object.prototype
+  ) {
     invalidDocument(`${what} has an invalid group key`)
   }
-  if (raw.kind !== undefined && !key.startsWith(`${raw.kind}:`)) invalidDocument(`${what}.kind does not match its key`)
+  const repoKey = key.startsWith('repo:')
+  const importKey = key.startsWith('import:')
+  if (repoKey && key.length <= 'repo:'.length) invalidDocument(`${what} has an invalid group key`)
+  if (importKey && key.length <= 'import:'.length) invalidDocument(`${what} has an invalid group key`)
+  if (raw.kind !== undefined && repoKey && raw.kind !== 'repo') invalidDocument(`${what}.kind does not match its key`)
+  if (raw.kind !== undefined && importKey && raw.kind !== 'import') invalidDocument(`${what}.kind does not match its key`)
 }
 
 /** Validate the `groups` map. */
 function validateGroups(raw) {
   requireObject(raw, 'groups')
-  for (const [key, value] of Object.entries(raw)) validateGroup(value, key, `groups.${key}`)
+  for (const [key, value] of Object.entries(raw)) validateGroup(value, key, 'groups entry')
 }
 
 /**
@@ -817,25 +859,40 @@ export function normalizeReadableState(raw) {
   }
   if (raw.version === LEGACY_VERSION) {
     validateSettings(raw.settings, { requireAll: false })
-    validateMembers(raw.skills, 'skills', { version: LEGACY_VERSION, kind: 'skill' })
-    validateMembers(raw.mcp, 'mcp', { version: LEGACY_VERSION, kind: 'mcp' })
+    if (raw.groups !== undefined) {
+      if (!isObject(raw.groups)) invalidDocument('v3 document has a non-object "groups" section')
+      if (Object.keys(raw.groups).length > 0) {
+        invalidDocument('v3 document contains v4-only groups; refusing to migrate away their scope')
+      }
+    }
+    for (const section of ['skills', 'mcp']) {
+      if (!isObject(raw[section])) continue
+      for (const member of Object.values(raw[section])) {
+        if (!isObject(member)) continue
+        if (member.modesFrom !== undefined || member.workspacesFrom !== undefined) {
+          invalidDocument('v3 document contains v4-only inheritance markers; refusing to reinterpret its scope')
+        }
+      }
+    }
     validateSources(raw.sources)
+    validateMembers(raw.skills, 'skills', { version: LEGACY_VERSION, kind: 'skill', sources: raw.sources })
+    validateMembers(raw.mcp, 'mcp', { version: LEGACY_VERSION, kind: 'mcp', sources: raw.sources })
     return normalizeState(migrateV3(raw))
   }
   if (raw.version !== STATE_VERSION) {
     throw new StateReadError(
       'resource-pool/state-unsupported-version',
-      `state file uses unsupported version ${String(raw.version)}; refusing to overwrite or use it`,
+      'state file uses an unsupported version; refusing to overwrite or use it',
     )
   }
   for (const section of STATE_SECTIONS) {
     if (!isObject(raw[section])) invalidDocument(`missing or invalid "${section}" section`)
   }
   validateSettings(raw.settings, { requireAll: true })
-  validateMembers(raw.skills, 'skills', { version: STATE_VERSION, kind: 'skill' })
-  validateMembers(raw.mcp, 'mcp', { version: STATE_VERSION, kind: 'mcp' })
   validateSources(raw.sources)
   validateGroups(raw.groups)
+  validateMembers(raw.skills, 'skills', { version: STATE_VERSION, kind: 'skill', sources: raw.sources })
+  validateMembers(raw.mcp, 'mcp', { version: STATE_VERSION, kind: 'mcp', sources: raw.sources })
   return normalizeState(raw)
 }
 
@@ -1000,6 +1057,7 @@ export function withoutExcluded(names, excluded) {
 export class StateStore {
   constructor({ file, logger, version = '0.3.0' } = {}) {
     this.file = typeof file === 'string' && file.length > 0 ? file : statePath()
+    this.key = resolvePath(this.file)
     this.logger = logger
     this.version = version
     this.cached = undefined
@@ -1058,7 +1116,7 @@ export class StateStore {
         this.everObserved = true
         throw new StateReadError('resource-pool/state-unreadable', 'state file could not be read; refusing to overwrite or use it')
       }
-      if (this.everLoaded || this.everObserved) {
+      if (this.everLoaded || this.everObserved || observedStateFiles.has(this.key)) {
         throw new StateReadError(
           'resource-pool/state-missing',
           'state file disappeared after it was known to exist; refusing to treat it as a first run',
@@ -1068,6 +1126,7 @@ export class StateStore {
       return this.cached
     }
     this.everObserved = true
+    observedStateFiles.add(this.key)
     this.cached = this.#decode(text)
     return this.cached
   }
@@ -1123,7 +1182,7 @@ export class StateStore {
       text = await readFile(this.file, 'utf8')
     } catch (error) {
       if (error?.code === 'ENOENT') {
-        if (this.everLoaded || this.everObserved) {
+        if (this.everLoaded || this.everObserved || observedStateFiles.has(this.key)) {
           throw new StateReadError(
             'resource-pool/state-missing',
             'state file disappeared after it was known to exist; refusing to overwrite it',
@@ -1136,6 +1195,7 @@ export class StateStore {
       throw new StateReadError('resource-pool/state-unreadable', 'state file could not be read; refusing to overwrite it')
     }
     this.everObserved = true
+    observedStateFiles.add(this.key)
     this.cached = this.#decode(text)
     return this.cached
   }
@@ -1159,6 +1219,7 @@ export class StateStore {
     this.cached = normalized
     this.everLoaded = true
     this.everObserved = true
+    observedStateFiles.add(this.key)
     return normalized
   }
 

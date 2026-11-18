@@ -230,6 +230,28 @@ export function resolvePool(state, { mode, cwd, allModes, allWorkspaces } = {}) 
 }
 
 /**
+ * Whether an MCP public tool name has more than one plausible server split.
+ *
+ * The public name is `mcp__<server>__<raw>`, and neither `server` nor `raw` is
+ * prevented from containing `__`. Parsing at the first separator can therefore
+ * attribute an external `alpha__a` tool to an allowed `alpha` server. Callers
+ * use this predicate to deny an ambiguous name instead of allowing it by
+ * prefix. This is deliberately conservative: a legitimate raw name containing
+ * `__` is hidden too.
+ *
+ * @param {unknown} toolName - model-facing tool name.
+ * @returns {boolean} whether the server boundary is ambiguous (or malformed).
+ */
+export function isAmbiguousMcpToolName(toolName) {
+  if (typeof toolName !== 'string' || !toolName.startsWith(MCP_TOOL_PREFIX)) return false
+  const rest = toolName.slice(MCP_TOOL_PREFIX.length)
+  const separator = rest.indexOf('__')
+  if (separator <= 0) return true
+  if (separator === rest.length - 2) return true
+  return rest.indexOf('__', separator + 2) >= 0
+}
+
+/**
  * Parse the MCP Server name out of one public tool name.
  * @param {unknown} toolName - model-facing tool name such as `mcp__qcc__search`.
  * @returns {string} server name, or '' when the name is not an MCP tool.

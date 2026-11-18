@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { collectModes, collectModesAsync } from '../src/inventory.js'
+import { collectMcpServers, collectModes, collectModesAsync } from '../src/inventory.js'
 
 /** Minimal plugin context stub for the mode collectors. */
 function context() {
@@ -38,4 +38,14 @@ test('a session whose preset is unknown is still listed once', async () => {
   }
   const ids = (await collectModesAsync({ get: (name) => services[name] })).map((mode) => mode.id)
   assert.deepEqual(ids, ['standard', 'custom'])
+})
+
+test('collectMcpServers does not attribute an ambiguous public name to a server prefix', () => {
+  const ctx = {
+    get: (name) => (name === 'tools' ? { schemas: () => [{ name: 'mcp__alpha__search' }, { name: 'mcp__alpha__a__x' }] } : undefined),
+  }
+  const rows = collectMcpServers(ctx)
+  const alpha = rows.find((row) => row.serverName === 'alpha')
+  assert.deepEqual(alpha.tools, ['mcp__alpha__search'])
+  assert.equal(alpha.toolCount, 1)
 })

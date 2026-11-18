@@ -8,7 +8,7 @@
 1. **文档版本 4**：新增顶层 `groups`；技能的 `modes` / `workspaces` 旁增加
    `modesFrom` / `workspacesFrom`（`group` = 继承组，`self` = 用自己的）。
 2. **组的键**：Git 来源 `repo:<source.project>`；无仓库的本地导入 `import:<sourceId>`；
-   没有来源的成员不分组。组记录 `{key, kind, modes[], workspaces[]}`。
+   没有来源的成员不分组。组记录 `{key, kind, enabled, modes[], workspaces[]}`。
 3. **生效条件**：每个维度独立——`from === 'group'` 且组存在则用组的值，否则用成员自己的值；
    组不存在时回落成员自己的值。`resolvePool` 语义不变，判定前先算生效条件。
 4. **迁移**：v3 → v4 是显式迁移（`store.migrateV3`），按组内现状推出组值并标记继承，
@@ -30,8 +30,9 @@
     （不再保留可更新的空壳）；它是该仓库最后一个来源时，组也一并删除。
 11. **恢复**：`POST /source/update {id, force?, restore?}`；`restore` 先清空 `excluded` 再强制重装，
     `force` 表示提交未变也重装。面板在来源行显示「已排除 N 个」与恢复入口。
-12. **整组开关**：组记录增加 `enabled`（默认 true）。生效 = 成员 `enabled` 且组 `enabled`；
-    组开关不改成员自己的值，重新打开即恢复。`POST /group` 接受 `enabled`。
+12. **整组开关**：组记录增加 `enabled`（新建组默认 true；读取时必须是布尔值，缺失拒绝）。
+    生效 = 成员 `enabled` 且组 `enabled`；组开关不改成员自己的值，重新打开即恢复。
+    `POST /group` 接受 `enabled`。
     面板：资源组头一个开关 + 设置 tab「分组开关」卡片（按仓库列出成员数、模式、工作区）。
 13. **折叠**：资源 tab 的仓库组与来源 tab 的仓库组都默认折叠，点 ▸ 或组名展开；折叠状态只在客户端内存里。
 14. **组级检查/更新**：来源 tab 的仓库组头显示汇总检查状态（任一 `update-available` → 有更新；
@@ -120,13 +121,19 @@
 
 - 所有读取（`store.read()`，含面板 GET、`/resolve`、Agent 激活）和写入前读取都先校验完整
   文档：非法 JSON、JSON 非对象、不支持的版本、缺少必需段，以及会被规范化成更宽权限的语义错误
-  （非布尔开关、非法 `modes`/`workspaces`、非法成员键、无效继承标记等）直接抛
-  `StateReadError`（`resource-pool/state-*`），**不回退到默认文档**。
-- 首次运行（文件从未存在）仍是合法的空文档。同一 Store 实例已经看到过文件后，再出现 `ENOENT`
-  按 `state-missing` 失败。Host 重启后文件已被删除与真正首次使用无法区分，此时按首次运行处理；
-  这是已记录的边界。插件重载会先释放旧限制层；重载时若文件仍损坏，已有 Agent 只能走
-  保守层（拒绝当时可见的 `mcp__*`），无法重建原来的精确范围——这是插件生命周期边界，
-  不会假装已恢复。
+  直接抛 `StateReadError`（`resource-pool/state-*`），**不回退到默认文档**。包括：
+  - 非布尔开关；v4 成员/组缺少 `enabled`（不再默认成 `true`）；
+  - 非数组或非法的 `modes`/`workspaces`、非法成员键、无效继承标记；
+  - v4 成员 `sourceId` 指向不存在来源且任一维度依赖 `group` 继承（显式 `self` 的旧悬空来源仍可读）；
+  - `version: 3` 带非空 `groups` 或 `modesFrom`/`workspacesFrom`（v4-only 语义，拒绝而不是静默迁移）；
+  - group key 会污染对象原型或含控制字符；其它旧 API 写入的安全旧 key 作为惰性遗留项保留，
+    但只有 `repo:` / `import:` 可被来源引用，新的 `POST /group` 拒绝其它 key。
+  - 错误消息固定、单行、≤240 字符，不回显原始 version、map key、文件内容或凭据。
+- 首次运行（文件从未存在）仍是合法的空文档。本进程已经观察过该路径后，再出现 `ENOENT`
+  按 `state-missing` 失败；该进程内记录通过 `globalThis` 在新建 `StateStore`（插件热重载）间共享，
+  不创建 marker 文件。全新 Host 进程无法区分文件被删与真正首次使用，此时按首次运行处理。
+  插件重载会先释放旧限制层；重载时若文件仍损坏，已有 Agent 只能走保守层
+  （拒绝当时可见的 `mcp__*`），无法重建原来的精确范围——这是插件生命周期边界，不会假装已恢复。
 - 更新（`store.update`）与直接 `store.write` 都使用同一校验，失败时**不修改原文件字节**。
   HTTP 返回 500，错误消息只说明无法读取/不是合法 JSON/文档不合法，**不回显文件内容、definition
   或其中的凭据**。
@@ -139,6 +146,8 @@
 - MCP `restrict` 注册失败按激活失败处理；只有在新的 deny 层安装成功后才释放旧层。
 - 面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 返回 `stateStatus.ok=false`
   与安全错误码/恢复说明。
+- 已提交的写操作若重新应用有失败，HTTP 返回 200（保留已提交状态）并附带固定文案的
+  `warning: {code, message, failed?}`；不把内部错误或工具名回显给浏览器。
 - 恢复前应先**备份** `state.json`（`0600`，可能含 MCP 令牌），再人工修复或从备份还原；
   插件不会自动备份，也不会自动重写损坏文件。修复后下一次保存或插件重载会重新应用。
 
@@ -207,8 +216,10 @@ resolvePool(state, {mode, cwd}) -> {gated, skills: string[], mcpServers: string[
 1. **技能层**：按 §3 注册 provider（`allowed` 为本次判定结果）。`gateDefaultSkills === true` 时额外摘掉全局技能……（v3 不实现该分支，仅保留设置位，见 §9）。
 2. **MCP 层**：从全局 `ctx.tools.schemas()` 取 `mcp__<server>__*`，不在 `mcpServers` 内的名字 `agent.ctx.tools.restrict({deny})`。
    注意：`mcpServerOf` 以**第一个** `__` 解析 server，而 public 名无法可靠反查 server/raw；合法
-   Server 名本身含 `__` 时可能误归类（误隐藏或误放行）。这层是尽力而为的 Server 级限制，**不是**
-   强安全边界：动态新增工具可绕过静态 deny，MCP resources 与 server instructions 也不受工具 deny 影响。
+   Server 名本身含 `__` 时可能误归类。现在 `isAmbiguousMcpToolName` 对**多重 `__`、无分隔符或空
+   server/raw** 的公共名一律 deny，优先不扩权；代价是合法 server/raw 名含 `__` 的工具也被隐藏。
+   这层仍是尽力而为的 Server 级限制，**不是**强安全边界：动态新增工具可绕过静态 deny，
+   MCP resources、server instructions 以及程序化/scoped 注册的隐藏服务都不受工具 deny 覆盖。
 3. **提示词**：`agent.ctx.systemPrompt.section({name:'resource-pool:active', order: getSectionOrder('TOOL_READ')-30, text})`，说明模式、工作区、可用技能与 MCP。
 
 生命周期与并发（不变）：`agent/created` 必须 `await`；先算后放；每 Agent 一条 promise chain；`signature` 去重；`agent/disposed` 释放；插件卸载 `disposeAll`；`ctx.inject(['agents'], () => reapplyAll())`。
@@ -217,7 +228,10 @@ Fail-closed 增量：
 
 - 读取/校验失败时，已有激活的 Agent 保留旧 layer，新的 `restrict` 先安装、旧的后释放；
 - 没有旧激活的 Agent（新建路径）失败必须向上抛出，使 `agent/created` 拒绝创建；
+- 已有保守层时，每次显式 `reapplyAll`/preset 重放都重新枚举当前可见 `mcp__*` 并**先注册后释放**，
+  不会因为一次空清单就把 `activated` 当成健康激活而永不刷新；
 - `tools.schemas()` 不可用而本次又需要 MCP 门控时视为激活失败，不能当作"没有工具要隐藏"；
+- `reapplyAll()` 返回 `{total, failed, warnings}`；`warnings` 只含固定/脱敏消息，供 HTTP warning 使用；
 - 状态错误只影响资源池门控，不改变 MCP resources / server instructions 的既有边界。
 
 ## 6. HTTP API
@@ -227,7 +241,7 @@ Fail-closed 增量：
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
 | GET | `` | — | `{ok, meta, state, inventory, mounts}` |
-| POST | `/item` | `{kind:'skill'\|'mcp', name, enabled?, modes?, workspaces?, modesFrom?, workspacesFrom?, description?}` | `{ok, state}` |
+| POST | `/item` | `{kind:'skill'\|'mcp', name, enabled?, modes?, workspaces?, modesFrom?, workspacesFrom?, description?}` | `{ok, state, warning?}` |
 | POST | `/item/remove` | `{kind, name}` | `{ok, state, removed}` |
 | POST | `/settings` | `{patch}` | `{ok, state}` |
 | GET | `/resolve?mode=&cwd=` | — | `{ok, pool}` |
@@ -243,7 +257,15 @@ Fail-closed 增量：
 
 规则：
 
-- 写操作：原子落盘 → `reapplyAll()` → 返回新 `state`。
+- 写操作：原子落盘 → `reapplyAll()` → 返回新 `state`。若重新应用有失败，仍返回 200 与已提交的
+  `state`，并附带脱敏 `warning`；不会把已提交的写操作回滚。
+- 所有 scope/enabled 入参在落盘前严格校验：`modes` 必须是合法字符串数组（`[123]`、带空白的模式名
+  400），`workspaces` 必须是绝对路径（相对路径 400），`enabled`/settings 开关必须是布尔值；
+  省略字段保持"部分更新、保留原值"，空数组仍是显式"全部"。非法输入返回 400 且文件字节不变。
+- `POST /group` 的 `key` 必须是 `repo:<project>` 或 `import:<sourceId>`；旧 API 写入的其它安全 key
+  仍可读（惰性、不可被来源引用），但不能新建。
+- `POST /source/delete` 在删除共享来源前，把被引用成员当前生效的 `enabled`/`modes`/`workspaces`
+  物化为它自己的 `self` 值，再清除 `sourceId`；并发删除多个共享来源也不能把空条件变成"处处可用"。
 - `POST /item` **只编辑已存在的成员**：成员不存在（包括只改条件的请求）返回 400 `resource-pool/unknown-item`，不会新建成员；新建只由导入接口完成。这样删除期间迟到的保存不能把成员重新创建出来。
 - `POST /item` 的 `description` 是**仅 MCP 成员**可写的用途摘要：必须是字符串（否则 400），保存前 `trim`，最长 300 字符（超长 400，code `resource-pool/bad-scope`）；非 MCP 成员携带它返回 400 `resource-pool/bad-description`。`""` 是显式清除（落盘删除该键，公开投影不再有 `description`）；**缺省该属性不是编辑**，保留已存储的用途。条件保存（不带 `description`）因此不会覆盖另一端刚改的用途；客户端只在**本标签页实际编辑过**该行用途时才发送此属性（含清空），并在保存失败/响应乱序时保留脏标记以便重试。
 - 所有返回 `state` 的响应（概览与全部写操作）都经过公开投影：MCP 成员只含 `enabled`、`modes`、`workspaces`、`installedAt`、`description`，**绝不包含 `definition`**（URL/命令/headers/env 中的凭据）。落盘状态仍保留 `definition` 供启动重挂载；投影只影响浏览器响应。

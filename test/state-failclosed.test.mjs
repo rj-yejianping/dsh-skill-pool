@@ -394,7 +394,7 @@ test('a failed restrict registration keeps the old gate and fails a new Agent', 
 })
 
 /** Build the real route handlers over a temporary Store. */
-async function makeApi(initial = validState()) {
+async function makeApi(initial = validState(), { onChanged = async () => {} } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'skill-pool-failclosed-api-'))
   const file = join(dir, 'state.json')
   const store = new StateStore({ file })
@@ -418,7 +418,7 @@ async function makeApi(initial = validState()) {
       callback({ get: (name) => services[name], effect: (register) => register() }),
     effect: (register) => register(),
   }
-  registerWebApi({ ctx, store, meta: { file, version: 'test' }, onChanged: async () => {}, logger: {} })
+  registerWebApi({ ctx, store, meta: { file, version: 'test' }, onChanged, logger: {} })
 
   const call = async (method, suffix, body) => {
     const pathname = suffix.split('?')[0]
@@ -578,6 +578,430 @@ test('reapplyAll conservatively denies visible MCP tools for a live Agent with n
     assert.deepEqual(live.restrictions[1].deny, ['mcp__kb__search', 'mcp__other__x'])
   } finally {
     harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('an unsupported version is not echoed, even when it contains sensitive text', async () => {
+  const { dir, file, store } = await temporaryStore()
+  try {
+    const sensitive = 'Bearer unsupported-version-fixture-not-real'
+    await writeFile(file, JSON.stringify({ version: sensitive }), 'utf8')
+    await assert.rejects(store.read({ fresh: true }), (error) => {
+      assert.equal(error.code, 'resource-pool/state-unsupported-version')
+      assert.equal(String(error.message).includes(sensitive), false)
+      return true
+    })
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('an inert legacy group written by an older API still reads, but its key is not treated as a scope', async () => {
+  const { dir, file, store } = await temporaryStore()
+  try {
+    const legacy = validState()
+    // The old API accepted any group key. Only repo:/import: keys can ever be
+    // referenced by a source, so preserving this entry cannot widen access.
+    legacy.groups['legacy-group'] = {
+      key: 'legacy-group',
+      kind: 'repo',
+      enabled: true,
+      modes: ['a-mode-that-does-not-exist'],
+      workspaces: ['/legacy-workspace'],
+    }
+    await writeFile(file, JSON.stringify(legacy), 'utf8')
+    const read = await store.read({ fresh: true })
+    assert.deepEqual(read.groups['legacy-group'], legacy.groups['legacy-group'])
+    // The MCP member has no source/group, so the inert group cannot change it.
+    assert.equal(read.mcp.kb.modesFrom, undefined)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dangerous legacy group key is still rejected by the strict reader', async () => {
+  const { dir, file, store } = await temporaryStore()
+  try {
+    const base = JSON.stringify(validState())
+    const text = base.replace(
+      '"groups":{}',
+      '"groups":{"__proto__":{"key":"__proto__","kind":"repo","modes":[],"workspaces":[]}}',
+    )
+    await writeFile(file, text, 'utf8')
+    await rejectsClosed(store.read({ fresh: true }), 'resource-pool/state-invalid-document')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('the panel rejects invalid scope and switch inputs without widening or rewriting state', async () => {
+  const api = await makeApi()
+  try {
+    const before = await readFile(api.file)
+    const badRequests = [
+      ['POST', '/item', { kind: 'mcp', name: 'kb', modes: [123] }, 'resource-pool/bad-scope'],
+      ['POST', '/item', { kind: 'mcp', name: 'kb', modes: ['bad mode'] }, 'resource-pool/bad-scope'],
+      ['POST', '/item', { kind: 'mcp', name: 'kb', workspaces: ['relative/path'] }, 'resource-pool/bad-scope'],
+      ['POST', '/item', { kind: 'mcp', name: 'kb', enabled: 'false' }, 'resource-pool/bad-scope'],
+      ['POST', '/group', { key: 'repo:example/project', modes: [123] }, 'resource-pool/bad-group'],
+      ['POST', '/group', { key: 'repo:example/project', workspaces: ['relative'] }, 'resource-pool/bad-group'],
+      ['POST', '/group', { key: 'legacy-group', enabled: false }, 'resource-pool/bad-group'],
+      ['POST', '/settings', { patch: { enabled: 'false' } }, 'resource-pool/bad-settings'],
+      ['POST', '/mcp/import', { payload: { mcpServers: { probe: { url: 'http://127.0.0.1:65535/mcp' } } }, scope: { modes: [123] } }, 'resource-pool/bad-scope'],
+    ]
+    for (const [method, path, body, code] of badRequests) {
+      const response = await api.call(method, path, body)
+      assert.equal(response.status, 400, `${method} ${path}`)
+      assert.equal(response.payload.error.code, code, `${method} ${path}`)
+      assert.deepEqual(await readFile(api.file), before, `${method} ${path} preserves bytes`)
+    }
+    const after = await api.call('GET', '')
+    assert.deepEqual(after.payload.state.mcp.kb.modes, ['b'])
+    assert.deepEqual(after.payload.state.mcp.kb.workspaces, [])
+  } finally {
+    await api.dispose()
+  }
+})
+
+test('a partial valid item update still preserves the untouched condition fields', async () => {
+  const api = await makeApi()
+  try {
+    const response = await api.call('POST', '/item', { kind: 'mcp', name: 'kb', enabled: false })
+    assert.equal(response.status, 200)
+    assert.equal(response.payload.state.mcp.kb.enabled, false)
+    assert.deepEqual(response.payload.state.mcp.kb.modes, ['b'])
+    assert.deepEqual(response.payload.state.mcp.kb.workspaces, [])
+  } finally {
+    await api.dispose()
+  }
+})
+
+test('a committed but degraded re-application is reported as a redacted warning', async () => {
+  const api = await makeApi(validState(), {
+    onChanged: async () => ({
+      total: 1,
+      failed: 1,
+      warnings: [{ code: 'resource-pool/activation-degraded', message: 'Bearer hidden-fixture-not-real' }],
+    }),
+  })
+  try {
+    const response = await api.call('POST', '/item', { kind: 'mcp', name: 'kb', enabled: false })
+    assert.equal(response.status, 200)
+    assert.equal(response.payload.ok, true)
+    assert.equal(response.payload.state.mcp.kb.enabled, false)
+    assert.equal(response.payload.warning?.code, 'resource-pool/activation-degraded')
+    assert.equal(JSON.stringify(response.payload).includes('hidden-fixture-not-real'), false)
+    const persisted = JSON.parse(await readFile(api.file, 'utf8'))
+    assert.equal(persisted.mcp.kb.enabled, false, 'the committed state is retained')
+  } finally {
+    await api.dispose()
+  }
+})
+
+test('reapplyAll reports a failed count when an existing healthy layer is kept', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const harness = makeActivation(store)
+  try {
+    await store.write(validState())
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.equal(agent.restrictions.length, 1)
+
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    const result = await harness.activation.reapplyAll()
+    assert.equal(result.failed, 1)
+    assert.equal(agent.restrictions[0].disposed, false)
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('conservative fallback refreshes on every explicit reapply when new MCP tools appear', async () => {
+  const { dir, file, store } = await temporaryStore()
+  const schemasRef = { current: [] }
+  const harness = makeActivation(store, { schemas: () => schemasRef.current })
+  try {
+    await writeFile(file, '{"version":4,"mcp":', 'utf8')
+    const agent = harness.addAgent('a')
+
+    // No visible MCP tools yet: the live Agent is recorded as conservative but
+    // there is no restriction to install.
+    await harness.activation.reapplyAll()
+    assert.equal(agent.restrictions.length, 0)
+
+    schemasRef.current = [{ name: 'mcp__kb__search' }]
+    await harness.activation.reapplyAll()
+    assert.equal(agent.restrictions.length, 1, 'a later explicit reapply sees the new tool')
+    assert.deepEqual(agent.restrictions[0].deny, ['mcp__kb__search'])
+
+    schemasRef.current = [{ name: 'mcp__kb__search' }, { name: 'mcp__new__x' }]
+    await harness.activation.reapplyAll()
+    assert.equal(agent.restrictions.length, 2)
+    assert.equal(agent.restrictions[0].disposed, true, 'the old fallback is released after the new one is safe')
+    assert.deepEqual(agent.restrictions[1].deny, ['mcp__kb__search', 'mcp__new__x'])
+  } finally {
+    harness.activation.disposeAll()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+
+test('a v4 body mislabeled as v3 is rejected instead of dropping groups and inheritance', async () => {
+  const { dir, file, store } = await temporaryStore()
+  try {
+    const v4 = normalizeState(legacyDocument())
+    const mislabeled = { ...v4, version: 3 }
+    await writeFile(file, JSON.stringify(mislabeled), 'utf8')
+    await rejectsClosed(store.read({ fresh: true }), 'resource-pool/state-invalid-document')
+
+    // A v3-shaped document that merely adds an empty top-level groups object is
+    // still safe to migrate; the v4-only fields are what must be rejected.
+    const contractV3 = legacyDocument()
+    contractV3.groups = {}
+    await writeFile(file, JSON.stringify(contractV3), 'utf8')
+    assert.equal((await store.read({ fresh: true })).version, 4)
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('v4 members and groups must state enabled explicitly, never default it to true', async () => {
+  const { dir, file, store } = await temporaryStore()
+  try {
+    const memberMissing = validState()
+    delete memberMissing.mcp.kb.enabled
+    await writeFile(file, JSON.stringify(memberMissing), 'utf8')
+    await rejectsClosed(store.read({ fresh: true }), 'resource-pool/state-invalid-document')
+
+    const groupMissing = validState()
+    groupMissing.groups['repo:example/project'] = {
+      key: 'repo:example/project', kind: 'repo', modes: [], workspaces: [],
+    }
+    await writeFile(file, JSON.stringify(groupMissing), 'utf8')
+    await rejectsClosed(store.read({ fresh: true }), 'resource-pool/state-invalid-document')
+
+    const v3MemberMissing = legacyDocument()
+    delete v3MemberMissing.skills['lark-doc'].enabled
+    await writeFile(file, JSON.stringify(v3MemberMissing), 'utf8')
+    await rejectsClosed(store.read({ fresh: true }), 'resource-pool/state-invalid-document')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('a dangling source reference is rejected only when an inherited scope depends on it', async () => {
+  const { dir, file, store } = await temporaryStore()
+  try {
+    const inherited = validState()
+    inherited.skills.shared = {
+      enabled: true, modes: [], workspaces: [], modesFrom: 'group', workspacesFrom: 'group', sourceId: 'missing',
+    }
+    await writeFile(file, JSON.stringify(inherited), 'utf8')
+    await rejectsClosed(store.read({ fresh: true }), 'resource-pool/state-invalid-document')
+
+    // Explicit self scopes keep their own lists authoritative, so stale
+    // provenance cannot widen anything; older legal data remains readable.
+    const selfScoped = validState()
+    selfScoped.skills.shared = {
+      enabled: true, modes: ['a'], workspaces: ['/w'], modesFrom: 'self', workspacesFrom: 'self', sourceId: 'missing',
+    }
+    await writeFile(file, JSON.stringify(selfScoped), 'utf8')
+    const read = await store.read({ fresh: true })
+    assert.deepEqual(read.skills.shared.modes, ['a'])
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+/** A shared skill state where one repo group scopes two sources. */
+function sharedSourceState({ groupEnabled = true, memberMode = 'group' } = {}) {
+  return normalizeState({
+    version: 4,
+    settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
+    sources: {
+      src_a: {
+        id: 'src_a', kind: 'git', label: 'a', url: 'https://github.com/example/project', provider: 'github',
+        project: 'example/project', branch: 'main', subdir: '', skills: ['shared'], excluded: [], createdAt: '2026-11-18T00:00:00.000Z',
+      },
+      src_b: {
+        id: 'src_b', kind: 'git', label: 'b', url: 'https://github.com/example/project', provider: 'github',
+        project: 'example/project', branch: 'main', subdir: 'other', skills: ['shared'], excluded: [], createdAt: '2026-11-18T00:00:00.000Z',
+      },
+    },
+    groups: {
+      'repo:example/project': {
+        key: 'repo:example/project', kind: 'repo', enabled: groupEnabled, modes: ['standard'], workspaces: ['/workspace'],
+      },
+    },
+    skills: {
+      shared: {
+        enabled: true, modes: [], workspaces: [],
+        modesFrom: memberMode, workspacesFrom: memberMode,
+        sourceId: 'src_a', installedAt: '2026-11-18T00:00:00.000Z',
+      },
+    },
+    mcp: {},
+  })
+}
+
+test('deleting one of several shared sources materializes the effective scope before clearing sourceId', async () => {
+  const api = await makeApi(sharedSourceState({ groupEnabled: false }))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = api.dir
+  try {
+    const before = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.equal(before.payload.pool.gated, true)
+    assert.deepEqual(before.payload.pool.skills, [], 'the disabled group makes the shared skill inactive')
+
+    const removed = await api.call('POST', '/source/delete', { id: 'src_a' })
+    assert.equal(removed.status, 200)
+    const member = removed.payload.state.skills.shared
+    assert.ok(member, 'the skill remains because src_b still lists it')
+    assert.equal(member.sourceId ?? '', '')
+    assert.equal(member.enabled, false, 'effective disabled state is materialized')
+    assert.deepEqual(member.modes, ['standard'])
+    assert.deepEqual(member.workspaces, ['/workspace'])
+    assert.equal(member.modesFrom, 'self')
+    assert.equal(member.workspacesFrom, 'self')
+
+    const after = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.deepEqual(after.payload.pool.skills, [], 'effective visibility did not widen')
+    // It must still be readable by the strict reader (no dangling group scope).
+    assert.equal((await api.call('GET', '')).status, 200)
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await api.dispose()
+  }
+})
+
+test('concurrent deletion of all shared sources cannot widen the remaining member', async () => {
+  const api = await makeApi(sharedSourceState({ groupEnabled: true }))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = api.dir
+  try {
+    const before = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.deepEqual(before.payload.pool.skills, ['shared'])
+
+    const [first, second] = await Promise.all([
+      api.call('POST', '/source/delete', { id: 'src_a' }),
+      api.call('POST', '/source/delete', { id: 'src_b' }),
+    ])
+    for (const response of [first, second]) {
+      assert.ok(response.status === 200 || response.status === 404, `unexpected status ${response.status}`)
+    }
+
+    const overview = await api.call('GET', '')
+    assert.equal(overview.status, 200, 'the final document is still readable')
+    const member = overview.payload.state.skills.shared
+    if (member !== undefined) {
+      assert.equal(member.modesFrom, 'self')
+      assert.equal(member.workspacesFrom, 'self')
+      assert.deepEqual(member.modes, ['standard'])
+      assert.deepEqual(member.workspaces, ['/workspace'])
+    }
+    const after = await api.call('GET', '/resolve?mode=standard&cwd=%2Fworkspace')
+    assert.deepEqual(
+      after.payload.pool.skills.filter((name) => !before.payload.pool.skills.includes(name)),
+      [],
+      'concurrent deletes cannot add a visible skill',
+    )
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await api.dispose()
+  }
+})
+
+test('a self-scoped shared member keeps its own scope when its source is deleted', async () => {
+  const api = await makeApi(sharedSourceState({ memberMode: 'self' }))
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = api.dir
+  try {
+    const member = sharedSourceState({ memberMode: 'self' }).skills.shared
+    member.modes = ['special']
+    member.workspaces = ['/special']
+    // Rewrite the fixture with the member's real self scope.
+    await writeFile(api.file, JSON.stringify({
+      ...sharedSourceState({ memberMode: 'self' }),
+      skills: { shared: { ...sharedSourceState({ memberMode: 'self' }).skills.shared, modes: ['special'], workspaces: ['/special'] } },
+    }), 'utf8')
+
+    const removed = await api.call('POST', '/source/delete', { id: 'src_a' })
+    assert.equal(removed.status, 200)
+    const after = removed.payload.state.skills.shared
+    assert.deepEqual(after.modes, ['special'])
+    assert.deepEqual(after.workspaces, ['/special'])
+    assert.equal(after.modesFrom, 'self')
+    assert.equal(after.workspacesFrom, 'self')
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    await api.dispose()
+  }
+})
+
+test('ambiguous mcp__ names are denied even when their prefix names an allowed server', async () => {
+  const state = normalizeState({
+    version: 4,
+    settings: { enabled: true, mcpGate: true, injectSummary: false, gateDefaultSkills: false },
+    skills: {}, sources: {}, groups: {},
+    mcp: { alpha: { enabled: true, modes: [], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z' } },
+  })
+  const harness = makeActivation({
+    async read() { return state },
+  }, {
+    schemas: () => [{ name: 'mcp__alpha__search' }, { name: 'mcp__alpha__a__x' }],
+  })
+  try {
+    const agent = harness.addAgent('a')
+    await harness.activation.applyToAgent(agent)
+    assert.deepEqual(agent.restrictions[0]?.deny, ['mcp__alpha__a__x'])
+  } finally {
+    harness.activation.disposeAll()
+  }
+})
+
+test('a new StateStore in the same process still remembers an observed state file', async () => {
+  const { dir, file } = await temporaryStore()
+  try {
+    const first = new StateStore({ file })
+    await first.write(validState())
+    const second = new StateStore({ file })
+    await unlink(file)
+    await rejectsClosed(second.read({ fresh: true }), 'resource-pool/state-missing')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('state error messages never echo map keys, newlines or long sensitive text', async () => {
+  const { dir, file, store } = await temporaryStore()
+  try {
+    const sensitive = 'fixture-secret-map-key\nBearer not-a-real-token-' + 'x'.repeat(400)
+    const document = validState()
+    document.sources = { [sensitive]: 'not-an-object' }
+    await writeFile(file, JSON.stringify(document), 'utf8')
+    await assert.rejects(store.read({ fresh: true }), (error) => {
+      assert.equal(error.code, 'resource-pool/state-invalid-document')
+      assert.equal(String(error.message).includes('fixture-secret-map-key'), false)
+      assert.equal(/[\r\n]/.test(String(error.message)), false)
+      assert.ok(String(error.message).length <= 300, `message is bounded: ${String(error.message).length}`)
+      return true
+    })
+
+    const groupDoc = validState()
+    groupDoc.groups = { [sensitive]: 'not-an-object' }
+    await writeFile(file, JSON.stringify(groupDoc), 'utf8')
+    await assert.rejects(store.read({ fresh: true }), (error) => {
+      assert.equal(String(error.message).includes('fixture-secret-map-key'), false)
+      assert.equal(/[\r\n]/.test(String(error.message)), false)
+      return true
+    })
+  } finally {
     await rm(dir, { recursive: true, force: true })
   }
 })

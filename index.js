@@ -141,9 +141,7 @@ export function apply(ctx, config = {}) {
     mounts,
     meta,
     logger,
-    onChanged: async () => {
-      await activation.reapplyAll()
-    },
+    onChanged: () => activation.reapplyAll(),
   })
 
   // Storage keeps each MCP member's connection definition precisely so this

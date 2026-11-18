@@ -162,7 +162,7 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
   "version": 4,
   "settings": { "enabled": true, "mcpGate": true, "injectSummary": true, "gateDefaultSkills": false },
   "groups": {
-    "repo:larksuite/cli": { "key": "repo:larksuite/cli", "kind": "repo", "modes": ["standard"], "workspaces": [] }
+    "repo:larksuite/cli": { "key": "repo:larksuite/cli", "kind": "repo", "enabled": true, "modes": ["standard"], "workspaces": [] }
   },
   "skills": { "<name>": { "enabled": true, "modes": [], "workspaces": [],
                           "modesFrom": "group", "workspacesFrom": "group",
@@ -179,14 +179,25 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
 `import:<sourceId>`（一次导入一组），没有来源的成员不分组。
 
 状态文件与技能目录、MCP 连接记录分离。**首次使用**（文件从未存在）视为合法的空配置；
-但文件存在却读不懂，或同一进程内已经读到过的文件随后消失，都按异常处理，不会退回默认配置。
+但文件存在却读不懂，或本进程已经观察过的文件随后消失，都按异常处理，不会退回默认配置。
+同一 Node 进程内新建的 `StateStore`（例如插件热重载）会通过进程内记录继续记住"该文件曾经存在"；
+这不会创建任何 marker 文件。全新 Host 进程仍无法区分"文件被删"与"真正首次使用"，见下方边界。
 
 **读取和写入都 fail-closed**：普通读取（含面板 GET、`/resolve`、Agent 激活）与更新（`/item`、导入、删除等）
-都会先校验完整 v4 文档（v3 走显式迁移）。非法 JSON、JSON 非对象、不支持的版本、缺少必需段，
-以及会被规范化成**更宽权限**的语义错误（非布尔开关、非数组或非法的 `modes`/`workspaces`、
-非法成员键、无效的继承标记等）都会返回显式错误，绝不回退到空默认文档。面板 GET 返回 500；
-原文件**逐字节保留**，不会被自动重写。错误信息只描述"无法读取 / 不是合法 JSON / 文档不合法"等，
-**不回显文件内容或任何凭据**。
+都会先校验完整文档（v4 严格校验，v3 走显式迁移）。非法 JSON、JSON 非对象、不支持的版本、缺少必需段，
+以及会被规范化成**更宽权限**的语义错误都会返回显式错误，绝不回退到空默认文档。包括：
+
+- 非布尔开关；成员/组缺少 `enabled`（不再把缺失当成 `true`）；
+- 非数组或非法的 `modes`/`workspaces`、非法成员键、无效的继承标记；
+- 成员 `sourceId` 指向不存在的来源、且该维度依赖 `group` 继承（无法解析继承时拒绝；
+  显式 `self` 的旧悬空来源仍可读）；
+- `version: 3` 却带非空 `groups` 或 v4 继承标记（不能静默丢弃这些 v4-only 语义）；
+- groups 中会污染对象原型或含控制字符的键。
+
+写入边界也会严格校验 API 入参：`modes:[123]`、相对工作区路径、字符串 `enabled` 等直接 400，
+不会落盘成更宽的 `[]`。省略字段仍是"部分更新、保持原值"。面板 GET 返回 500；
+原文件**逐字节保留**，不会被自动重写。错误信息固定、单行、有长度上限，
+**不回显文件内容、map 键、原始 version 值或任何凭据**。
 
 - **已有 Agent**：重新激活时若读取失败，保留上一次成功安装的限制层并告警，**不会先释放旧层**。
   若插件重载后某个已有会话已经没有旧层可保留，会安装一个**保守回退**：拒绝当时可见的所有 MCP 工具
@@ -194,17 +205,25 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
 - **新 Agent**：状态无法安全读取时，`agent/created` 监听器抛错，宿主拒绝创建该 Agent；
   不会发布一个没有 MCP 门控的会话。修复文件后，下一次保存或插件重载会恢复正常。
 - **降级可见**：面板 GET 返回 `resource-pool/state-*` 错误；`resource_pool_status` 工具在失败时返回
-  `stateStatus.ok=false`、错误码与恢复说明。
-- **边界**：Host 重启后若状态文件已被删除，进程无法区分"被删"与"全新首次使用"，此时按首次运行处理。
+  `stateStatus.ok=false`、错误码与恢复说明。写入成功但重新应用失败时，HTTP 仍返回 200（已提交状态保留）
+  并附带脱敏的 `warning`，面板以提示条显示；不会假装所有活动会话都已生效。
+- **边界**：全新 Host 进程启动后若状态文件已被删除，无法区分"被删"与"真正首次使用"，
+  此时按首次运行处理（同进程内的新 `StateStore` 会记得，见上）。
   插件重载会先释放旧限制层；若重载时文件仍损坏，已有会话只能退化为上述保守层，
   无法重建原来的精确范围。请从备份恢复。插件**不会**自动生成备份。
 
 恢复前请先**自行备份** `state.json`（它按 `0600` 写入，可能含 MCP 令牌），再人工修复或从自己的备份恢复。
 
-`groups` 里每项还有 `enabled`（默认 `true`），生效条件 = 成员开关 **且** 组开关。
+`groups` 每项还有必填的 `enabled`（新建组时默认 `true`；读取时缺失会被拒绝，
+避免把已关闭的组读成开启）；生效条件 = 成员开关 **且** 组开关。
+旧 API 可能写入过任意 group key：只要键本身安全（非原型污染、无控制字符），这类组会作为
+**惰性遗留项**保留，但只有 `repo:<project>` / `import:<sourceId>` 才能被来源引用；
+新的 `POST /group` 会拒绝其它 key（400），不再制造无法引用的组。
 
 v3 文档会被**迁移**到 v4 而不是丢弃：按仓库推出组、把成员已一致的取值灌给组并让成员继承，
 因此迁移前后每个会话看到的资源完全相同；组内本来就不一致的维度留空，成员保留自己的取值。
+v3 文档若包含非空 `groups` 或 `modesFrom`/`workspacesFrom`（v4-only 语义），迁移会丢失/重解释范围，
+因此直接拒绝并提示恢复备份，而不是静默迁移。
 v1 / v2 / 未来未知版本在**读取时拒绝**（`resource-pool/state-unsupported-version`），
 不会重置覆盖（那两版的成员模型不同，猜映射会悄悄改变门控）；纯函数 `normalizeState`
 对未知版本仍返回空文档，仅供内部工具与测试使用。
@@ -217,14 +236,15 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，91 个可移植测试）
+MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，109 个可移植测试）
 不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 91/91；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 109/109；不代表宿主能力已验证 |
+| `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 4/4；不是宿主能力门禁 |
 | `npm run test:feasibility` | 可选探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
 | `npm run verify:feasibility` | **发布或能力声明的强制门禁**（Node 包装器，POSIX/Windows 通用） | 缺失、版本不符或任一探针失败均非零退出 |
 
@@ -241,14 +261,17 @@ MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。
 - **MCP 只有 Server 级门控**：**没有**单工具开关（界面开关 / per-tool switch），也**没有** MCP
   渐进披露（按服务按需展开）。任务 4/5 在本版本**未实现**，不是隐藏的实验开关。
 - 现有可行性证据不支持上述能力：当前代 public 名称无法可靠反查 server/raw（`mcpServerOf`
-  按第一个 `__` 解析，合法服务名本身含 `__` 时可能把工具归到错误的 Server，既可能误隐藏也可能
-  在清单同时含两个服务名时误放行）；动态新增工具可绕过静态 deny 名单；隐藏业务工具不影响
-  MCP resources 与 server instructions；断线后 schema/提示可能陈旧。
-  详见 `docs/mcp-feasibility-results.md`。
+  按第一个 `__` 解析，合法服务名本身含 `__` 时可能把工具归到错误的 Server）。现在对
+  **有歧义的 `mcp__*` 名一律 deny**（`isAmbiguousMcpToolName`），优先不扩权；代价是合法
+  server/raw 名本身含 `__` 的工具也会被隐藏，面板的 MCP 工具列表也不会把它们归到某个
+  server（无法安全归属）。动态新增工具仍可绕过静态 deny 名单；
+  隐藏业务工具不影响 MCP resources 与 server instructions；断线后 schema/提示可能陈旧。
+  这不是全面的 MCP 隔离证明。详见 `docs/mcp-feasibility-results.md`。
 - **状态 fail-closed 只解决"损坏状态被当成空池"这一条**：新 Agent 在状态不可读时会被拒绝创建，
   已有 Agent 保留旧限制（没有旧层时退化为拒绝当时可见 MCP 工具的保守层）；它**不**把 MCP
-  变成安全边界，也不修复上一条的静态 deny 动态注册缺口。MCP resources / server instructions
-  仍不受工具 deny 影响。
+  变成安全边界，也不修复静态 deny 的动态注册缺口。保守层/正常 deny 只覆盖**当前全球工具清单中
+  可见的 `mcp__*` 公共名**，不覆盖 MCP resources、server instructions、程序化注册的 scoped/隐藏服务，
+  也不能证明 Loader 名单完整。MCP 仍不是强安全边界。
 - **GUI 与真实模型运行时未验证**：用途摘要/条件的浏览器交互、真实 Agent 循环的模型请求装配、
   PTC/自定义执行器、真实 approval 服务与审计，均未在真实 profile 中实测；本仓库只验证代码与可移植路径。
 - 技能池只管理自己导入的资源；**系统自带技能始终可用**，不参与门控
@@ -266,6 +289,7 @@ npm run lint                # node --check 全部源码
 npm test                    # 可移植单测 test/*.test.mjs（不含宿主探针）
 npm run test:feasibility    # 可选宿主探针；缺失运行时会跳过，不能当发布证据
 npm run verify:feasibility  # 强制宿主门禁：缺失/版本不符/失败均非零退出
+npm run test:lifecycle      # index.js 生命周期/恢复/保守回退探针（需要 DSH）
 node test-persisted-mcp.mjs # MCP 定义持久化/重挂载检查
 ```
 

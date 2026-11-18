@@ -17,7 +17,7 @@
 import { join } from 'node:path'
 
 import { listLibrarySkills } from './library.js'
-import { MCP_TOOL_PREFIX, effectiveEnabled, effectiveScope, groupKeyOfSource, mcpServerOf } from './rules.js'
+import { isAmbiguousMcpToolName, MCP_TOOL_PREFIX, effectiveEnabled, effectiveScope, groupKeyOfSource, mcpServerOf } from './rules.js'
 import { mcpEntryId } from './uploads.js'
 
 /** Provider name the library provider registers under (must match §3). */
@@ -220,6 +220,9 @@ export function collectMcpServers(ctx) {
       for (const schema of tools.schemas()) {
         const name = schema?.name
         if (typeof name !== 'string' || !name.startsWith(MCP_TOOL_PREFIX)) continue
+        // An ambiguous public name cannot be attributed to a server safely; the
+        // activation layer denies it, so showing it under a prefix would mislead.
+        if (isAmbiguousMcpToolName(name)) continue
         const server = mcpServerOf(name)
         if (server.length === 0) continue
         ensure(server).tools.push(name)

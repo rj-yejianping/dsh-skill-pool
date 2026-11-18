@@ -22,6 +22,7 @@ import {
   excludeSourceSkill,
   newId,
   normalizeItemName,
+  normalizePath,
   removeItem,
   removeSource,
   StateReadError,
@@ -30,7 +31,7 @@ import {
   upsertSource,
 } from './store.js'
 import { buildInventory } from './inventory.js'
-import { resolvePool } from './rules.js'
+import { effectiveEnabled, effectiveScope, resolvePool } from './rules.js'
 import { DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS, mountServer } from './mount.js'
 import {
   buildMcpConfig,
@@ -171,12 +172,26 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
 
   /** Committed mutation response: file is already on disk, re-apply, then answer. */
   const committed = async (state, extra = {}) => {
+    let warning
     try {
-      await onChanged?.()
+      const result = await onChanged?.()
+      if (result !== undefined && Number.isFinite(result?.failed) && result.failed > 0) {
+        // The write is committed and must stay committed. Report that not every
+        // live Agent could be re-applied without echoing tool names or errors.
+        warning = {
+          code: 'resource-pool/activation-degraded',
+          message: `状态已保存，但 ${result.failed} 个活动会话未能重新应用；它们保留旧限制或仅保守 MCP 拒绝层。`,
+          failed: result.failed,
+        }
+      }
     } catch (error) {
       logger?.warn?.(`[resource-pool] re-application failed: ${error instanceof Error ? error.message : String(error)}`)
+      warning = {
+        code: 'resource-pool/activation-failed',
+        message: '状态已保存，但重新应用结果未知；活动会话可能保留旧限制。',
+      }
     }
-    return json({ ok: true, state: publicState(state), ...extra })
+    return json({ ok: true, state: publicState(state), ...extra, ...(warning === undefined ? {} : { warning }) })
   }
 
   /** Resolve one stored Git token from the credential store. */
@@ -209,19 +224,44 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
 
   // ------------------------------------------------------------- validation
 
+  /**
+   * Validate a mode list at the API boundary.
+   *
+   * The store's lenient normalizer drops unusable entries, which would turn
+   * `[123]` into `[]` ("all modes") and silently widen access. Reject instead;
+   * an absent field still means "leave unchanged", and `[]` is a real "all".
+   */
+  const strictModes = (value, field) => {
+    if (!Array.isArray(value)) throw new Error(`${field} 必须是数组`)
+    const modes = []
+    for (const item of value) {
+      if (typeof item !== 'string' || item.length === 0 || normalizeItemName(item) !== item) {
+        throw new Error(`${field} 包含非法的模式名`)
+      }
+      modes.push(item)
+    }
+    return modes
+  }
+
+  /** Validate absolute workspace paths at the API boundary. */
+  const strictWorkspaces = (value, field) => {
+    if (!Array.isArray(value)) throw new Error(`${field} 必须是字符串数组`)
+    const workspaces = []
+    for (const item of value) {
+      const path = typeof item === 'string' ? normalizePath(item) : ''
+      if (path.length === 0) throw new Error(`${field} 包含非法的工作区路径`)
+      workspaces.push(path)
+    }
+    return workspaces
+  }
+
   /** Read one `scope` object (`{modes, workspaces}`); undefined when absent. */
   const readScope = (value) => {
     if (value === undefined || value === null) return undefined
     if (!isObject(value)) throw new Error('scope 必须是 {modes, workspaces} 对象')
     const scope = {}
-    if (value.modes !== undefined) {
-      if (!Array.isArray(value.modes)) throw new Error('scope.modes 必须是数组')
-      scope.modes = value.modes
-    }
-    if (value.workspaces !== undefined) {
-      if (!Array.isArray(value.workspaces)) throw new Error('scope.workspaces 必须是字符串数组')
-      scope.workspaces = value.workspaces
-    }
+    if (value.modes !== undefined) scope.modes = strictModes(value.modes, 'scope.modes')
+    if (value.workspaces !== undefined) scope.workspaces = strictWorkspaces(value.workspaces, 'scope.workspaces')
     return scope
   }
 
@@ -237,14 +277,8 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       if (typeof body.enabled !== 'boolean') throw new Error('enabled 必须是布尔值')
       patch.enabled = body.enabled
     }
-    if (body.modes !== undefined) {
-      if (!Array.isArray(body.modes)) throw new Error('modes 必须是数组')
-      patch.modes = body.modes
-    }
-    if (body.workspaces !== undefined) {
-      if (!Array.isArray(body.workspaces)) throw new Error('workspaces 必须是字符串数组')
-      patch.workspaces = body.workspaces
-    }
+    if (body.modes !== undefined) patch.modes = strictModes(body.modes, 'modes')
+    if (body.workspaces !== undefined) patch.workspaces = strictWorkspaces(body.workspaces, 'workspaces')
     for (const key of ['modesFrom', 'workspacesFrom']) {
       if (body[key] === undefined) continue
       if (body[key] !== 'group' && body[key] !== 'self') throw new Error(`${key} 必须是 'group' 或 'self'`)
@@ -485,6 +519,11 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     const body = await readBody(request)
     const patch = isObject(body.patch) ? body.patch : isObject(body.settings) ? body.settings : null
     if (patch === null) return failure('resource-pool/bad-settings', '缺少 patch 对象')
+    for (const key of ['enabled', 'mcpGate', 'injectSummary', 'gateDefaultSkills']) {
+      if (patch[key] !== undefined && typeof patch[key] !== 'boolean') {
+        return failure('resource-pool/bad-settings', `${key} 必须是布尔值`)
+      }
+    }
     try {
       const state = await store.update((current) => applySettingsPatch(current, patch))
       return committed(state)
@@ -498,18 +537,27 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     const body = await readBody(request)
     const key = typeof body.key === 'string' ? body.key.trim() : ''
     if (key.length === 0) return failure('resource-pool/bad-group', '缺少 group.key')
+    // Only repo:/import: groups can ever be referenced by a source. Older API
+    // versions could write other keys; they remain readable as inert legacy
+    // entries, but new writes must not create more of them.
+    if (
+      !(key.startsWith('repo:') || key.startsWith('import:')) ||
+      key.length <= 5 ||
+      key.length > 512 ||
+      /[\u0000-\u001f\u007f]/.test(key)
+    ) {
+      return failure('resource-pool/bad-group', 'group.key 必须是 repo:<project> 或 import:<sourceId>')
+    }
     const patch = { key }
     if (body.enabled !== undefined) {
       if (typeof body.enabled !== 'boolean') return failure('resource-pool/bad-group', 'enabled 必须是布尔值')
       patch.enabled = body.enabled
     }
-    if (body.modes !== undefined) {
-      if (!Array.isArray(body.modes)) return failure('resource-pool/bad-group', 'modes 必须是数组')
-      patch.modes = body.modes
-    }
-    if (body.workspaces !== undefined) {
-      if (!Array.isArray(body.workspaces)) return failure('resource-pool/bad-group', 'workspaces 必须是字符串数组')
-      patch.workspaces = body.workspaces
+    try {
+      if (body.modes !== undefined) patch.modes = strictModes(body.modes, 'modes')
+      if (body.workspaces !== undefined) patch.workspaces = strictWorkspaces(body.workspaces, 'workspaces')
+    } catch (error) {
+      return failure('resource-pool/bad-group', error instanceof Error ? error.message : String(error))
     }
     try {
       const state = await store.update((current) => upsertGroup(current, patch))
@@ -972,14 +1020,24 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       const removed = Array.isArray(result?.removed) ? result.removed : []
       const skipped = Array.isArray(result?.skipped) ? result.skipped : skipSkills
       const state = await store.update((doc) => {
-        let next = removeSource(doc, id)
-        for (const name of removed) next = removeItem(next, 'skill', name)
-        // Shared skills stay installed; their dangling sourceId is cleared.
-        for (const name of skipped) {
-          const member = next.skills[name]
-          if (member === undefined || member.sourceId !== id) continue
-          next = upsertItem(next, 'skill', name, member, { sourceId: '' })
+        // Shared skills stay installed, but they may currently inherit their
+        // group scope. Materialize the *effective* scope/enabled before the
+        // source (and possibly its group) disappears, otherwise a group-owned
+        // empty scope would become an unrestricted self scope.
+        let next = doc
+        const removedSet = new Set(removed)
+        for (const [name, member] of Object.entries(next.skills)) {
+          if (member.sourceId !== id) continue
+          if (removedSet.has(name)) continue
+          const scope = effectiveScope(next, member)
+          next = upsertItem(next, 'skill', name, {
+            enabled: effectiveEnabled(next, member),
+            modes: [...scope.modes],
+            workspaces: [...scope.workspaces],
+          }, { sourceId: '', modesFrom: 'self', workspacesFrom: 'self' })
         }
+        next = removeSource(next, id)
+        for (const name of removed) next = removeItem(next, 'skill', name)
         return next
       })
       return committed(state, { removed, skipped })
