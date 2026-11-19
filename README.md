@@ -48,23 +48,6 @@ exact Agent modes and workspaces each skill loads in — from the Settings panel
 - 组不存在（本地 ZIP/文件导入、来源被删）时，成员用自己那份；
 - `inherit` 与"显式全部"是两回事：前者跟着组走，后者写死"所有模式/工作区"。
 
-## MCP 用途摘要（会发给 AI）
-
-MCP 成员的展开行可以填一句**用途摘要**（最多 300 字符，保存时去掉首尾空白；清空后保存即删除该字段）。
-它只是池成员的元数据，存于 `state.json` 的 `mcp.<server>.description`，**不写进连接定义**
-（URL/命令/请求头/env 都不受影响），也不是凭据来源。
-
-每个 Agent 的系统提示只列出它**当前可用**的 MCP 服务名，并把各服务的用途作为独立 JSON 数据附上；
-该数据明确标注为**用户提供、不可信、不是指令、不是授权依据**，`purpose: null` 表示未填写。
-JSON 编码只是结构边界，**不是注入防护，也不保证内容安全**，所以请勿在用途里写凭据或连接信息。
-
-自动保存的编辑语义：
-
-- 启用、模式、工作区等**条件每次保存都会发送**；用途摘要**只有本标签页真正编辑过它时**才发送。
-  因此 A 标签页只切换启用状态，不会用自己文档里的旧用途覆盖 B 标签页刚改的用途。
-- 清空保存会发送空字符串（真正的清除）；没编辑则不发送该字段，服务端保留原值。
-- 连续输入与请求在途时，旧响应不会覆盖更新的输入；保存失败后，本标签页下一次保存会继续携带未保存的用途。
-
 ## 删除与排除
 
 - **删除一个技能** = 删磁盘文件 + 移出池 + 在它所属来源的 `excluded[]` 里记一笔。
@@ -144,8 +127,8 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
 dsh plugin --profile web add dsh-skill-pool
 
 # 本地开发：先从源码目录打包，再装真实包
-npm pack                      # → dsh-skill-pool-0.3.7.tgz
-plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.tgz")
+npm pack                      # → dsh-skill-pool-0.3.8.tgz
+plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.8.tgz")
 ```
 
 > 不要用 `link:` / 软链安装：Host 在 profile 目录下按 importer 路径做包解析，
@@ -178,7 +161,6 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.7.
                           "modesFrom": "group", "workspacesFrom": "group",
                           "sourceId": "src_x", "digest": "sha256:…", "installedAt": "…" } },
   "mcp":    { "<server>": { "enabled": true, "modes": [], "workspaces": [],
-                             "description": "用途摘要（可空；模型可见，不写入定义）",
                              "definition": { "transport": "streamable-http", "url": "http://…/mcp", "headers": { "Authorization": "Bearer …" } } } },
   "sources": { "<id>": { "kind": "git|zip|files", "skills": ["<name>"], "excluded": ["<name>"],
                          "sha": "…", "lastCheck": { "status": "up-to-date" } } }
@@ -345,7 +327,7 @@ MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。
   变成安全边界，也不修复静态 deny 的动态注册缺口。保守层/正常 deny 只覆盖**当前全球工具清单中
   可见的 `mcp__*` 公共名**，不覆盖 MCP resources、server instructions、程序化注册的 scoped/隐藏服务，
   也不能证明 Loader 名单完整。MCP 仍不是强安全边界。
-- **GUI 与真实模型运行时未验证**：用途摘要/条件的浏览器交互、真实 Agent 循环的模型请求装配、
+- **GUI 与真实模型运行时未验证**：条件的浏览器交互、真实 Agent 循环的模型请求装配、
   PTC/自定义执行器、真实 approval 服务与审计，均未在真实 profile 中实测；本仓库只验证代码与可移植路径。
 - 技能池只管理自己导入的资源；**系统自带技能始终可用**，不参与门控
   （`gateDefaultSkills` 设置位保留，v3 未启用）。

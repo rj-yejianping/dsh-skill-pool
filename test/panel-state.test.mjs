@@ -36,14 +36,14 @@ const plugin = captured.factory((id) => {
   throw new Error(`unexpected client require: ${id}`)
 })
 
-/** Document shape the panel consumes. */
-function documentWith(description) {
+/** Document shape the panel consumes; `mode` distinguishes local from server rows. */
+function documentWith(mode = 'a') {
   return {
     version: 4,
     settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
     skills: {},
     mcp: {
-      kb: { enabled: true, modes: ['a'], workspaces: [], description },
+      kb: { enabled: true, modes: [mode], workspaces: [] },
       private: { enabled: true, modes: ['b'], workspaces: [] },
     },
     sources: {},
@@ -51,8 +51,8 @@ function documentWith(description) {
   }
 }
 
-function draftOf(description) {
-  return { enabled: true, modes: ['a'], workspaces: [], description }
+function draftOf(mode) {
+  return { enabled: true, modes: [mode], workspaces: [] }
 }
 
 test('board reconciliation is a real export of the client bundle', () => {
@@ -61,13 +61,13 @@ test('board reconciliation is a real export of the client bundle', () => {
 
 test('a reload with the same edit revision keeps an unsaved local draft', () => {
   const current = {
-    state: documentWith('Draft purpose typed but not saved'),
+    state: documentWith('draft'),
     inventory: { mcp: [] },
     mounts: { kb: { state: 'ready' } },
     meta: { version: 'old' },
   }
   const loaded = {
-    state: documentWith('Stored purpose from disk'),
+    state: documentWith('stored'),
     inventory: { mcp: [{ server: 'kb' }] },
     mounts: {},
     meta: { version: 'new' },
@@ -76,11 +76,11 @@ test('a reload with the same edit revision keeps an unsaved local draft', () => 
   const next = plugin.boardState.applyLoadedBoard(current, loaded, {
     startedRevision: 7,
     currentRevision: 7,
-    drafts: new Map([['mcp:kb', draftOf('Draft purpose typed but not saved')]]),
+    drafts: new Map([['mcp:kb', draftOf('draft')]]),
   })
 
   // The row draft survives, while inventory/meta/metadata are still refreshed.
-  assert.equal(next.state.mcp.kb.description, 'Draft purpose typed but not saved')
+  assert.deepEqual(next.state.mcp.kb.modes, ['draft'])
   assert.deepEqual(next.inventory, loaded.inventory)
   assert.deepEqual(next.mounts, loaded.mounts)
   assert.deepEqual(next.meta, loaded.meta)
@@ -88,13 +88,13 @@ test('a reload with the same edit revision keeps an unsaved local draft', () => 
 
 test('a reload started before a newer edit never replaces the state', () => {
   const current = {
-    state: documentWith('Newest local purpose'),
+    state: documentWith('new'),
     inventory: { mcp: [] },
     mounts: {},
     meta: { version: 'old' },
   }
   const loaded = {
-    state: documentWith('Stale server purpose'),
+    state: documentWith('stale'),
     inventory: { mcp: [{ server: 'kb' }] },
     mounts: {},
     meta: { version: 'new' },
@@ -107,20 +107,20 @@ test('a reload started before a newer edit never replaces the state', () => {
   })
 
   assert.equal(next.state, current.state, 'stale GET does not replace state')
-  assert.equal(next.state.mcp.kb.description, 'Newest local purpose')
+  assert.deepEqual(next.state.mcp.kb.modes, ['new'])
   assert.deepEqual(next.inventory, loaded.inventory)
   assert.deepEqual(next.meta, loaded.meta)
 })
 
 test('a reload with no local changes applies the server document', () => {
   const current = {
-    state: documentWith('Old local purpose'),
+    state: documentWith('old'),
     inventory: { mcp: [] },
     mounts: {},
     meta: { version: 'old' },
   }
   const loaded = {
-    state: documentWith('Fresh server purpose'),
+    state: documentWith('fresh'),
     inventory: { mcp: [{ server: 'kb' }] },
     mounts: {},
     meta: { version: 'new' },
@@ -132,13 +132,13 @@ test('a reload with no local changes applies the server document', () => {
     drafts: new Map(),
   })
 
-  assert.equal(next.state.mcp.kb.description, 'Fresh server purpose')
+  assert.deepEqual(next.state.mcp.kb.modes, ['fresh'])
   assert.deepEqual(next.inventory, loaded.inventory)
 })
 
 test('the initial load is applied unchanged', () => {
   const loaded = {
-    state: documentWith('Initial purpose'),
+    state: documentWith('initial'),
     inventory: { mcp: [] },
     mounts: {},
     meta: { version: 'new' },
@@ -153,12 +153,12 @@ test('the initial load is applied unchanged', () => {
 
 test('a draft for a member absent from the authoritative document is never re-added', () => {
   const current = {
-    state: documentWith('Draft for a member deleted elsewhere'),
+    state: documentWith('draft'),
     inventory: { mcp: [] },
     mounts: {},
     meta: { version: 'old' },
   }
-  const authoritative = documentWith('Unused server purpose')
+  const authoritative = documentWith('unused')
   delete authoritative.mcp.kb
   const loaded = {
     state: authoritative,
@@ -170,7 +170,7 @@ test('a draft for a member absent from the authoritative document is never re-ad
   const next = plugin.boardState.applyLoadedBoard(current, loaded, {
     startedRevision: 9,
     currentRevision: 9,
-    drafts: new Map([['mcp:kb', draftOf('Draft for a member deleted elsewhere')]]),
+    drafts: new Map([['mcp:kb', draftOf('draft')]]),
   })
 
   assert.equal(Object.hasOwn(next.state.mcp, 'kb'), false, 'no phantom row is resurrected')
@@ -179,42 +179,42 @@ test('a draft for a member absent from the authoritative document is never re-ad
 })
 
 test('orphaned drafts are exposed with their unsaved entry for a visible warning', () => {
-  const authoritative = documentWith('Server purpose')
+  const authoritative = documentWith('server')
   delete authoritative.mcp.kb
   authoritative.skills['still-here'] = { enabled: true, modes: ['a'], workspaces: [] }
   const orphans = plugin.boardState.orphanedDrafts(authoritative, new Map([
-    ['mcp:kb', draftOf('Unsaved knowledge base text')],
+    ['mcp:kb', draftOf('unsaved-modes')],
     ['skill:still-here', { enabled: false, modes: ['a'], workspaces: [] }],
   ]))
 
   assert.equal(orphans.length, 1)
   assert.equal(orphans[0].key, 'mcp:kb')
-  assert.equal(orphans[0].entry.description, 'Unsaved knowledge base text')
+  assert.deepEqual(orphans[0].entry.modes, ['unsaved-modes'])
 })
 
 test('a save response cannot resurrect a member deleted meanwhile', () => {
-  const current = documentWith('Fresh local state')
+  const current = documentWith('fresh-local')
   delete current.mcp.kb
-  const canonical = { enabled: true, modes: ['a'], workspaces: [], description: 'Stale save result' }
+  const canonical = { enabled: true, modes: ['a'], workspaces: [] }
   const next = plugin.boardState.applyItemSave(current, 'mcp', 'kb', canonical)
   assert.equal(next, current, 'the removed row is not re-added by its old save response')
   assert.equal(Object.hasOwn(next.mcp, 'kb'), false)
 })
 
 test('a save response still updates an existing member', () => {
-  const current = documentWith('Old purpose')
-  const canonical = { enabled: true, modes: ['a'], workspaces: [], description: 'Saved purpose' }
+  const current = documentWith('old')
+  const canonical = { enabled: true, modes: ['saved'], workspaces: [] }
   const next = plugin.boardState.applyItemSave(current, 'mcp', 'kb', canonical)
-  assert.equal(next.mcp.kb.description, 'Saved purpose')
+  assert.deepEqual(next.mcp.kb.modes, ['saved'])
   assert.equal(next.mcp.private.enabled, true)
 })
 
 test('the discarded-draft warning preserves the unsaved text visibly', () => {
   const message = plugin.boardState.draftLossMessage([
-    { key: 'mcp:kb', entry: { enabled: true, modes: ['a'], workspaces: [], description: 'Unsaved knowledge base text' } },
+    { key: 'mcp:kb', entry: { enabled: true, modes: ['unsaved-modes'], workspaces: [] } },
   ])
   assert.ok(message.includes('kb'), message)
-  assert.ok(message.includes('Unsaved knowledge base text'), message)
+  assert.ok(message.includes('unsaved-modes'), message)
   assert.ok(message.toLowerCase().includes('unsaved'), message)
 })
 
@@ -237,7 +237,6 @@ test('the panel inherit payload keeps current values and switches the marker to 
       name: 'shared',
       entry: { enabled: true, modes: ['x'], workspaces: ['/x'], modesFrom: 'group', workspacesFrom: 'group' },
     },
-    new Set(),
   )
   assert.equal(body.modesFrom, 'group')
   assert.equal(body.workspacesFrom, 'group')

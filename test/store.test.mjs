@@ -193,26 +193,6 @@ const mcpDefinition = {
 
 const mcpScope = { enabled: true, modes: ['standard'], workspaces: [] }
 
-/** A v4 document written before MCP descriptions existed. */
-function v4DocumentWithoutDescription() {
-  return {
-    version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
-    skills: {},
-    mcp: {
-      kb: {
-        enabled: true,
-        modes: ['standard'],
-        workspaces: [],
-        definition: mcpDefinition,
-        installedAt: '2026-11-18T00:00:00.000Z',
-      },
-    },
-    sources: {},
-    groups: {},
-  }
-}
-
 /** Create a store over a private temporary directory. */
 async function temporaryStore() {
   const dir = await mkdtemp(join(tmpdir(), 'skill-pool-store-'))
@@ -220,66 +200,21 @@ async function temporaryStore() {
   return { file, store: new StateStore({ file }) }
 }
 
-test('an old v4 MCP member reads an absent description as empty and keeps its definition', () => {
-  const state = normalizeState(v4DocumentWithoutDescription())
-  assert.equal(state.mcp.kb.description ?? '', '')
-  assert.deepEqual(state.mcp.kb.definition, mcpDefinition)
-  // Re-normalizing stays stable instead of inventing a description.
-  assert.equal(normalizeState(state).mcp.kb.description ?? '', '')
+test('a scope change or re-import preserves the stored connection definition', () => {
+  const base = upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition })
 
-  // Adding a description later must not disturb the stored connection.
-  const updated = upsertItem(state, 'mcp', 'kb', mcpScope, { description: 'Search the knowledge base' })
-  assert.equal(updated.mcp.kb.description, 'Search the knowledge base')
-  assert.deepEqual(updated.mcp.kb.definition, mcpDefinition)
-})
-
-test('upsertItem stores a description apart from the connection definition', () => {
-  const state = upsertItem(defaultState(), 'mcp', 'kb', mcpScope, {
-    definition: mcpDefinition,
-    description: '  Search the internal knowledge base.  ',
-  })
-  assert.equal(state.mcp.kb.description, 'Search the internal knowledge base.')
-  assert.deepEqual(state.mcp.kb.definition, mcpDefinition)
-  // The definition is connection config only: no description leaks into it.
-  assert.equal(state.mcp.kb.definition.description, undefined)
-})
-
-test('a description is trimmed and bounded to 300 characters', () => {
-  const state = upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { description: `  ${'x'.repeat(400)}  ` })
-  assert.equal(state.mcp.kb.description, 'x'.repeat(300))
-})
-
-test('an empty description clears the stored one and keeps the definition', () => {
-  const withDescription = upsertItem(defaultState(), 'mcp', 'kb', mcpScope, {
-    definition: mcpDefinition,
-    description: 'Search the knowledge base',
-  })
-  const cleared = upsertItem(withDescription, 'mcp', 'kb', mcpScope, { description: '' })
-  assert.equal(cleared.mcp.kb.description ?? '', '')
-  assert.deepEqual(cleared.mcp.kb.definition, mcpDefinition)
-})
-
-test('a scope change or re-import without a description preserves it and the definition', () => {
-  const base = upsertItem(defaultState(), 'mcp', 'kb', mcpScope, {
-    definition: mcpDefinition,
-    description: 'Search the knowledge base',
-  })
-
-  // Editing conditions must not drop either the description or the definition.
+  // Editing conditions must not drop the definition.
   const scoped = upsertItem(base, 'mcp', 'kb', { enabled: false, modes: [], workspaces: [] })
-  assert.equal(scoped.mcp.kb.description, 'Search the knowledge base')
   assert.equal(scoped.mcp.kb.enabled, false)
   assert.deepEqual(scoped.mcp.kb.definition, mcpDefinition)
 
-  // Re-importing a changed connection keeps the user's description.
+  // Re-importing a changed connection replaces the definition.
   const replacement = { ...mcpDefinition, url: 'http://127.0.0.1:65534/mcp' }
   const reimported = upsertItem(scoped, 'mcp', 'kb', mcpScope, { definition: replacement })
-  assert.equal(reimported.mcp.kb.description, 'Search the knowledge base')
   assert.deepEqual(reimported.mcp.kb.definition, replacement)
 
-  // An omitted description is never turned into a default summary.
+  // A write without a definition keeps the stored connection.
   const untouched = upsertItem(reimported, 'mcp', 'kb', mcpScope)
-  assert.equal(untouched.mcp.kb.description, 'Search the knowledge base')
   assert.deepEqual(untouched.mcp.kb.definition, replacement)
 })
 
@@ -287,17 +222,16 @@ test('concurrent updates to different fields both survive on disk', async () => 
   const { file, store } = await temporaryStore()
   await store.write(upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition }))
 
+  const replacement = { ...mcpDefinition, url: 'http://127.0.0.1:65534/mcp' }
+
   await Promise.all([
-    store.update((current) => upsertItem(current, 'mcp', 'kb', mcpScope, { description: 'Search the knowledge base' })),
-    store.update((current) =>
-      upsertItem(current, 'mcp', 'kb', { enabled: false, modes: ['standard'], workspaces: [] }),
-    ),
+    store.update((current) => upsertItem(current, 'mcp', 'kb', mcpScope, { definition: replacement })),
+    store.update((current) => upsertItem(current, 'mcp', 'kb', { ...mcpScope, enabled: false })),
   ])
 
   const persisted = JSON.parse(await readFile(file, 'utf8'))
-  assert.equal(persisted.mcp.kb.description, 'Search the knowledge base')
   assert.equal(persisted.mcp.kb.enabled, false)
-  assert.deepEqual(persisted.mcp.kb.definition, mcpDefinition)
+  assert.deepEqual(persisted.mcp.kb.definition, replacement)
 })
 
 test('many concurrent updates all land instead of overwriting each other', async () => {
@@ -320,13 +254,13 @@ test('a direct write queued before an update is seen by that update', async () =
   const { file, store } = await temporaryStore()
   const seeding = store.write(upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition }))
   const updated = store.update((current) =>
-    upsertItem(current, 'mcp', 'kb', mcpScope, { description: 'Search the knowledge base' }),
+    upsertItem(current, 'mcp', 'kb', { ...mcpScope, enabled: false }),
   )
   await Promise.all([seeding, updated])
 
   const persisted = JSON.parse(await readFile(file, 'utf8'))
   assert.deepEqual(persisted.mcp.kb.definition, mcpDefinition)
-  assert.equal(persisted.mcp.kb.description, 'Search the knowledge base')
+  assert.equal(persisted.mcp.kb.enabled, false)
 })
 
 test('a failed update rejects but later updates still run', async () => {
@@ -339,17 +273,17 @@ test('a failed update rejects but later updates still run', async () => {
     /boom/,
   )
   const next = await store.update((current) =>
-    upsertItem(current, 'mcp', 'kb', mcpScope, { description: 'written after failure' }),
+    upsertItem(current, 'mcp', 'kb', { ...mcpScope, enabled: false }),
   )
-  assert.equal(next.mcp.kb.description, 'written after failure')
+  assert.equal(next.mcp.kb.enabled, false)
   const persisted = JSON.parse(await readFile(file, 'utf8'))
-  assert.equal(persisted.mcp.kb.description, 'written after failure')
+  assert.equal(persisted.mcp.kb.enabled, false)
 })
 
-test('the persisted document is owner-only and a fresh read keeps description and definition', async () => {
+test('the persisted document is owner-only and a fresh read keeps the definition', async () => {
   const { file, store } = await temporaryStore()
   await store.update((current) =>
-    upsertItem(current, 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'Search the knowledge base' }),
+    upsertItem(current, 'mcp', 'kb', mcpScope, { definition: mcpDefinition }),
   )
 
   const info = await stat(file)
@@ -357,22 +291,21 @@ test('the persisted document is owner-only and a fresh read keeps description an
 
   const reopened = new StateStore({ file })
   const reread = await reopened.read({ fresh: true })
-  assert.equal(reread.mcp.kb.description, 'Search the knowledge base')
   assert.deepEqual(reread.mcp.kb.definition, mcpDefinition)
-  assert.equal(reread.mcp.kb.definition.description, undefined)
+  assert.deepEqual(reread.mcp.kb.modes, ['standard'])
 })
 
-test('a fresh read sees a description changed outside the store', async () => {
+test('a fresh read sees conditions changed outside the store', async () => {
   const { file, store } = await temporaryStore()
   await store.write(defaultState())
   const external = upsertItem(defaultState(), 'mcp', 'kb', mcpScope, {
     definition: mcpDefinition,
-    description: 'Written by another process',
   })
+  external.mcp.kb.enabled = false
   await writeFile(file, JSON.stringify(external), { encoding: 'utf8', mode: 0o600 })
 
   const fresh = await store.read({ fresh: true })
-  assert.equal(fresh.mcp.kb.description, 'Written by another process')
+  assert.equal(fresh.mcp.kb.enabled, false)
   assert.deepEqual(fresh.mcp.kb.definition, mcpDefinition)
 })
 
@@ -395,9 +328,7 @@ async function withDeadline(promise, label, ms = 2000) {
 
 test('a nested store.write inside an update mutator fails fast instead of deadlocking', async () => {
   const { file, store } = await temporaryStore()
-  await store.write(
-    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
-  )
+  await store.write(upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition }))
   const before = await readFile(file, 'utf8')
 
   await assert.rejects(
@@ -415,15 +346,12 @@ test('a nested store.write inside an update mutator fails fast instead of deadlo
   // The queue recovers: the rejected task settled and later updates still run.
   const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
   assert.equal(recovered.mcp.after.enabled, true)
-  assert.equal(recovered.mcp.kb.description, 'keep me')
   assert.deepEqual(recovered.mcp.kb.definition, mcpDefinition)
 })
 
 test('a nested store.update inside an update mutator fails fast instead of deadlocking', async () => {
   const { file, store } = await temporaryStore()
-  await store.write(
-    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
-  )
+  await store.write(upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition }))
   const before = await readFile(file, 'utf8')
 
   await assert.rejects(
@@ -440,7 +368,7 @@ test('a nested store.update inside an update mutator fails fast instead of deadl
 
   const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
   assert.equal(recovered.mcp.after.enabled, true)
-  assert.equal(recovered.mcp.kb.description, 'keep me')
+  assert.deepEqual(recovered.mcp.kb.definition, mcpDefinition)
 })
 
 test('independent concurrent external updates still queue while an async update runs', async () => {
@@ -479,19 +407,16 @@ test('an async mutation result is persisted once it settles', async () => {
   const { file, store } = await temporaryStore()
   const state = await store.update(async (current) => {
     await new Promise((resolve) => setTimeout(resolve, 5))
-    return upsertItem(current, 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'async summary' })
+    return upsertItem(current, 'mcp', 'kb', mcpScope, { definition: mcpDefinition })
   })
-  assert.equal(state.mcp.kb.description, 'async summary')
+  assert.deepEqual(state.mcp.kb.definition, mcpDefinition)
   const persisted = JSON.parse(await readFile(file, 'utf8'))
-  assert.equal(persisted.mcp.kb.description, 'async summary')
   assert.deepEqual(persisted.mcp.kb.definition, mcpDefinition)
 })
 
 test('an invalid mutation result is rejected and leaves the document bytes untouched', async () => {
   const { file, store } = await temporaryStore()
-  await store.write(
-    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
-  )
+  await store.write(upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition }))
   const before = await readFile(file)
 
   const invalidMutators = [
@@ -508,16 +433,14 @@ test('an invalid mutation result is rejected and leaves the document bytes untou
 
   // The queue recovers and the stored configuration is still there.
   const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
-  assert.equal(recovered.mcp.kb.description, 'keep me')
   assert.equal(recovered.mcp.after.enabled, true)
+  assert.deepEqual(recovered.mcp.kb.definition, mcpDefinition)
   assert.deepEqual(recovered.mcp.kb.definition, mcpDefinition)
 })
 
 test('an update refuses to overwrite a corrupt state file and recovers after repair', async () => {
   const { file, store } = await temporaryStore()
-  await store.write(
-    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
-  )
+  await store.write(upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition }))
   const good = await readFile(file, 'utf8')
   await writeFile(file, '{"version":4,"mcp":', 'utf8')
   const corrupt = await readFile(file)
@@ -531,7 +454,6 @@ test('an update refuses to overwrite a corrupt state file and recovers after rep
   // Repairing the file lets the next update proceed and keeps the original data.
   await writeFile(file, good, 'utf8')
   const repaired = await store.update((current) => upsertItem(current, 'mcp', 'new', mcpScope))
-  assert.equal(repaired.mcp.kb.description, 'keep me')
   assert.deepEqual(repaired.mcp.kb.definition, mcpDefinition)
   assert.equal(repaired.mcp.new.enabled, true)
 })
@@ -562,9 +484,7 @@ test('a plain read fails closed too instead of returning defaults', async () => 
 
 test('an update rejects v4 fragments and wrong section shapes without rewriting the document', async () => {
   const { file, store } = await temporaryStore()
-  await store.write(
-    upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'keep me' }),
-  )
+  await store.write(upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition }))
   const before = await readFile(file)
   const complete = defaultState()
 
@@ -584,7 +504,6 @@ test('an update rejects v4 fragments and wrong section shapes without rewriting 
 
   // The queue recovers and the credential-bearing member is still intact.
   const recovered = await store.update((current) => upsertItem(current, 'mcp', 'after', mcpScope))
-  assert.equal(recovered.mcp.kb.description, 'keep me')
   assert.deepEqual(recovered.mcp.kb.definition, mcpDefinition)
   assert.equal(recovered.mcp.after.enabled, true)
 })
@@ -594,18 +513,18 @@ test('an update over a stored v3 document still migrates it to v4', async () => 
   await writeFile(file, JSON.stringify(legacyDocument()), { encoding: 'utf8', mode: 0o600 })
 
   const state = await store.update((current) =>
-    upsertItem(current, 'mcp', 'kb', mcpScope, { definition: mcpDefinition, description: 'migrated' }),
+    upsertItem(current, 'mcp', 'kb', mcpScope, { definition: mcpDefinition }),
   )
   assert.equal(state.version, 4)
   assert.equal(state.skills['lark-doc'].modesFrom, 'group')
   assert.deepEqual(state.groups['repo:larksuite/cli'].modes, ['standard'])
-  assert.equal(state.mcp.kb.description, 'migrated')
+  assert.deepEqual(state.mcp.kb.definition, mcpDefinition)
 
   const persisted = JSON.parse(await readFile(file, 'utf8'))
   assert.equal(persisted.version, 4)
   assert.equal(persisted.skills['lark-doc'].modesFrom, 'group')
   assert.deepEqual(persisted.groups['repo:larksuite/cli'].modes, ['standard'])
-  assert.equal(persisted.mcp.kb.description, 'migrated')
+  assert.deepEqual(persisted.mcp.kb.definition, mcpDefinition)
 })
 
 test('an update refuses a non-ENOENT read error (EISDIR) without touching the path', async () => {

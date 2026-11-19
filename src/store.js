@@ -129,24 +129,6 @@ function optionalString(value, limit = 4096) {
   return value.trim().slice(0, limit)
 }
 
-/** Maximum length of the user-written purpose summary of an MCP member. */
-const DESCRIPTION_LIMIT = 300
-
-/**
- * Normalize the user-written purpose summary of one MCP member.
- *
- * This text is model-facing metadata, kept next to (never inside) the connection
- * definition: it must not be able to smuggle connection fields, and an empty
- * value means "no summary" so a document never grows an empty key.
- *
- * @param {unknown} value - candidate description.
- * @returns {string} trimmed, length-capped description ('' when absent).
- */
-function cleanDescription(value) {
-  if (typeof value !== 'string') return ''
-  return value.trim().slice(0, DESCRIPTION_LIMIT)
-}
-
 /** Timestamp helper: keep a stored value, else use now. */
 function timestamp(value) {
   const text = optionalString(value, 64)
@@ -269,10 +251,6 @@ function itemExtras(kind, extra, base) {
     // the connection definition that makes the member survive a Host restart.
     const defined = cleanMcpDefinition(provided.definition) ?? cleanMcpDefinition(previous.definition)
     if (defined !== undefined) out.definition = defined
-    // The user's purpose summary is metadata, stored apart from the definition:
-    // an omitted description keeps the stored one, an empty string clears it.
-    out.description =
-      typeof provided.description === 'string' ? cleanDescription(provided.description) : cleanDescription(previous.description)
   }
   out.installedAt = pick('installedAt') || new Date().toISOString()
   return out
@@ -339,10 +317,6 @@ function normalizeMember(kind, raw) {
       raw.workspacesFrom === 'self' ? 'self' : raw.workspacesFrom === 'group' ? 'group' : member.workspaces.length > 0 ? 'self' : 'group'
   }
   if (kind === 'mcp') {
-    // The user-written summary is metadata, never part of the connection
-    // definition, so normalization keeps the two fields independent.
-    const description = cleanDescription(raw.description)
-    if (description.length > 0) member.description = description
     const definition = cleanMcpDefinition(raw.definition)
     if (definition !== undefined) member.definition = definition
   }
@@ -760,7 +734,6 @@ function validateMember(raw, what, { version, kind, sources }) {
     }
   }
   if (kind === 'mcp') {
-    optionalStringField(raw.description, `${what}.description`, DESCRIPTION_LIMIT)
     if (raw.definition !== undefined) validateDefinition(raw.definition, `${what}.definition`)
   }
 }

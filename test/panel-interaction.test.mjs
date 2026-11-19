@@ -145,7 +145,7 @@ let boardState = {
     },
   },
   mcp: {
-    kb: { enabled: true, modes: [], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z', description: 'synthetic mcp' },
+    kb: { enabled: true, modes: [], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z' },
   },
   sources: {
     src_a: {

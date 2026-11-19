@@ -292,9 +292,8 @@ function mcpRows(ctx, state) {
     const live = byName.get(server)
     rows.push({
       server,
-      // The user-written purpose summary is model-facing metadata; the connection
-      // definition (URL/command/headers/env) never enters the inventory.
-      description: clipDescription(member.description),
+      // The connection definition (URL/command/headers/env) never enters the
+      // inventory.
       tools: Array.isArray(live?.tools) ? [...live.tools] : [],
       managed: live?.managed === true,
       entryId: live?.entryId !== undefined && live.entryId.length > 0 ? live.entryId : mcpEntryId(server),
