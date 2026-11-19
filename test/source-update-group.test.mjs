@@ -53,7 +53,7 @@ test('source/update keeps same-group member enabled for re-enabling', async (t) 
   const store = new StateStore({ file })
   await store.write(normalizeState({
     version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     sources: {
       src_a: {
         id: 'src_a', kind: 'git', label: 'group/project@main',

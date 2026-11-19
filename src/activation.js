@@ -29,8 +29,6 @@ import { librarySkillsRoot } from './library.js'
 import { createLibraryProvider } from './provider.js'
 import { isAmbiguousMcpToolName, mcpServerOf, MCP_TOOL_PREFIX, resolvePool } from './rules.js'
 
-const SECTION_NAME = 'resource-pool:active'
-
 /** Labels of effects that restrict the MCP tool surface (normal or fallback). */
 const RESTRICT_LABELS = new Set(['mcp-restrict', 'mcp-restrict-fallback'])
 
@@ -97,69 +95,16 @@ export function workspaceOf(agent) {
   return process.cwd()
 }
 
-/** Chinese prompt summary. */
-function summaryTextZh({ mode, cwd, skillNames, servers, skillGated, mcpGated }) {
-  const lines = ['## 技能池已激活', '', `Agent 模式：\`${mode}\`，工作区：\`${cwd}\`。`]
-  if (skillGated) {
-    lines.push(
-      skillNames.length > 0
-        ? `技能池在本会话提供了这些技能：${skillNames.join('、')}。`
-        : '技能池在本会话没有提供任何技能。',
-    )
-  }
-  if (mcpGated) {
-    if (servers.length > 0) {
-      // The authoritative list of admitted connections: every other MCP tool
-      // is hidden in this session.
-      lines.push(`本会话可用的 MCP 连接只有：${servers.join('、')}；其它 MCP 工具已被隐藏。`)
-    } else {
-      lines.push('本会话没有任何可用 MCP 连接；所有 MCP 工具已被隐藏。')
-    }
-  }
-  lines.push(
-    '未列出的技能池资源在本模式/工作区下确实不可用：不要尝试调用，也不要凭记忆复述它们的内容。',
-    '如果任务确实需要某个不可用的资源，请让用户在「设置 → 技能池」里为它加上当前的 Agent 模式或工作区条件。',
-  )
-  return lines.join('\n')
-}
-
-/** English prompt summary. */
-function summaryTextEn({ mode, cwd, skillNames, servers, skillGated, mcpGated }) {
-  const lines = ['## Resource pool active', '', `Agent mode \`${mode}\`, workspace \`${cwd}\`.`]
-  if (skillGated) {
-    lines.push(
-      skillNames.length > 0
-        ? `The resource pool supplies these skills in this session: ${skillNames.join(', ')}.`
-        : 'The resource pool supplies no skills in this session.',
-    )
-  }
-  if (mcpGated) {
-    if (servers.length > 0) {
-      lines.push(
-        `The only MCP connections available in this session are: ${servers.join('; ')}; every other MCP tool is hidden.`,
-      )
-    } else {
-      lines.push('No MCP connections are available in this session; all MCP tools are hidden.')
-    }
-  }
-  lines.push(
-    'Resource-pool resources that are not listed are genuinely unavailable in this mode/workspace: do not try to call them and do not recall their content from memory.',
-    'If a task really needs an unavailable resource, ask the user to add the current Agent mode or workspace to its condition in Settings → Resource pool.',
-  )
-  return lines.join('\n')
-}
-
 /**
  * Create the activation manager.
  * @param {object} options - manager options.
  * @param {object} options.ctx - plugin context.
  * @param {(fresh?: boolean) => Promise<object>} options.getState - read the current document.
  * @param {{ debug?: Function, warn?: Function }} [options.logger] - logger.
- * @param {() => string} [options.promptLanguage] - 'zh' | 'en'.
  * @param {() => string} [options.libraryRoot] - library skills root override.
  * @returns {object} manager with applyToAgent/reapplyAll/disposeAgent/disposeAll.
  */
-export function createActivation({ ctx, getState, logger, promptLanguage = () => 'zh', libraryRoot = () => librarySkillsRoot() }) {
+export function createActivation({ ctx, getState, logger, libraryRoot = () => librarySkillsRoot() }) {
   /** @type {WeakMap<object, {disposers: {dispose: Function, label: string}[], signature: string, activated: boolean, chain: Promise<void>}>} */
   const agents = new WeakMap()
 
@@ -670,33 +615,6 @@ export function createActivation({ ctx, getState, logger, promptLanguage = () =>
             'skill-provider',
           )
         }
-      }
-
-      const systemPrompt = ctx.get('systemPrompt')
-      if (
-        settings.injectSummary !== false &&
-        pool.gated &&
-        systemPrompt !== undefined &&
-        typeof systemPrompt.getSectionOrder === 'function'
-      ) {
-        const skillNames = allowedSkills.size > 0 ? [...allowedSkills].sort() : []
-        const summary = (promptLanguage() === 'en' ? summaryTextEn : summaryTextZh)({
-          mode,
-          cwd,
-          skillNames,
-          servers,
-          skillGated: pool.gateSkills,
-          mcpGated: pool.gateMcp,
-        })
-        addEffect(
-          () =>
-            agent.ctx.systemPrompt.section({
-              name: SECTION_NAME,
-              order: systemPrompt.getSectionOrder('TOOL_READ') - 30,
-              text: summary,
-            }),
-          'summary',
-        )
       }
 
       if (!pool.gateMcp) {

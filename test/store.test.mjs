@@ -22,7 +22,7 @@ import { resolvePool } from '../src/rules.js'
 function legacyDocument() {
   return {
     version: 3,
-    settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     sources: {
       src_lark: {
         id: 'src_lark',

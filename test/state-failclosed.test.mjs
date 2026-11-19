@@ -21,7 +21,7 @@ import { StateStore, defaultState, normalizeState, upsertGroup, upsertItem, upse
 function validState() {
   return normalizeState({
     version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     skills: {},
     mcp: {
       kb: { enabled: true, modes: ['b'], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z' },
@@ -35,7 +35,7 @@ function validState() {
 function legacyDocument() {
   return {
     version: 3,
-    settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     sources: {
       src_lark: {
         id: 'src_lark',
@@ -203,7 +203,6 @@ test('a v3 document missing optional switches still migrates without inventing a
   const { dir, file, store } = await temporaryStore()
   try {
     const legacy = legacyDocument()
-    delete legacy.settings.injectSummary
     delete legacy.settings.gateDefaultSkills
     await writeFile(file, JSON.stringify(legacy), 'utf8')
     const migrated = await store.read({ fresh: true })
@@ -882,7 +881,7 @@ function storedZip(name, content) {
 function sharedSourceState({ groupEnabled = true, memberMode = 'group' } = {}) {
   return normalizeState({
     version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     sources: {
       src_a: {
         id: 'src_a', kind: 'git', label: 'a', url: 'https://github.com/example/project', provider: 'github',
@@ -1009,7 +1008,7 @@ test('a self-scoped shared member keeps its own scope when its source is deleted
 test('ambiguous mcp__ names are denied even when their prefix names an allowed server', async () => {
   const state = normalizeState({
     version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: false, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     skills: {}, sources: {}, groups: {},
     mcp: { alpha: { enabled: true, modes: [], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z' } },
   })
@@ -1585,7 +1584,7 @@ test('a recovered-but-empty snapshot stays conservative after the file breaks ag
 function twoMcpState() {
   return normalizeState({
     version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: false, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     skills: {}, sources: {}, groups: {},
     mcp: {
       kb: { enabled: true, modes: ['b'], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z' },

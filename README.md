@@ -134,7 +134,7 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.8.
 > 不要用 `link:` / 软链安装：Host 在 profile 目录下按 importer 路径做包解析，
 > 软链会让 `@deepseek-ai/dsh-tools` 解析到 profile 之外而启动失败（`ERR_MODULE_NOT_FOUND`）。
 
-配置项（`cordis.patch.yml` 的 `config`）：`file`（状态文件路径）、`promptLanguage`（`zh`/`en`）、
+配置项（`cordis.patch.yml` 的 `config`）：`file`（状态文件路径）、
 `enabled`（插件级总开关）。插件级 `enabled=false` 是刻意的"不门控"：此时状态文件损坏不会阻止新 Agent
 创建（面板与状态工具仍会报告文件错误）。
 
@@ -153,7 +153,7 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.8.
 ```jsonc
 {
   "version": 4,
-  "settings": { "enabled": true, "mcpGate": true, "injectSummary": true, "gateDefaultSkills": false },
+  "settings": { "enabled": true, "mcpGate": true, "gateDefaultSkills": false },
   "groups": {
     "repo:larksuite/cli": { "key": "repo:larksuite/cli", "kind": "repo", "enabled": true, "modes": ["standard"], "workspaces": [] }
   },

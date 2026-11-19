@@ -66,7 +66,6 @@
   "settings": {
     "enabled": true,          // 总开关；false 时完全不干预任何会话
     "mcpGate": true,          // MCP 命名空间门控
-    "injectSummary": true,    // 是否注入系统提示摘要
     "gateDefaultSkills": false // 是否连系统自带技能一起严格隐藏（默认关）
   },
   "skills": {

@@ -52,20 +52,18 @@ const VERSION = (() => {
 /** Schemastery schema surfaced by `Config.listConfigs` and the profile patch. */
 export const Config = z.object({
   file: z.string().default('').description('Absolute state file path; empty uses $DSH_HOME/resource-pool/state.json.'),
-  promptLanguage: z.string().default('zh').description("Language of the injected pool summary: 'zh' | 'en'."),
   enabled: z.boolean().default(true).description('Master switch; false keeps the panel but never gates a session.'),
 })
 
 /**
  * Mount the plugin.
  * @param {import('@deepseek-ai/cordis').Context} ctx - plugin context.
- * @param {{ file?: string, promptLanguage?: string, enabled?: boolean }} [config] - validated configuration.
+ * @param {{ file?: string, enabled?: boolean }} [config] - validated configuration.
  */
 export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? undefined
   const file = typeof config.file === 'string' && config.file.trim().length > 0 ? config.file.trim() : statePath()
   const store = new StateStore({ file, logger, version: VERSION })
-  const promptLanguage = config.promptLanguage === 'en' ? 'en' : 'zh'
   const masterEnabled = config.enabled !== false
 
   /** Read the stored document with fail-closed validation (diagnostics too). */
@@ -93,9 +91,9 @@ export function apply(ctx, config = {}) {
     return readStoredState()
   }
 
-  const activation = createActivation({ ctx, getState, logger, promptLanguage: () => promptLanguage })
+  const activation = createActivation({ ctx, getState, logger })
 
-  const meta = { version: VERSION, file, pluginName: 'dsh-skill-pool', promptLanguage }
+  const meta = { version: VERSION, file, pluginName: 'dsh-skill-pool' }
 
   // Apply to existing Agents too: a plugin reload must not leave live sessions
   // ungated until they are recreated.
@@ -184,7 +182,6 @@ export function apply(ctx, config = {}) {
           plugin: 'dsh-skill-pool',
           version: VERSION,
           stateFile: file,
-          promptLanguage,
           masterEnabled,
           stateStatus: {
             ok: false,
@@ -204,7 +201,6 @@ export function apply(ctx, config = {}) {
         plugin: 'dsh-skill-pool',
         version: VERSION,
         stateFile: file,
-        promptLanguage,
         masterEnabled,
         stateStatus: { ok: true },
         mode,

@@ -50,7 +50,7 @@ function stateWith({ deny = [], allow = [], extra = [] } = {}) {
   }
   return normalizeState({
     version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: false, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     skills: {}, sources: {}, groups: {}, mcp,
   })
 }

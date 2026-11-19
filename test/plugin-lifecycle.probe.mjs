@@ -27,7 +27,7 @@ async function loadPlugin() {
 function validState() {
   return normalizeState({
     version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: false, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     skills: {}, sources: {}, groups: {},
     mcp: { kb: { enabled: true, modes: ['b'], workspaces: [], installedAt: '2026-11-18T00:00:00.000Z' } },
   })

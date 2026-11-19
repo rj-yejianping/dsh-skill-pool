@@ -80,7 +80,7 @@ export const GIT_PROVIDERS = ['github', 'gitlab']
 export const CHECK_STATUSES = ['up-to-date', 'update-available', 'error']
 
 /** Switches the panel may patch. */
-export const SETTING_KEYS = ['enabled', 'mcpGate', 'injectSummary', 'gateDefaultSkills']
+export const SETTING_KEYS = ['enabled', 'mcpGate', 'gateDefaultSkills']
 
 /** Conservative identifier grammar for resource names and mode ids. */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/
@@ -193,7 +193,7 @@ function cleanSubdir(value) {
 
 /** Default settings of a fresh document (§2.1). */
 export function defaultSettings() {
-  return { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false }
+  return { enabled: true, mcpGate: true, gateDefaultSkills: false }
 }
 
 /** A fresh, empty document. */
@@ -517,7 +517,6 @@ function migrateV3(source) {
   const settings = {
     enabled: rawSettings.enabled !== false,
     mcpGate: rawSettings.mcpGate !== false,
-    injectSummary: rawSettings.injectSummary !== false,
     gateDefaultSkills: rawSettings.gateDefaultSkills === true,
   }
   const sources = {}
@@ -582,7 +581,6 @@ export function normalizeState(raw) {
   const settings = {
     enabled: rawSettings.enabled !== false,
     mcpGate: rawSettings.mcpGate !== false,
-    injectSummary: rawSettings.injectSummary !== false,
     gateDefaultSkills: rawSettings.gateDefaultSkills === true,
   }
 

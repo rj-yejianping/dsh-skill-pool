@@ -211,8 +211,6 @@ window.__ModuleLoader__.load({
         setEnabledHint: '关闭后完全不干预任何会话。',
         setMcpGate: 'MCP 门控',
         setMcpGateHint: '隐藏未命中条件的 MCP 工具。',
-        setInjectSummary: '注入资源摘要',
-        setInjectSummaryHint: '在系统提示中说明可用技能与 MCP。',
         setGateDefaultSkills: '系统技能严格隐藏',
         setGateDefaultSkillsHint: '暂未启用（系统技能始终可用）。',
         stateFile: '状态文件',
@@ -411,8 +409,6 @@ window.__ModuleLoader__.load({
         setEnabledHint: 'Off leaves every session completely untouched.',
         setMcpGate: 'MCP gate',
         setMcpGateHint: 'Hide the tools of MCP servers that do not match.',
-        setInjectSummary: 'Inject resource summary',
-        setInjectSummaryHint: 'State the available skills and MCP servers in the system prompt.',
         setGateDefaultSkills: 'Strictly hide system skills',
         setGateDefaultSkillsHint: 'Not enabled yet (system skills are always available).',
         stateFile: 'State file',
@@ -450,7 +446,6 @@ window.__ModuleLoader__.load({
     const DEFAULT_SETTINGS = Object.freeze({
       enabled: true,
       mcpGate: true,
-      injectSummary: true,
       gateDefaultSkills: false,
     })
     const EMPTY_INVENTORY = Object.freeze({
@@ -649,7 +644,6 @@ window.__ModuleLoader__.load({
       return {
         enabled: source.enabled !== false,
         mcpGate: source.mcpGate !== false,
-        injectSummary: source.injectSummary !== false,
         gateDefaultSkills: source.gateDefaultSkills === true,
       }
     }
@@ -3982,13 +3976,6 @@ window.__ModuleLoader__.load({
               checked: settings.mcpGate === true,
               disabled: savingSettings,
               onChange: (value) => void saveSettings({ mcpGate: value }),
-            }),
-            h(SwitchRow, {
-              label: TEXT.setInjectSummary,
-              hint: TEXT.setInjectSummaryHint,
-              checked: settings.injectSummary === true,
-              disabled: savingSettings,
-              onChange: (value) => void saveSettings({ injectSummary: value }),
             }),
             h(SwitchRow, {
               label: `${TEXT.setGateDefaultSkills} · ${TEXT.notAvailable}`,

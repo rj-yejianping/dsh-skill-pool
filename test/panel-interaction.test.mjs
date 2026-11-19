@@ -137,7 +137,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const calls = []
 let boardState = {
   version: 4,
-  settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
+  settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
   skills: {
     shared: {
       enabled: true, modes: [], workspaces: [], modesFrom: 'group', workspacesFrom: 'group',

@@ -40,7 +40,7 @@ const plugin = captured.factory((id) => {
 function documentWith(mode = 'a') {
   return {
     version: 4,
-    settings: { enabled: true, mcpGate: true, injectSummary: true, gateDefaultSkills: false },
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
     skills: {},
     mcp: {
       kb: { enabled: true, modes: [mode], workspaces: [] },

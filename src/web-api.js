@@ -670,7 +670,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     const body = await readBody(request)
     const patch = isObject(body.patch) ? body.patch : isObject(body.settings) ? body.settings : null
     if (patch === null) return failure('resource-pool/bad-settings', '缺少 patch 对象')
-    for (const key of ['enabled', 'mcpGate', 'injectSummary', 'gateDefaultSkills']) {
+    for (const key of ['enabled', 'mcpGate', 'gateDefaultSkills']) {
       if (patch[key] !== undefined && typeof patch[key] !== 'boolean') {
         return failure('resource-pool/bad-settings', `${key} 必须是布尔值`)
       }
