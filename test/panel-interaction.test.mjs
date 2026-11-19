@@ -314,7 +314,7 @@ const settingsTab = byText(tree, 'Settings')[0]
 assert.ok(settingsTab, 'Settings tab rendered')
 click(settingsTab, 'Settings tab')
 await sleep(30)
-assert.ok(textOf(tree).includes('Group switches'), 'settings group switches rendered')
+assert.equal(textOf(tree).includes('Group switches'), false, 'the group-switch card is gone')
 assert.ok(textOf(tree).includes('State file'), 'settings state file row rendered')
 
 console.log(JSON.stringify({

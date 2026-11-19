@@ -385,7 +385,7 @@ export async function removeSkillDir({ root, name })                  // boolean
    - 每行：label、kind、技能数、`上次检查` 状态徽标（已是最新 / 有更新 / 错误）、「检查更新」「更新」「删除」。
    - 顶部「检查全部更新」。
    - ZIP/文件导入来源只读展示，无更新按钮。
-3. **设置**：总开关、MCP 门控、提示摘要、`gateDefaultSkills`（灰显标注 v3 未启用）、状态文件路径、版本。
+3. **设置**：总开关、MCP 门控、`gateDefaultSkills`（灰显标注 v3 未启用）、状态文件路径、版本。
 
 交互约定：
 

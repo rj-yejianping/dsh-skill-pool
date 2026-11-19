@@ -85,7 +85,6 @@ window.__ModuleLoader__.load({
         groupExpand: '展开',
         groupCollapse: '收起',
         settingsGroups: '分组开关',
-        settingsGroupsHint: '关掉一个仓库组等于关闭它下面所有资源；成员自己的开关保持不变，重新打开即恢复。',
         groupDisabledTag: '整组已关闭',
         groupHint: '同仓库成员默认继承这组条件；单个资源可以改为单独设置。',
         addPathPlaceholder: '/root/workspace/foo 回车添加',
@@ -286,7 +285,6 @@ window.__ModuleLoader__.load({
         groupExpand: 'Expand',
         groupCollapse: 'Collapse',
         settingsGroups: 'Group switches',
-        settingsGroupsHint: 'Turning a repository group off disables every member; each member keeps its own switch.',
         groupDisabledTag: 'group off',
         groupHint: 'Members of one repository inherit this scope by default; a single resource can opt out.',
         addPathPlaceholder: '/root/workspace/foo then Enter',
@@ -2091,14 +2089,6 @@ window.__ModuleLoader__.load({
         whiteSpace: 'nowrap',
         cursor: 'pointer',
       },
-      groupSwitchRow: {
-        display: 'flex',
-        alignItems: 'center',
-        gap: '10px',
-        padding: '8px 2px',
-        borderBottom: '1px solid var(--rp-line)',
-        minWidth: 0,
-      },
       groupCaret: {
         width: '14px',
         flex: '0 0 auto',
@@ -3886,65 +3876,6 @@ window.__ModuleLoader__.load({
         )
       }
 
-      function renderGroupSwitches() {
-        if (groupList.length === 0) return null
-        return h(
-          'div',
-          { style: S.card },
-          h(
-            'div',
-            { style: S.cardHead },
-            h(
-              'div',
-              { style: S.cardTitleRow },
-              h('span', { style: S.cardTitle }, TEXT.settingsGroups),
-              h('span', { style: S.countBadge }, String(groupList.length)),
-            ),
-          ),
-          h('div', { style: S.cardDesc }, TEXT.settingsGroupsHint),
-          groupList.map((row, index) =>
-            h(
-              'div',
-              {
-                key: row.key,
-                style: {
-                  ...SX.groupSwitchRow,
-                  ...(index === groupList.length - 1 ? { borderBottom: 'none' } : null),
-                },
-              },
-              h(
-                'div',
-                { style: S.rowText },
-                h(
-                  'div',
-                  { style: S.rowName },
-                  h(
-                    'span',
-                    { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' } },
-                    row.name,
-                  ),
-                  h('span', { style: S.countBadge }, `${row.names.length} ${TEXT.countUnit}`),
-                  row.group !== null && row.group.enabled === false
-                    ? h('span', { style: S.badgeWarn }, TEXT.groupDisabledTag)
-                    : null,
-                ),
-                h(
-                  'div',
-                  { style: S.rowDesc },
-                  `${TEXT.rowModes}: ${groupScopeText(row.group, 'modes')} · ${TEXT.rowWorkspaces}: ${groupScopeText(row.group, 'workspaces')}`,
-                ),
-              ),
-              h(Toggle, {
-                checked: row.group === null || row.group.enabled !== false,
-                label: row.name,
-                title: row.group !== null && row.group.enabled === false ? TEXT.disabled : TEXT.enabled,
-                onChange: (value) => updateGroup(row.key, { enabled: value }),
-              }),
-            ),
-          ),
-        )
-      }
-
       function renderSettings() {
         const savingSettings = isBusy('settings')
         return h(
@@ -3986,7 +3917,6 @@ window.__ModuleLoader__.load({
             }),
             h('div', { style: S.cardDesc }, TEXT.settingsHint),
           ),
-          renderGroupSwitches(),
           h(
             'div',
             { style: S.row },
