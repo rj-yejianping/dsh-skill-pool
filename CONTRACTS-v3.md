@@ -39,6 +39,68 @@
     否则任一 `error` → 失败；否则已是最新）与「检查 / 更新」按钮。检查走 `POST /source/check {ids}`，
     更新对组内每条 Git 来源依次 `POST /source/update {id}`，一条失败不影响其余。
 
+## v5 增量（2026-11-20，插件 0.5.0；覆盖下文冲突处）
+
+> 文档版本仍是 **4**（`STATE_VERSION = 4`）：以下字段是 v4 MCP 成员上的**可选新增**，旧文档读取时
+> 补默认值，不需要迁移。本节只增补，不改写既有条目；与下文冲突处以本节为准。
+
+1. **MCP 成员新字段**（`mcp.<server>`）：
+
+   - `description`：面板展示与 discover 入口说明用的纯文本。必须是字符串、≤500 字符且不含
+     控制字符（`\u0000-\u001f`、`\u007f`）；`POST /mcp/config` 对含控制字符或超长的请求直接 400，
+     落盘前再 `cleanDescription`（trim、截断到上限）。缺失/空串合法。
+   - `disclosure`：`"full"`（默认，历史行为：工具一次性全部注入）或 `"progressive"`。读取时其它值
+     直接拒绝（`resource-pool/state-invalid-document`），不静默回退；`normalizeState` 的写入路径未知值按
+     `full`。
+   - `tools`：`Record<publicName, {enabled: boolean, modes: string[], workspaces: string[]}>`。
+     键必须匹配 `mcp__*` 且 ≤128 字符；`enabled` 必须是布尔值，`modes`/`workspaces` 必须是合法
+     字符串数组（工作区为绝对路径）。语义与成员条件相同：两个维度 AND、空=不限；服务条件与工具
+     条件是 AND。删除成员时其 `tools` 一起删除；条目非法时读取失败，不偷换成"全部允许"。
+     缺失 = 没有逐工具配置；显式 `{}` 保留为空配置。
+
+2. **读取、写入与投影**：旧文档无需迁移——缺失的 `description`/`tools` 按空处理，缺失的
+   `disclosure` 按 `full` 处理，且不会写回文件；`POST /item`、`POST /mcp/config`、`POST /mcp/tool`
+   的读-改-写都保留连接 `definition`、`description`、`disclosure` 与 `tools`（仅改动请求里的字段）。
+   所有带 `state` 的响应继续经公开投影：MCP 成员含 `enabled`、`modes`、`workspaces`、`description`、
+   `disclosure`、`tools`（每项深拷贝 `{enabled,modes,workspaces}`）与可选 `installedAt`，
+   **仍绝不包含 `definition`**。
+
+3. **渐进披露生效（`src/activation.js` / `src/disclosure.js`）**：
+   - `disclosure:"progressive"` 且 `settings.mcpGate !== false`、成员在当前 Agent 池内时，该服务的
+     `mcp__<server>__*` 业务工具在当前步被 progressive deny 层隐藏；每服务注册一个全局
+     `<server>_discover` 工具，`when({agent})` 只对**已激活且非保守**的 per-Agent 记录为真。
+   - discover 名字派生固定：服务名小写、`[^a-z0-9_]+` 折叠为 `_`、去首尾 `_`、追加 `_discover`；
+     结果为空、以数字开头或超过 64 字符时不注册并记警告，**不静默改名**；与已有工具冲突时同样跳过。
+   - discover 调用成功返回
+     `{ok:true, service, description, expanded:true, tools:[{name,summary}], hidden:{total,disabled,outOfScope,ambiguous}, nextStep}`；
+     返回体只含公共名与摘要，**不含**工具定义、URL、命令、headers/env。失败码是闭集：
+     `state-unavailable`、`not-in-pool`、`offline`（可选 `mcpManager` 报未连接）、
+     `tools-unavailable`、`no-tools`（含 `hidden` 计数）、`expand-failed`。
+   - 展开只释放**该 Agent、该服务**的 progressive deny 层；`pool` 层（池外）与 `tool` 层（逐接口
+     关闭/作用域不匹配）保留，展开不能解除用户拒绝。展开是 per-Agent 的**内存**状态，不持久化：
+     Host/插件重启、插件重载、会话恢复后需要重新 discover。A/B 两个 Agent 的展开互不影响。
+
+4. **全局 dispatch guard**：插件注册一个 `tools.guard`，对 `mcp__*` 按 per-Agent 激活记录判定，
+   原因闭集：`pool-not-activated`（无记录/未激活）、`tool-disabled`（逐接口关闭或作用域不匹配）、
+   `server-not-in-pool`（池外服务或歧义公共名）、`server-not-expanded`（progressive 未展开）、
+   `guard-error`（记录形状非法，fail-closed）。无 Agent 的调用不拦（没有记录可依）；`mcpGate:false`
+   只关池级与渐进层，逐接口拒绝仍然生效。guard 覆盖 `tools/change`/重连后新注册的公共名：在
+   deny 层按新工具清单重算之前，Schema 可能短时出现在下一步，但直接调用会被拒；下一次显式重放
+   （保存、preset 重放、插件重载）补齐 deny。它不覆盖 MCP resources、server instructions 或程序化
+   scoped 注册，不构成强安全边界。
+
+5. **新增路由（4 条，前缀 `/dsh-skill-pool`）**。写路由与既有写路由一致：先原子落盘、再
+   `reapplyAll()` 并同步 discover 注册，返回 200 + 公开 `state` + 可选脱敏 `warning`（已提交的写不回滚）；
+   读路由在状态不可读时 fail-closed（500）。
+
+   | 方法 | 路径 | 请求 | 响应 / 错误 |
+   |---|---|---|---|
+   | POST | `/mcp/config` | `{server, description?, disclosure?}` | `{ok,state,warning?}`；400 `resource-pool/bad-server` / `bad-description` / `bad-disclosure`；404 `resource-pool/unknown-server`。只改这两个字段，连接定义与 scope 保留。 |
+   | POST | `/mcp/tool` | `{server, tool, enabled?, modes?, workspaces?, clear?}` | `{ok,state,warning?}`；400 `resource-pool/bad-server` / `bad-tool` / `bad-scope`；404 `unknown-server`。新键必须能由 `mcp__<server>__*` 唯一归属（歧义/跨服务拒绝）；已存键允许工具暂时不在线时继续修改；`clear:true` 删除该键并恢复默认（其余字段忽略）。 |
+   | GET | `/mcp/tools?server=` | — | `{ok, server, description, disclosure, tools:[{name,summary,registered,config,ambiguous}]}`；404 `unknown-server`；500 `resource-pool/tools-unavailable`。`config` 为 `null` 或 `{enabled,modes,workspaces}`；已保存但当前不在线的历史条目也会列出（`registered:false`），只列可归属该服务的名字。 |
+   | POST | `/mcp/describe` | `{server, language?: 'zh'\|'en'}` | 成功 `{ok:true, description}`（**草稿，不落盘**，用户通过 `/mcp/config` 确认）；失败是**扁平** `{ok:false, error:<code>, message}`：`bad-server` 400、`unknown-server` 404、`offline` 503、`tools-unavailable` 500、`no-tools` 400、`no-default-model` 503、`no-llm` 503、`timeout` 504、`generate-failed` 502。输入只含可归属该服务的公共名与描述摘要；不发送 `definition`/凭据。 |
+
+
 ## 1. 产品模型
 
 **一个全局资源池 = 用户的资源库。** 没有"资源库 → 资源池"的两步搬运。

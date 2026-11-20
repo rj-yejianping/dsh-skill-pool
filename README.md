@@ -127,8 +127,8 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
 dsh plugin --profile web add dsh-skill-pool
 
 # 本地开发：先从源码目录打包，再装真实包
-npm pack                      # → dsh-skill-pool-0.3.8.tgz
-plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.8.tgz")
+npm pack                      # → dsh-skill-pool-0.5.0.tgz
+plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.5.0.tgz")
 ```
 
 > 不要用 `link:` / 软链安装：Host 在 profile 目录下按 importer 路径做包解析，
@@ -161,6 +161,9 @@ plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.3.8.
                           "modesFrom": "group", "workspacesFrom": "group",
                           "sourceId": "src_x", "digest": "sha256:…", "installedAt": "…" } },
   "mcp":    { "<server>": { "enabled": true, "modes": [], "workspaces": [],
+                             "description": "知识库",
+                             "disclosure": "full",   // "full" | "progressive"
+                             "tools": { "mcp__<server>__<raw>": { "enabled": true, "modes": [], "workspaces": [] } },
                              "definition": { "transport": "streamable-http", "url": "http://…/mcp", "headers": { "Authorization": "Bearer …" } } } },
   "sources": { "<id>": { "kind": "git|zip|files", "skills": ["<name>"], "excluded": ["<name>"],
                          "sha": "…", "lastCheck": { "status": "up-to-date" } } }
@@ -283,43 +286,91 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 没有 `definition` 的历史成员（0.3.5 及更早导入的）会被跳过，重新导入一次即补上。
 状态文件因此按 `0600` 写入——`definition.headers` 里可能有令牌。
 
+## MCP 渐进注入与逐接口开关（0.5.0）
+
+从 0.5.0 起，每个 MCP 成员多两个设置：`disclosure`（`full` 默认 / `progressive`）与面板用的
+`description`；每个已注册工具还可以用 `tools` 单独设开关与模式/工作区条件。
+
+- **渐进注入（progressive）**：模型在**当前步**只看到该服务的 `<server>_discover` 工具，看不到它的
+  业务工具 Schema。调用 discover 后，**下一步**才出现原来的公共名（`mcp__<server>__<raw>`），
+  并可直接调用。discover 返回名字、描述摘要与隐藏计数，**不含**工具定义、URL、命令、headers 或 env。
+- **逐接口开关**：`tools` 的每个条目与成员使用同一套 `{enabled, modes, workspaces}` 条件
+  （两个维度 AND、空=不限）；服务条件与工具条件是 AND。被关闭或作用域不匹配的工具在
+  **full 与 progressive 两种模式下都不出现**。展开只解除“渐进层”，**不会解除**逐工具的拒绝。
+- **dispatch 兜底**：插件注册一个全局 `tools.guard`。池外服务、未展开的 progressive 服务、
+  被逐接口关闭/作用域不匹配的工具，即使此刻还能在注册表里看到，直接调用也会在到达 MCP Server
+  之前被拒绝。展开是 **per-Agent 的内存状态**：两个 Agent 各自 discover 互不影响。
+- **只有工具 Schema 与调用受影响**：MCP resources（`list_mcp_resources` / `read_mcp_resource`）
+  与 server instructions 不受渐进/逐接口隐藏影响。可选 `mcpManager` 报该服务未连接时 discover
+  返回 `offline` 且不展开；没有 manager 或其条目时按注册表工具清单降级。
+
+### 已知边界
+
+1. 渐进只覆盖**工具 Schema 与调用**；MCP resources、server instructions 与服务端自身的其他访问路径
+   不受影响，也不构成安全隔离。
+2. 展开是 per-Agent 的**内存**状态：Host/插件重启、插件重载、会话恢复后都要重新 discover；
+   本插件不持久化展开状态。
+3. 动态注册窗口：连接/重连或 `tools/change` 后新出现的工具，在本次 deny 层重算之前**可能短时
+   出现在下一步的 Schema 里**（本仓库不声称“Schema 从未出现”）；期间直接调用由全局 guard 拒绝。
+   下一次显式重放（保存、preset 重放、插件重载）会按当时的工具清单补齐 deny。
+4. 离线服务的残留旧 Schema 不会被当成在线目录（有 `mcpManager` 时优先判离线）；本插件不清理
+   残留 Schema，也不把旧目录当成功。
+5. 面板与 discover 都不暴露 `definition`（URL/命令/headers/env）；MCP 仍不是强安全边界，详见「已知限制」。
+
+### English summary
+
+Progressive disclosure exposes only one `<server>_discover` entry per MCP service in the model step;
+calling it reveals that service's original tool names on the *next* step. Per-tool switches and scopes
+(`tools`) apply in both full and progressive modes and are never lifted by expansion. A global
+dispatch-time guard refuses direct calls to out-of-pool, unexpanded, switched-off or out-of-scope
+tools, including a tool registered through `tools/change` until the next re-apply. Only tool schemas
+and calls are hidden: MCP resources and server instructions are unaffected. Expansion is per-Agent,
+in-memory, and lost on restart/reload, so the Agent must discover again. This repository claims no
+token or latency savings; its probes verify behaviour only.
+
 ## MCP 可行性验证（发布门禁）
 
-MCP 工具披露与开关所依赖的宿主能力**不由普通单测证明**。普通套件（`npm test`，161 个可移植测试）
-不需要安装 DSH；宿主探针 `test/mcp-feasibility.probe.mjs` 共 21 项，直接驱动**已安装**的 DSH
+MCP 工具披露、渐进注入与逐接口开关所依赖的宿主能力**不由普通单测证明**。普通套件
+（`npm test`，239 个可移植测试）不需要安装 DSH；两个宿主探针直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
-`DSH_FEASIBILITY_ROOT` 指向别的安装树）。
+`DSH_FEASIBILITY_ROOT` 指向别的安装树）：
+
+- `test/mcp-feasibility.probe.mjs`：21 项 MCP 身份/作用域/关机/披露通道能力；
+- `test/mcp-progressive.probe.mjs`：7 项渐进注入/逐接口/guard/动态注册/重载行为。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 161/161；不代表宿主能力已验证 |
-| `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 5/5；不是宿主能力门禁 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 239/239；不代表宿主能力已验证 |
+| `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 10/10；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:activation` | 真实 ToolsService + production activation 探针（零层/竞态/多 agent/scope-local/over） | 当前环境 7/7；不是宿主能力门禁 |
-| `npm run test:feasibility` | 可选探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
+| `npm run test:feasibility` | 可选宿主探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
 | `npm run verify:feasibility` | **发布或能力声明的强制门禁**（Node 包装器，POSIX/Windows 通用） | 缺失、版本不符或任一探针失败均非零退出 |
+| `npm run test:progressive` | 可选渐进注入/逐接口/guard 宿主探针 | 运行时缺失/版本不符时**逐项 `unverified` 并跳过，退出码 0** |
+| `npm run verify:progressive` | **渐进披露能力的强制门禁**（同一 Node 包装器） | 缺失、版本不符或任一探针失败均非零退出 |
 
-> `test:feasibility` 的绿色或跳过**不能**当成能力证据。发布前必须运行
-> `npm run verify:feasibility`；通过表示 21/21 在当前安装的真实运行时通过。
-> 21 项里包含刻意固定 **OBSERVED FAIL** 的检查：它们通过只说明已知缺陷仍可复现，不代表该能力可用。
-> 实测结论与未测项见 `docs/mcp-feasibility-results.md`。
+> `test:feasibility` / `test:progressive` 的绿色或跳过**不能**当成能力证据。发布前必须运行
+> `npm run verify:feasibility` 与 `npm run verify:progressive`；通过分别表示 21/21 与 7/7 在当前安装的
+> 真实运行时通过。可行性探针里包含刻意固定 **OBSERVED FAIL** 的检查：它们通过只说明已知缺陷仍可复现，
+> 不代表该能力可用。渐进探针不声称“新注册的 Schema 从未出现”：动态注册检查明确记录窗口并验证
+> 直接调用被 guard 拒绝。实测结论与未测项见 `docs/mcp-feasibility-results.md`。
 
 探针只使用临时目录和受控 MCP 子进程：不加载用户 profile、不写用户状态、不访问 OpenViking，
 不需要真实凭据。
 
 ## 已知限制
 
-- **MCP 只有 Server 级门控**：**没有**单工具开关（界面开关 / per-tool switch），也**没有** MCP
-  渐进披露（按服务按需展开）。任务 4/5 在本版本**未实现**，不是隐藏的实验开关。
-- 现有可行性证据不支持上述能力：当前代 public 名称无法可靠反查 server/raw（`mcpServerOf`
-  按第一个 `__` 解析，合法服务名本身含 `__` 时可能把工具归到错误的 Server）。现在对
-  **有歧义的 `mcp__*` 名一律 deny**（`isAmbiguousMcpToolName`），包括重叠分隔符
-  （`mcp__a___b`）和宿主因截断/字符规范化附加 `_<12 hex>` 哈希的名字；mount readiness 与
-  inventory 也不再把这些名字归到前缀 server。代价是合法 server/raw 名本身含 `__` 的工具也会被
-  隐藏，面板的 MCP 工具列表也不会把它们归到某个 server（无法安全归属）。动态新增工具仍可绕过
-  静态 deny 名单；
-  隐藏业务工具不影响 MCP resources 与 server instructions；断线后 schema/提示可能陈旧。
+- **MCP 仍不是强安全边界**：Server 级门控、可选的渐进披露与逐接口开关只作用于模型的工具
+  Schema 与调用；MCP resources、server instructions、程序化注册的 scoped/隐藏服务与服务端自身
+  的其他访问路径不受覆盖。动态新增/重连后的工具在 deny 层重算前可能短时出现在下一步
+  （直接调用由全局 guard 拒绝），展开是 per-Agent 内存状态，重启/重载后需重新 discover。
+  详见上一节「已知边界」。
+- 当前代 public 名称无法可靠反查 server/raw（`mcpServerOf` 按第一个 `__` 解析，合法服务名本身含
+  `__` 时可能把工具归到错误的 Server）。因此对 **有歧义的 `mcp__*` 名一律 deny**
+  （`isAmbiguousMcpToolName`），包括重叠分隔符（`mcp__a___b`）和宿主因截断/字符规范化附加
+  `_<12 hex>` 哈希的名字；mount readiness、inventory 与 `/mcp/tools` 也不会把这些名字安全归属到
+  某个 server。代价是合法 server/raw 名本身含 `__` 的工具也会被隐藏。断线后 schema/提示可能陈旧。
   这不是全面的 MCP 隔离证明。详见 `docs/mcp-feasibility-results.md`。
 - **状态 fail-closed 只解决"损坏状态被当成空池"这一条**：新 Agent 在状态不可读时会被拒绝创建，
   已有 Agent 保留旧限制（没有旧层时退化为拒绝当时可见 MCP 工具的保守层；若随后工具列表
@@ -348,6 +399,8 @@ npm run test:lifecycle      # index.js 生命周期/恢复/保守回退探针（
 npm run test:naming         # 真实 publicToolName 歧义/截断哈希探针（需要 DSH）
 npm run test:restrict       # 真实 tools.restrict 注册/卸载/重注册探针（需要 DSH）
 npm run test:activation     # 真实 ToolsService + activation 零层/竞态/多 agent 探针（需要 DSH）
+npm run test:progressive    # 渐进注入/逐接口/guard/动态注册/重载探针；缺失运行时会跳过
+npm run verify:progressive  # 强制渐进披露门禁：缺失/版本不符/失败均非零退出
 node test-persisted-mcp.mjs # MCP 定义持久化/重挂载检查
 ```
 
