@@ -364,6 +364,7 @@ test('describe aborts the model stream when generation times out', async () => {
   assert.equal(payload.error, 'timeout')
   assert.equal(aborted, true, 'the route aborted the request instead of leaving it hanging')
   assert.equal(signal.aborted, true)
+  for (let tick = 0; tick < 100 && !closed; tick += 1) await new Promise((resolve) => setImmediate(resolve))
   assert.equal(closed, true, 'the route closed the abandoned stream')
 })
 
@@ -372,6 +373,11 @@ test('describe cancels generation when the panel request is aborted', async () =
   let entered = false
   let closed = false
   let signal
+  /** Resolves once the route has actually reached the fake stream. */
+  let markEntered
+  const reachedStream = new Promise((resolve) => {
+    markEntered = resolve
+  })
   const llm = {
     stream: (options) => {
       signal = options.signal
@@ -380,6 +386,7 @@ test('describe cancels generation when the panel request is aborted', async () =
           try {
             yield { type: 'text-delta', text: '半' }
             entered = true
+            markEntered()
             await new Promise((resolve) => {
               if (options.signal.aborted) resolve()
               else options.signal.addEventListener('abort', resolve, { once: true })
@@ -394,7 +401,17 @@ test('describe cancels generation when the panel request is aborted', async () =
   }
   const result = await withApi({ llm, selection: { provider: 'p', model: 'm' } }, async (api) => {
     const pending = api.describe({ server: 'alpha' }, { signal: controller.signal })
-    for (let tick = 0; tick < 100 && !entered; tick += 1) await new Promise((resolve) => setImmediate(resolve))
+    // Wait for the route to reach the stream instead of guessing a tick count:
+    // a loaded parallel suite can delay the state read. The guard keeps a real
+    // regression from hanging this test.
+    let guard
+    await Promise.race([
+      reachedStream,
+      new Promise((resolve) => {
+        guard = setTimeout(resolve, 5000)
+      }),
+    ])
+    clearTimeout(guard)
     assert.equal(entered, true, 'the request reached the model before the client aborted')
     controller.abort()
     return pending
