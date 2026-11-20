@@ -516,6 +516,13 @@ window.__ModuleLoader__.load({
     const SKILL = 'skill'
     const MCP = 'mcp'
     const ITEM_DEBOUNCE_MS = 320
+    const ROW_DRAFT_KEYS = Object.freeze([
+      'enabled',
+      'modes',
+      'workspaces',
+      'modesFrom',
+      'workspacesFrom',
+    ])
     // Mirrors the Host's limits so the panel can stop an invalid draft before
     // it reaches a route that would reject it with 400.
     const MCP_DESCRIPTION_LIMIT = 500
@@ -646,6 +653,17 @@ window.__ModuleLoader__.load({
       return text.length > 10 ? text.slice(0, 8) + '…' : text
     }
 
+    /**
+     * Strip the characters the `/mcp/config` route rejects (C0 controls and DEL)
+     * before a draft is shown or sent. The textarea must never hand the Host a
+     * value it will answer with 400, including pasted multi-line text.
+     */
+    function cleanPanelDescription(raw) {
+      return asString(raw)
+        .replace(/[\u0000-\u001f\u007f]/g, '')
+        .slice(0, MCP_DESCRIPTION_LIMIT)
+    }
+
     /** Normalize one per-tool scope, defaulting to enabled/unrestricted. */
     function normalizeToolScope(raw) {
       const source = asObject(raw)
@@ -673,6 +691,22 @@ window.__ModuleLoader__.load({
       return out
     }
 
+    /**
+     * Scope-only projection of a member. Row drafts carry exactly these keys:
+     * copying the whole entry would let an unsaved scope draft restore stale
+     * `description`/`disclosure`/`tools` over newer saved values on a reload.
+     */
+    function rowDraftOf(raw) {
+      const source = asObject(raw)
+      return {
+        enabled: source.enabled !== false,
+        modes: asStringArray(source.modes),
+        workspaces: uniqueStrings(asArray(source.workspaces).map(normalizePath)),
+        modesFrom: asString(source.modesFrom) === 'self' ? 'self' : 'group',
+        workspacesFrom: asString(source.workspacesFrom) === 'self' ? 'self' : 'group',
+      }
+    }
+
     function blankEntry() {
       return {
         enabled: true,
@@ -692,15 +726,11 @@ window.__ModuleLoader__.load({
     function normalizeEntry(raw) {
       const source = asObject(raw)
       const entry = {
-        enabled: source.enabled !== false,
-        modes: asStringArray(source.modes),
-        workspaces: uniqueStrings(asArray(source.workspaces).map(normalizePath)),
-        modesFrom: asString(source.modesFrom) === 'self' ? 'self' : 'group',
-        workspacesFrom: asString(source.workspacesFrom) === 'self' ? 'self' : 'group',
+        ...rowDraftOf(source),
         sourceId: asString(source.sourceId),
         digest: asString(source.digest),
         installedAt: asString(source.installedAt),
-        description: asString(source.description).slice(0, MCP_DESCRIPTION_LIMIT),
+        description: cleanPanelDescription(source.description),
         disclosure: source.disclosure === 'progressive' ? 'progressive' : 'full',
         tools: normalizeMcpTools(source.tools),
       }
@@ -739,6 +769,27 @@ window.__ModuleLoader__.load({
         modes: scope.modes,
         workspaces: scope.workspaces,
       }
+    }
+
+    /**
+     * Remove the config fields a completed save wrote from the local draft map.
+     *
+     * A request carries only the fields the user changed; deleting the whole
+     * server entry would throw away a newer draft that was never sent (for
+     * example an AI-generated description followed by an injection-mode save).
+     * A field still queued or holding a newer local value is kept.
+     */
+    function configDraftAfterSave(draft, patch, queued) {
+      const source = asObject(draft)
+      const sent = asObject(patch)
+      const waiting = asObject(queued)
+      const out = { ...source }
+      for (const key of ['description', 'disclosure']) {
+        if (sent[key] === undefined) continue
+        if (waiting[key] !== undefined) continue
+        if (Object.hasOwn(out, key) && out[key] === sent[key]) delete out[key]
+      }
+      return out
     }
 
     /**
@@ -1108,7 +1159,15 @@ window.__ModuleLoader__.load({
         // Never resurrect a member the authoritative document no longer has:
         // another tab may have deleted it while this draft was being typed.
         if (!hasLoadedMember(loadedState, key)) continue
-        next = withEntry(next, row.kind, row.name, entry)
+        const bucket = row.kind === MCP ? next.mcp : next.skills
+        const loaded = bucket[row.name] || {}
+        // A row draft owns the scope only; never let it roll back MCP display or
+        // per-tool fields that a newer save may have written.
+        const patch = {}
+        for (const field of ROW_DRAFT_KEYS) {
+          if (Object.hasOwn(entry, field)) patch[field] = entry[field]
+        }
+        next = withEntry(next, row.kind, row.name, { ...loaded, ...patch })
       }
       return next
     }
@@ -2509,7 +2568,12 @@ window.__ModuleLoader__.load({
       }, [])
 
       const setRowError = useCallback((key, message) => {
-        setRowErrors((current) => ({ ...current, [key]: message }))
+        setRowErrors((current) => {
+          // A superseded failure still has to surface; only an identical message
+          // is deduped, never dropped because a newer request exists.
+          if (current[key] === message) return current
+          return { ...current, [key]: message }
+        })
       }, [])
 
       const clearRowError = useCallback((key) => {
@@ -2650,6 +2714,16 @@ window.__ModuleLoader__.load({
               if (!mounted.current) return
               surfaceWarning(payload)
               boardRevisionRef.current += 1
+              // Drop only the fields this request carried. A description that
+              // arrived later (an AI draft, or a queued edit) must survive an
+              // injection-mode save; a field still queued stays a draft too.
+              const remaining = configDraftAfterSave(
+                configDraftsRef.current.get(server),
+                patch,
+                configQueueRef.current.get(server),
+              )
+              if (Object.keys(remaining).length === 0) configDraftsRef.current.delete(server)
+              else configDraftsRef.current.set(server, remaining)
               const currentSequence = configSeqRef.current.get(server) ?? 0
               if (currentSequence !== sequence) return
               const canonical = payload.state ? normalizeState(payload.state).mcp[server] : undefined
@@ -2664,16 +2738,13 @@ window.__ModuleLoader__.load({
                   return { ...current, state: withEntry(current.state, MCP, server, next) }
                 })
               }
-              if (!configQueueRef.current.has(server)) {
-                configDraftsRef.current.delete(server)
-                clearRowError(`mcp-config:${server}`)
-              }
+              if (!configQueueRef.current.has(server)) clearRowError(`mcp-config:${server}`)
             } catch (cause) {
               // Keep the optimistic value and its draft: an inline error means the
-              // user can retry, never that the text silently vanished.
-              if (mounted.current && (configSeqRef.current.get(server) ?? 0) === sequence) {
-                setRowError(`mcp-config:${server}`, messageOf(cause))
-              }
+              // user can retry, never that the text silently vanished. A failure
+              // whose edit was superseded still surfaces (an identical message is
+              // deduped by setRowError) instead of vanishing with its sequence.
+              if (mounted.current) setRowError(`mcp-config:${server}`, messageOf(cause))
             } finally {
               if (
                 mounted.current &&
@@ -3086,7 +3157,6 @@ window.__ModuleLoader__.load({
               summary: asString(item.summary),
               registered: item.registered !== false,
               ambiguous: item.ambiguous === true,
-              config: item.config && typeof item.config === 'object' ? normalizeToolScope(item.config) : null,
             })
           }
           setMcpToolCatalog((current) => ({
@@ -3241,7 +3311,10 @@ window.__ModuleLoader__.load({
             kind === MCP
               ? boardRef.current && boardRef.current.state.mcp[name]
               : boardRef.current && boardRef.current.state.skills[name]
-          const base = draft || source || blankEntry()
+          const base = rowDraftOf(draft || source || blankEntry())
+          // Scope only. MCP display/tool fields are owned by their own queues and
+          // must never be snapshotted into a scope draft (a reload would restore
+          // them over values saved afterwards).
           const next = {
             ...base,
             enabled: typeof patch.enabled === 'boolean' ? patch.enabled : base.enabled,
@@ -3257,7 +3330,14 @@ window.__ModuleLoader__.load({
                 : base.workspacesFrom,
           }
           draftsRef.current.set(key, next)
-          setBoard((current) => (current ? { ...current, state: withEntry(current.state, kind, name, next) } : current))
+          setBoard((current) => {
+            if (!current) return current
+            const member = (kind === MCP ? current.state.mcp[name] : current.state.skills[name]) || {}
+            return {
+              ...current,
+              state: withEntry(current.state, kind, name, { ...member, ...next }),
+            }
+          })
           clearRowError(key)
           queueItem(kind, name, next)
         },
@@ -3270,7 +3350,7 @@ window.__ModuleLoader__.load({
           const source = asObject(patch)
           const changes = {}
           if (source.description !== undefined) {
-            changes.description = asString(source.description).slice(0, MCP_DESCRIPTION_LIMIT)
+            changes.description = cleanPanelDescription(source.description)
           }
           if (source.disclosure !== undefined) {
             changes.disclosure = source.disclosure === 'progressive' ? 'progressive' : 'full'
@@ -3289,7 +3369,7 @@ window.__ModuleLoader__.load({
       const applyMcpDescriptionDraft = useCallback(
         (server, text) => {
           const name = asString(server)
-          const value = asString(text).slice(0, MCP_DESCRIPTION_LIMIT)
+          const value = cleanPanelDescription(text)
           if (name.length === 0 || removingRef.current.has(`mcp:${name}`)) return
           // The generated text is a newer local edit than any request already in
           // flight; bumping the sequence stops that response from overwriting it.
@@ -3318,7 +3398,7 @@ window.__ModuleLoader__.load({
           const name = asString(server)
           const busyKey = 'mcp-describe:' + name
           setBusyKey(busyKey, true)
-          clearRowError('mcp-config:' + name)
+          clearRowError(busyKey)
           try {
             const payload = await request(`${API}/mcp/describe`, {
               method: 'POST',
@@ -3330,7 +3410,7 @@ window.__ModuleLoader__.load({
             applyMcpDescriptionDraft(name, text)
           } catch (cause) {
             if (mounted.current) {
-              setRowError('mcp-config:' + name, `${TEXT.mcpDescribeFailed}: ${messageOf(cause)}`)
+              setRowError(busyKey, `${TEXT.mcpDescribeFailed}: ${messageOf(cause)}`)
             }
           } finally {
             if (mounted.current) setBusyKey(busyKey, false)
@@ -3994,7 +4074,30 @@ window.__ModuleLoader__.load({
               'div',
               { style: S.rowActions },
               ambiguous
-                ? null
+                ? [
+                    // The Host refuses to save this name (checkbox stays dead),
+                    // but clearing a stored config has no attribution check and
+                    // must remain possible or the entry becomes uncleanable.
+                    h(Toggle, {
+                      key: 'enabled',
+                      checked: config.enabled === true,
+                      disabled: true,
+                      label: name,
+                      title: TEXT.mcpToolAmbiguous,
+                    }),
+                    configured
+                      ? h(
+                          'button',
+                          {
+                            key: 'clear',
+                            type: 'button',
+                            style: S.ghostDanger,
+                            onClick: () => clearMcpTool(server, name),
+                          },
+                          TEXT.mcpToolClear,
+                        )
+                      : null,
+                  ]
                 : [
                     h(
                       'span',
@@ -4173,9 +4276,10 @@ window.__ModuleLoader__.load({
 
       /** Purpose description, injection mode and per-tool rows of one MCP member. */
       function renderMcpConfig(server, entry) {
-        const description = asString(entry.description)
+        const description = cleanPanelDescription(entry.description)
         const progressive = entry.disclosure === 'progressive'
         const describeBusy = isBusy('mcp-describe:' + server)
+        const describeError = rowErrors[`mcp-describe:${server}`]
         const configError = rowErrors[`mcp-config:${server}`]
         const configSaving = saving[`mcp-config:${server}`] === true
         const modeLabel = progressive ? TEXT.mcpInjectProgressive : TEXT.mcpInjectFull
@@ -4213,6 +4317,9 @@ window.__ModuleLoader__.load({
               ),
             ),
           ),
+          // Generation and saving have separate failures; one must not hide the
+          // other when they happen close together.
+          describeError ? h('div', { style: SX.inlineError, role: 'alert' }, describeError) : null,
           configError ? h('div', { style: SX.inlineError, role: 'alert' }, configError) : null,
           h(
             'div',
@@ -4361,7 +4468,6 @@ window.__ModuleLoader__.load({
               ),
             ),
           ),
-          isMcp ? renderMcpConfig(name, entry) : null,
           confirming
             ? h(
                 'div',
@@ -4385,6 +4491,9 @@ window.__ModuleLoader__.load({
               )
             : null,
           open ? renderCondEditor(kind, name, entry) : null,
+          // The new MCP block goes after the existing row actions and condition
+          // editor so clicking 删除 / Modes still changes something adjacent.
+          isMcp ? renderMcpConfig(name, entry) : null,
           rowErrors[key] ? h('div', { style: SX.rowError, role: 'alert' }, rowErrors[key]) : null,
         )
       }
@@ -5626,6 +5735,8 @@ window.__ModuleLoader__.load({
         normalizeEntry,
         normalizeMcpTools,
         buildToolSaveBody,
+        rowDraftOf,
+        configDraftAfterSave,
         failureTextOf,
         activationWarningOf,
         mergeActivationWarning,
