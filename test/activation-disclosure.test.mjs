@@ -15,8 +15,8 @@ const baseState = (over = {}) => ({
   },
 })
 
-function harness(state) {
-  const schemas = [
+function harness(state, overrides = {}) {
+  let schemas = [
     { name: 'read', description: 'read a file' },
     { name: 'mcp__alpha__search', description: 'search' },
     { name: 'mcp__alpha__read', description: 'read doc' },
@@ -41,8 +41,18 @@ function harness(state) {
     on: () => {},
     logger: { warn() {}, debug() {}, info() {} },
   }
-  const activation = createActivation({ ctx, getState: async () => state, logger: ctx.logger })
-  return { activation, layers, tools, getGuard: () => guard }
+  const activation = createActivation({
+    ctx,
+    getState: overrides.getState ?? (async () => state),
+    logger: ctx.logger,
+  })
+  return {
+    activation,
+    layers,
+    tools,
+    setSchemas: (next) => { schemas = next },
+    getGuard: () => guard,
+  }
 }
 
 const agentOf = (id, tools) => ({
@@ -110,4 +120,146 @@ test('the global guard rejects unexpanded, then allows after expansion', async (
 test('an agent with no activation record is denied by the global guard', () => {
   const h = harness(baseState())
   assert.equal(h.getGuard()({ name: 'mcp__beta__echo', agent: agentOf('cold', h.tools) }), 'pool-not-activated')
+})
+
+test('per-tool switches still apply when the MCP gate is off', async () => {
+  const state = baseState({
+    beta: {
+      enabled: true, modes: [], workspaces: [], disclosure: 'full',
+      tools: { 'mcp__beta__echo': { enabled: false, modes: [], workspaces: [] } },
+    },
+  })
+  state.settings.mcpGate = false
+  const h = harness(state)
+  const agent = agentOf('a1', h.tools)
+  await h.activation.applyToAgent(agent)
+  const denied = h.layers.filter((l) => l.active).flatMap((l) => l.filter.deny)
+  assert.ok(denied.includes('mcp__beta__echo'), 'a user refusal is not a pool gate')
+  assert.equal(h.activation.recordOf(agent).gateMcp, false)
+  assert.equal(h.getGuard()({ name: 'mcp__beta__echo', agent }), 'tool-disabled')
+  // Gate off still means no pool-level hiding, progressive services included.
+  assert.ok(!denied.includes('mcp__alpha__search'))
+  assert.equal(h.getGuard()({ name: 'mcp__hidden__x', agent }), undefined)
+})
+
+test('a transient empty MCP surface keeps the per-tool guard snapshot', async () => {
+  const h = harness(baseState({
+    beta: {
+      enabled: true, modes: [], workspaces: [], disclosure: 'full',
+      tools: { 'mcp__beta__echo': { enabled: false, modes: [], workspaces: [] } },
+    },
+  }))
+  const agent = agentOf('a1', h.tools)
+  await h.activation.applyToAgent(agent)
+  assert.equal(h.getGuard()({ name: 'mcp__beta__echo', agent }), 'tool-disabled')
+  // A host generation change: no MCP tool is visible right now. The old deny
+  // layers are retained, so their names must stay refused by the guard.
+  h.setSchemas([{ name: 'read', description: 'read a file' }])
+  await h.activation.applyToAgent(agent, { force: true })
+  assert.equal(h.getGuard()({ name: 'mcp__beta__echo', agent }), 'tool-disabled')
+  assert.equal(h.activation.recordOf(agent).toolDenied.has('mcp__beta__echo'), true)
+})
+
+test('the conservative deny is guard-backed for every visible MCP name', async () => {
+  const h = harness(baseState(), {
+    getState: async () => { throw new Error('synthetic unreadable state') },
+  })
+  const agent = agentOf('a1', h.tools)
+  const result = await h.activation.applyToAgent(agent, { conservative: true })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'resource-pool/activation-conservative')
+  const record = h.activation.recordOf(agent)
+  assert.deepEqual([...record.toolDenied].sort(), [
+    'mcp__alpha__read',
+    'mcp__alpha__search',
+    'mcp__beta__echo',
+    'mcp__hidden__x',
+  ])
+  assert.equal(h.getGuard()({ name: 'mcp__beta__echo', agent }), 'tool-disabled')
+})
+
+test('expansion is per Agent: A expands while B stays unexpanded', async () => {
+  const h = harness(baseState())
+  const a = agentOf('a1', h.tools)
+  const b = agentOf('b1', h.tools)
+  await h.activation.applyToAgent(a)
+  await h.activation.applyToAgent(b)
+  assert.equal(h.activation.expandService(a, 'alpha').ok, true)
+  const guard = h.getGuard()
+  assert.equal(guard({ name: 'mcp__alpha__search', agent: a }), undefined)
+  assert.equal(guard({ name: 'mcp__alpha__search', agent: b }), 'server-not-expanded')
+  assert.deepEqual(h.activation.recordOf(a).expandedServers, new Set(['alpha']))
+  assert.deepEqual(h.activation.recordOf(b).expandedServers, new Set())
+})
+
+test('expanding a service does not lift a per-tool refusal', async () => {
+  const h = harness(baseState({
+    alpha: {
+      enabled: true, modes: [], workspaces: [], disclosure: 'progressive',
+      tools: { 'mcp__alpha__read': { enabled: false, modes: [], workspaces: [] } },
+    },
+  }))
+  const agent = agentOf('a1', h.tools)
+  await h.activation.applyToAgent(agent)
+  const readLayer = h.layers.find((layer) => layer.active && layer.filter.deny.includes('mcp__alpha__read'))
+  assert.ok(readLayer, 'the disabled tool has its own tool-reason layer')
+  assert.deepEqual(h.activation.recordOf(agent).toolDenied, new Set(['mcp__alpha__read']))
+
+  assert.equal(h.activation.expandService(agent, 'alpha').ok, true)
+  const denied = h.layers.filter((l) => l.active).flatMap((l) => l.filter.deny)
+  assert.ok(denied.includes('mcp__alpha__read'), 'the tool layer survives expansion')
+  assert.ok(!denied.includes('mcp__alpha__search'), 'the progressive layer is lifted')
+  assert.equal(h.getGuard()({ name: 'mcp__alpha__read', agent }), 'tool-disabled')
+})
+
+test('expansion survives a re-apply and is dropped when the service leaves progressive mode', async () => {
+  const state = baseState()
+  const h = harness(state)
+  const agent = agentOf('a1', h.tools)
+  await h.activation.applyToAgent(agent)
+  assert.equal(h.activation.expandService(agent, 'alpha').ok, true)
+  await h.activation.applyToAgent(agent, { force: true })
+  assert.deepEqual(h.activation.recordOf(agent).expandedServers, new Set(['alpha']))
+  assert.equal(h.getGuard()({ name: 'mcp__alpha__search', agent }), undefined)
+  assert.ok(!h.layers.filter((l) => l.active).flatMap((l) => l.filter.deny).includes('mcp__alpha__search'))
+  assert.equal(state.mcp.alpha.disclosure, 'progressive')
+
+  // Switched back to full injection: the expansion fact is dropped.
+  state.mcp.alpha.disclosure = 'full'
+  await h.activation.applyToAgent(agent, { force: true })
+  assert.deepEqual(h.activation.recordOf(agent).expandedServers, new Set())
+
+  // Moved out of the Agent's pool: the expansion fact is dropped again.
+  state.mcp.alpha.disclosure = 'progressive'
+  await h.activation.applyToAgent(agent, { force: true })
+  assert.equal(h.activation.expandService(agent, 'alpha').ok, true)
+  state.mcp.alpha.modes = ['fleet']
+  await h.activation.applyToAgent(agent, { force: true })
+  assert.deepEqual(h.activation.recordOf(agent).expandedServers, new Set())
+  assert.equal(h.getGuard()({ name: 'mcp__alpha__search', agent }), 'server-not-in-pool')
+})
+
+test('service scope and tool scope are ANDed', async () => {
+  const h = harness(baseState({
+    beta: {
+      enabled: true, modes: ['standard'], workspaces: [], disclosure: 'full',
+      tools: { 'mcp__beta__echo': { enabled: true, modes: ['fleet'], workspaces: [] } },
+    },
+  }))
+  const agent = agentOf('a1', h.tools)
+  await h.activation.applyToAgent(agent)
+  const denied = h.layers.filter((l) => l.active).flatMap((l) => l.filter.deny)
+  assert.ok(denied.includes('mcp__beta__echo'), 'service scope matches, tool scope does not')
+  assert.equal(h.getGuard()({ name: 'mcp__beta__echo', agent }), 'tool-disabled')
+})
+
+test('expandService refuses while the MCP gate is off', async () => {
+  const state = baseState()
+  state.settings.mcpGate = false
+  const h = harness(state)
+  const agent = agentOf('a1', h.tools)
+  await h.activation.applyToAgent(agent)
+  assert.deepEqual(h.activation.expandService(agent, 'alpha'), { ok: false, error: 'not-in-pool' })
+  assert.deepEqual(h.activation.recordOf(agent).expandedServers, new Set())
+  assert.equal(h.getGuard()({ name: 'mcp__alpha__search', agent }), undefined)
 })

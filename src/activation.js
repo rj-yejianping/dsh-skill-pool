@@ -402,6 +402,9 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
       record.conservative = true
       record.degraded = over
       record.underRestricted = false
+      // Keep the previous per-tool snapshot: those layers are retained, so
+      // their names must stay refused at dispatch too. Nothing new is visible.
+      if (!(record.toolDenied instanceof Set)) record.toolDenied = new Set()
       logger?.warn?.('[resource-pool] state unavailable; no visible MCP tools, kept previous conservative deny')
       return { visible: 0, failed: 0, under: false, over, kept: record.disposers.length > 0 }
     }
@@ -477,6 +480,9 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
       record.degraded = over
       const under = failedNames.some((name) => !oldCoverage.has(name))
       record.underRestricted = under
+      // State is unreadable, so deny every MCP name that is visible right now at
+      // dispatch as well: the guard must not answer from the last good snapshot.
+      record.toolDenied = new Set(visible)
       logger?.warn?.(
         failedNames.length > 0
           ? `[resource-pool] state unavailable; conservative MCP deny is incomplete (${failedNames.length} failed)`
@@ -546,6 +552,9 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
     // which for a per-Agent provider means "admit the whole library".
     const libraryNames = Object.keys(state.skills ?? {}).sort()
     const allowed = settings.enabled === false ? libraryNames : pool.skills
+    // Master switch off means "never gate a session", per-tool MCP switches
+    // included. `mcpGate` off is narrower: it only stops pool-level hiding.
+    const poolEnabled = settings.enabled !== false
 
     // ---- MCP gate facts snapshotted into the record for the global guard.
     // The record, not the live document, decides every dispatch: it must stay
@@ -578,6 +587,12 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
     let toolDenied = new Set()
     let observedMcp = 0
     const visibleMcpNames = []
+    let ambiguous = 0
+    // The gate needs the tool surface to hide pool/progressive names. The
+    // per-tool switches need it too but are independent of the gate, so a
+    // gate-off document still reads it: only pool-level hiding is off then,
+    // never a user's explicit per-tool refusal.
+    let schemas
     if (pool.gateMcp) {
       // A missing/unreadable global tool surface is not "nothing to hide": it
       // means the MCP gate cannot be established. Treat it as an activation
@@ -585,50 +600,59 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
       if (tools === undefined || typeof tools.schemas !== 'function') {
         throw new Error('MCP gate is required but the global tools service is unavailable')
       }
-      let schemas
       try {
         schemas = tools.schemas()
       } catch (error) {
         throw new Error('MCP gate is required but the global tool list could not be read', { cause: error })
       }
       if (!Array.isArray(schemas)) throw new Error('MCP gate is required but the global tool list is not an array')
-      let ambiguous = 0
-      for (const schema of schemas) {
-        const name = schema?.name
-        if (typeof name !== 'string' || !name.startsWith(MCP_TOOL_PREFIX)) continue
-        observedMcp += 1
-        visibleMcpNames.push(name)
-        if (isAmbiguousMcpToolName(name)) {
-          // The public name cannot be attributed to one server; deny rather than
-          // allow by a prefix that an external server could share.
-          ambiguous += 1
-          denyPlan.push({ name, reason: 'pool', service: mcpServerOf(name) })
-          continue
-        }
-        const server = mcpServerOf(name)
-        if (!allowedServers.has(server)) {
-          denyPlan.push({ name, reason: 'pool', service: server })
-          continue
-        }
-        // A per-tool switch or scope is a user decision and applies in both
-        // disclosure modes, so it is evaluated before the progressive layer.
-        // A configured tool that is both switched off and unexpanded keeps the
-        // `'tool'` reason: expansion must never lift a user's explicit refusal.
-        const toolConfig = state.mcp?.[server]?.tools?.[name]
-        if (toolConfig !== undefined && toolActive(toolConfig, { mode, cwd }) === false) {
-          denyPlan.push({ name, reason: 'tool', service: server })
-          continue
-        }
-        // A progressive service stays hidden until this Agent expands it.
-        if (progressiveServers.has(server) && !expandedServers.has(server)) {
-          denyPlan.push({ name, reason: 'progressive', service: server })
-        }
+    } else if (poolEnabled && tools !== undefined && typeof tools.schemas === 'function') {
+      try {
+        const listed = tools.schemas()
+        if (Array.isArray(listed)) schemas = listed
+      } catch {
+        // Gate off: losing the tool surface cannot fail this activation. Old
+        // per-tool layers are retained below, so this does not open the gate.
       }
-      denyMcp = denyPlan.map((entry) => entry.name)
-      toolDenied = new Set(denyPlan.filter((entry) => entry.reason === 'tool').map((entry) => entry.name))
-      if (ambiguous > 0) {
-        logger?.warn?.(`[resource-pool] denied ${ambiguous} ambiguous MCP tool name${ambiguous === 1 ? '' : 's'} to avoid cross-server prefix allow`)
+    }
+    for (const schema of schemas ?? []) {
+      const name = schema?.name
+      if (typeof name !== 'string' || !name.startsWith(MCP_TOOL_PREFIX)) continue
+      observedMcp += 1
+      visibleMcpNames.push(name)
+      if (isAmbiguousMcpToolName(name)) {
+        // The public name cannot be attributed to one server; deny rather than
+        // allow by a prefix that an external server could share. Gate off means
+        // no pool hiding at all, so there is nothing to refuse here.
+        if (!pool.gateMcp) continue
+        ambiguous += 1
+        denyPlan.push({ name, reason: 'pool', service: mcpServerOf(name) })
+        continue
       }
+      const server = mcpServerOf(name)
+      if (pool.gateMcp && !allowedServers.has(server)) {
+        denyPlan.push({ name, reason: 'pool', service: server })
+        continue
+      }
+      // A per-tool switch or scope is a user decision and applies in both
+      // disclosure modes, so it is evaluated before the progressive layer and
+      // even when the MCP gate is off. A configured tool that is both switched
+      // off and unexpanded keeps the `'tool'` reason: expansion must never lift
+      // a user's explicit refusal.
+      const toolConfig = poolEnabled ? state.mcp?.[server]?.tools?.[name] : undefined
+      if (toolConfig !== undefined && toolActive(toolConfig, { mode, cwd }) === false) {
+        denyPlan.push({ name, reason: 'tool', service: server })
+        continue
+      }
+      // A progressive service stays hidden until this Agent expands it.
+      if (pool.gateMcp && progressiveServers.has(server) && !expandedServers.has(server)) {
+        denyPlan.push({ name, reason: 'progressive', service: server })
+      }
+    }
+    denyMcp = denyPlan.map((entry) => entry.name)
+    toolDenied = new Set(denyPlan.filter((entry) => entry.reason === 'tool').map((entry) => entry.name))
+    if (ambiguous > 0) {
+      logger?.warn?.(`[resource-pool] denied ${ambiguous} ambiguous MCP tool name${ambiguous === 1 ? '' : 's'} to avoid cross-server prefix allow`)
     }
 
     // ---- Apply transactionally: install the new MCP deny while the old one is
@@ -681,7 +705,10 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
       const failedNames = []
       const newEntries = []
       let restrictFailures = 0
-      if (pool.gateMcp && observedMcp > 0) {
+      // Per-tool layers are user decisions and survive the MCP gate, so they are
+      // installed whenever a user-denied tool is visible. When the gate is on,
+      // `denyPlan` also carries the pool and progressive reasons.
+      if (observedMcp > 0) {
         for (const plan of denyPlan) {
           if (retainedCoverage.has(plan.name)) continue
           try {
@@ -725,20 +752,39 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
         }
       }
 
-      if (!pool.gateMcp) {
-        // Explicit no-gate intent: release every layer, including names that
-        // are not currently visible.
-        for (const entry of oldRestrictions) disposeEntry(entry)
-        record.disposers = pending
-      } else if (observedMcp === 0) {
-        // No MCP tool is visible: we cannot name anything new, so keep every old
-        // per-tool layer (transient host generation change).
-        record.disposers = [...pending, ...oldRestrictions]
-        retainedInvisible = oldRestrictions.length > 0
-        overRestricted = oldRestrictions.some((entry) =>
-          (Array.isArray(entry.deny) ? entry.deny : []).some((name) => !visibleSet.has(name)),
-        )
-      } else if (restrictFailures > 0) {
+      // ---- Decide which previous layers survive.
+      // - Master switch off: never gate a session, so release them all.
+      // - Partial registration failure: keep everything old and fail closed.
+      // - MCP gate off: pool/progressive layers are released (no gate intent),
+      //   but a per-tool layer is a user decision and must survive so a disabled
+      //   tool stays hidden and refused.
+      // - Otherwise a layer survives only while it covers a name that is not
+      //   visible now: such a name cannot be re-registered, and dropping its
+      //   layer would open it the moment it reappears.
+      const retained = []
+      for (const entry of oldRestrictions) {
+        if (!poolEnabled) {
+          disposeEntry(entry)
+          continue
+        }
+        if (restrictFailures > 0) {
+          retained.push(entry)
+          continue
+        }
+        if (!pool.gateMcp && entry.reason !== 'tool') {
+          disposeEntry(entry)
+          continue
+        }
+        const names = Array.isArray(entry.deny) ? entry.deny : []
+        if (names.some((name) => !visibleSet.has(name))) {
+          retained.push(entry)
+          retainedInvisible = true
+        } else {
+          disposeEntry(entry)
+        }
+      }
+
+      if (restrictFailures > 0) {
         // A brand-new Agent has no prior authorization to fall back on: partial
         // MCP coverage must fail creation.
         if (!record.activated) throw new Error('MCP restrict registration failed for a new Agent')
@@ -756,36 +802,15 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
         }
         retainedInvisible = oldRestrictions.length > 0
         underRestricted = failedNames.some((name) => !oldCoverage.has(name))
-        const deniedSet = new Set(denyMcp)
-        overRestricted = oldRestrictions.some((entry) =>
-          (Array.isArray(entry.deny) ? entry.deny : []).some(
-            (name) => !visibleSet.has(name) || !deniedSet.has(name),
-          ),
-        )
-        record.disposers = [...pending, ...oldRestrictions]
-      } else {
-        const retained = []
-        for (const entry of oldRestrictions) {
-          const names = Array.isArray(entry.deny) ? entry.deny : []
-          // A name not visible now cannot be re-registered; keep the old layer
-          // that covers it. If it also covered a currently visible allowed name,
-          // the old layer must stay too (it cannot be split), so the result is
-          // reported as degraded rather than claimed fully applied.
-          if (names.some((name) => !visibleSet.has(name))) {
-            retained.push(entry)
-            retainedInvisible = true
-          } else {
-            disposeEntry(entry)
-          }
-        }
-        record.disposers = [...pending, ...retained]
-        const deniedSet = new Set(denyMcp)
-        overRestricted = retained.some((entry) =>
-          (Array.isArray(entry.deny) ? entry.deny : []).some(
-            (name) => !visibleSet.has(name) || !deniedSet.has(name),
-          ),
-        )
       }
+
+      record.disposers = [...pending, ...retained]
+      const deniedSet = new Set(denyMcp)
+      overRestricted = (restrictFailures > 0 ? oldRestrictions : retained).some((entry) =>
+        (Array.isArray(entry.deny) ? entry.deny : []).some(
+          (name) => !visibleSet.has(name) || !deniedSet.has(name),
+        ),
+      )
 
       record.activated = true
       record.mcpGateActive = pool.gateMcp
@@ -795,9 +820,20 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
       record.allowedServers = allowedServers
       record.progressiveServers = progressiveServers
       record.expandedServers = expandedServers
-      // Gate off installs no per-tool layers, so the guard must not remember an
-      // old per-tool refusal either: the whole MCP surface is ungated then.
-      record.toolDenied = pool.gateMcp ? toolDenied : new Set()
+      // The guard enforces per-tool refusals in both gate modes. When no MCP
+      // tool is visible, the previous deny layers are retained (they cannot be
+      // re-registered), so their names must stay in the snapshot: wiping it
+      // would make a name that reappears immediately callable again.
+      if (!poolEnabled) {
+        record.toolDenied = new Set()
+      } else if (observedMcp === 0) {
+        record.toolDenied = new Set([
+          ...(record.toolDenied instanceof Set ? record.toolDenied : []),
+          ...toolDenied,
+        ])
+      } else {
+        record.toolDenied = toolDenied
+      }
       // Any retained layer covering a currently invisible name means the last
       // safe activation could not be reconstructed exactly. Keep conservative
       // semantics so a later state failure refreshes coverage for new tools.
@@ -889,7 +925,14 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
     try {
       const record = agents.get(agent)
       if (record === undefined || record.activated !== true) return { ok: false, error: 'not-activated' }
-      if (!(record.progressiveServers instanceof Set) || !record.progressiveServers.has(server)) {
+      // Progressive disclosure only exists on top of the MCP gate: with the gate
+      // off there are no progressive layers to lift, and recording an expansion
+      // would leak into a later gate-on apply.
+      if (
+        record.gateMcp !== true ||
+        !(record.progressiveServers instanceof Set) ||
+        !record.progressiveServers.has(server)
+      ) {
         return { ok: false, error: 'not-in-pool' }
       }
       const keep = []
