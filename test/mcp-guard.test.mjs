@@ -46,12 +46,25 @@ test('gate off: only per-tool denial applies', () => {
   )
 })
 
-test('a malformed argument or record fails closed', () => {
+test('a missing argument is allowed; a throwing record reports guard-error', () => {
   // The guard runs on every tool call, so it must never throw.
   assert.equal(mcpGuardReason(), undefined)
   assert.equal(mcpGuardReason(null), undefined)
   assert.equal(
     mcpGuardReason({ name: 'mcp__alpha__search', hasAgent: true, record: { activated: true, get gateMcp() { throw new Error('boom') } } }),
+    'guard-error',
+  )
+})
+
+test('a present but non-Set collection fails closed', () => {
+  // A malformed deny-all collection must not release a progressive server.
+  assert.equal(
+    mcpGuardReason({ name: 'mcp__alpha__search', hasAgent: true, record: rec({ progressiveServers: ['alpha'] }) }),
+    'guard-error',
+  )
+  // An array must not count as evidence that the service was expanded.
+  assert.equal(
+    mcpGuardReason({ name: 'mcp__alpha__search', hasAgent: true, record: rec({ expandedServers: ['alpha'] }) }),
     'guard-error',
   )
 })

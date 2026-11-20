@@ -276,8 +276,8 @@ export function mcpServerOf(toolName) {
  *
  * Tools carry the same `{enabled, modes, workspaces}` shape as pool members and
  * follow the same AND semantics, so this is exactly {@link itemActive}. It is
- * exported under its own name because the activation layer and the panel both
- * ask this question of a bare tool config, not of a whole member.
+ * exported under its own name because the activation layer asks this question
+ * of a bare tool config, not of a whole member.
  *
  * @param {{enabled?: boolean, modes?: string[], workspaces?: string[]}|null|undefined} toolConfig - stored per-tool config.
  * @param {{mode?: string, cwd?: string, allModes?: boolean, allWorkspaces?: boolean}} target - session identity.

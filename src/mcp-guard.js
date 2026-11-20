@@ -21,6 +21,12 @@
  * their server boundary cannot be trusted, so they must never be allowed by
  * prefix.
  *
+ * Record contract: every collection field (`allowedServers`,
+ * `progressiveServers`, `expandedServers`, `toolDenied`) is a `Set`; an absent
+ * field reads as empty. A field that is present but not a `Set` is a malformed
+ * record and is denied with `'guard-error'` — a shape error must never open the
+ * gate, and no shape error may escape as a throw.
+ *
  * Pure and total: no I/O, no globals, and never throws — an unexpected shape is
  * reported as `'guard-error'` so a malformed record cannot open the gate.
  *
@@ -41,8 +47,22 @@ export const GUARD_SERVER_NOT_EXPANDED = 'server-not-expanded'
 export const GUARD_ERROR = 'guard-error'
 
 /**
- * Membership test that tolerates a missing or malformed collection.
- * @param {unknown} collection - Set from an activation record (or garbage).
+ * Whether one record collection is absent or a real `Set`.
+ *
+ * Absent is fine (it reads as empty); the contract says every collection is a
+ * `Set`, so a present value of any other type is a malformed record that the
+ * caller must refuse instead of treating it as empty.
+ *
+ * @param {unknown} collection - candidate collection from an activation record.
+ * @returns {boolean} whether the collection may be read as a set.
+ */
+function usableCollection(collection) {
+  return collection === undefined || collection === null || collection instanceof Set
+}
+
+/**
+ * Membership test for one already-validated record collection.
+ * @param {unknown} collection - absent or `Set` collection.
  * @param {unknown} value - candidate member.
  * @returns {boolean} whether the collection contains the value.
  */
@@ -77,6 +97,16 @@ export function mcpGuardReason(input) {
     if (hasAgent === false) return undefined
     if (record === null || typeof record !== 'object' || record.activated !== true) {
       return GUARD_POOL_NOT_ACTIVATED
+    }
+    // Refuse a malformed record before reading any collection: treating a
+    // present-but-wrong collection as empty would open the gate.
+    if (
+      !usableCollection(record.toolDenied) ||
+      !usableCollection(record.allowedServers) ||
+      !usableCollection(record.progressiveServers) ||
+      !usableCollection(record.expandedServers)
+    ) {
+      return GUARD_ERROR
     }
     // A per-tool refusal is a user decision, not a gate mode, so it applies first.
     if (hasIn(record.toolDenied, name)) return GUARD_TOOL_DISABLED
