@@ -243,3 +243,67 @@ test('the panel inherit payload keeps current values and switches the marker to 
   assert.deepEqual(body.modes, ['x'])
   assert.deepEqual(body.workspaces, ['/x'])
 })
+
+test('normalizeEntry keeps MCP description, disclosure and tool config', () => {
+  const entry = plugin.boardState.normalizeEntry({
+    enabled: true,
+    modes: [],
+    workspaces: [],
+    description: '知识库',
+    disclosure: 'progressive',
+    tools: { mcp__a__x: { enabled: false, modes: ['standard'], workspaces: ['/w'] } },
+  })
+  assert.equal(entry.description, '知识库')
+  assert.equal(entry.disclosure, 'progressive')
+  assert.deepEqual(entry.tools['mcp__a__x'], { enabled: false, modes: ['standard'], workspaces: ['/w'] })
+  assert.deepEqual(entry.tools['mcp__a__missing'], undefined)
+})
+
+test('normalizeEntry defaults missing MCP fields without widening a member', () => {
+  const entry = plugin.boardState.normalizeEntry({ enabled: true, modes: [], workspaces: [] })
+  assert.equal(entry.description, '')
+  assert.equal(entry.disclosure, 'full')
+  assert.deepEqual(entry.tools, {})
+
+  const invalid = plugin.boardState.normalizeEntry({
+    description: '',
+    disclosure: 'later',
+    tools: { 'resource_pool_status': { enabled: false }, 'mcp__a__x': { enabled: 'yes' } },
+  })
+  assert.equal(invalid.disclosure, 'full')
+  assert.equal(Object.hasOwn(invalid.tools, 'resource_pool_status'), false)
+  assert.deepEqual(invalid.tools['mcp__a__x'], { enabled: true, modes: [], workspaces: [] })
+})
+
+test('buildToolSaveBody sends clear or the full draft', () => {
+  assert.deepEqual(plugin.boardState.buildToolSaveBody('alpha', 'mcp__alpha__x', { enabled: false, modes: ['standard'] }), {
+    server: 'alpha',
+    tool: 'mcp__alpha__x',
+    enabled: false,
+    modes: ['standard'],
+    workspaces: [],
+  })
+  assert.deepEqual(plugin.boardState.buildToolSaveBody('alpha', 'mcp__alpha__x', { clear: true }), {
+    server: 'alpha',
+    tool: 'mcp__alpha__x',
+    clear: true,
+  })
+})
+
+test('the MCP helpers are exported for the panel and its tests', () => {
+  assert.equal(typeof plugin.boardState.normalizeMcpTools, 'function')
+  assert.equal(typeof plugin.boardState.buildToolSaveBody, 'function')
+  assert.deepEqual(plugin.boardState.normalizeMcpTools({ 'mcp__a__x': {} }), {
+    'mcp__a__x': { enabled: true, modes: [], workspaces: [] },
+  })
+})
+
+test('a describe failure reason is readable from both API error shapes', () => {
+  // `/mcp/describe` answers with a flat `{ok:false, error:<code>, message}`;
+  // other routes answer `{ok:false, error:{code,message}}`. The panel must show
+  // the reason for either shape instead of a bare HTTP status.
+  assert.equal(plugin.boardState.failureTextOf({ error: 'offline', message: '服务 alpha 当前离线' }), 'offline: 服务 alpha 当前离线')
+  assert.equal(plugin.boardState.failureTextOf({ error: { code: 'x', message: '原因' } }), '原因')
+  assert.equal(plugin.boardState.failureTextOf({ error: { code: 'resource-pool/x' } }), 'resource-pool/x')
+  assert.equal(plugin.boardState.failureTextOf(null), '')
+})
