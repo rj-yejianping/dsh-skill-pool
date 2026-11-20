@@ -123,7 +123,8 @@ window.__ModuleLoader__.load({
         mcpToolUnavailable: '不可用',
         mcpToolAmbiguous: '名称无法唯一归属，不能单独配置',
         mcpToolClear: '清除配置',
-        mcpScopeHint: '逐接口作用域与成员作用域是 AND。',
+        mcpInheritTag: '（继承服务）',
+        mcpToolInheritHint: '默认继承 MCP 服务的模式与工作区；两层是 AND，单独设置才会覆盖。',
         mcpHint: '渐进注入只隐藏工具 Schema；MCP resources 与 server instructions 不受影响；展开状态每个会话独立，重启/重连后重新发现；逐接口作用域与成员作用域是 AND。',
         mcpDiscoverUnavailable: '发现入口不可用：{reason}',
         mcpDiscoverReasonConflict: '名称冲突',
@@ -353,7 +354,8 @@ window.__ModuleLoader__.load({
         mcpToolUnavailable: 'Unavailable',
         mcpToolAmbiguous: 'Name cannot be attributed uniquely; it cannot be configured alone',
         mcpToolClear: 'Clear config',
-        mcpScopeHint: 'Per-tool scope and member scope are combined with AND.',
+        mcpInheritTag: ' (from server)',
+        mcpToolInheritHint: 'Inherits the MCP server scope by default; the two layers are combined with AND, and only a separate setting overrides it.',
         mcpHint: 'Progressive injection hides tool schemas only; MCP resources and server instructions are unaffected. Expansion is per session and is rediscovered after a restart/reconnect. Per-tool scope and member scope are combined with AND.',
         mcpDiscoverUnavailable: 'Discover entry unavailable: {reason}',
         mcpDiscoverReasonConflict: 'name conflict',
@@ -2527,12 +2529,19 @@ window.__ModuleLoader__.load({
       const previewInitialized = useRef(false)
       const boardRef = useRef(null)
       const loadBoardRef = useRef(null)
+      // Filled on every render with the debounced-write flushers: the settings
+      // dialog unmounts this panel when it closes, and a field edited moments
+      // before that must still reach the Host instead of dying with its timer.
+      const flushOnUnmountRef = useRef(null)
       boardRef.current = board
 
       useEffect(() => {
         mounted.current = true
         return () => {
           mounted.current = false
+          // Deliver whatever is still queued *before* dropping the queues: the
+          // requests are already snapshotted, so this only sends them.
+          flushOnUnmountRef.current?.()
           for (const timer of timersRef.current.values()) clearTimeout(timer)
           timersRef.current.clear()
           for (const timer of configTimersRef.current.values()) clearTimeout(timer)
@@ -2626,14 +2635,15 @@ window.__ModuleLoader__.load({
       // --------------------------------------------------------- autosave
 
       const flushItem = useCallback(
-        async (key) => {
+        async (key, options) => {
+          const force = options !== undefined && options !== null && options.force === true
           const job = pendingRef.current.get(key)
           if (!job) {
             markSaving(key, false)
             return
           }
           pendingRef.current.delete(key)
-          markSaving(key, true)
+          if (mounted.current) markSaving(key, true)
           const sequence = editSeqRef.current.get(key) ?? 0
           // Snapshot the request body now. A condition edit made *after* this
           // flush must travel with the newer queued save, never be squeezed into
@@ -2643,7 +2653,9 @@ window.__ModuleLoader__.load({
           // a newer one and restore the previous conditions.
           const previous = writeChainsRef.current.get(key) ?? Promise.resolve()
           const run = previous.then(async () => {
-            if (!mounted.current) return
+            // `force` is the unmount path: the panel is gone, but the request is
+            // still the user's edit and must be written.
+            if (!mounted.current && !force) return
             try {
               const payload = await request(`${API}/item`, { method: 'POST', body })
               if (!mounted.current) return
@@ -2733,20 +2745,23 @@ window.__ModuleLoader__.load({
        * could roll back a concurrent per-tool or scope save.
        */
       const flushMcpConfig = useCallback(
-        async (server) => {
+        async (server, options) => {
+          const force = options !== undefined && options !== null && options.force === true
           const job = configQueueRef.current.get(server)
           if (!job) {
             markSaving(`mcp-config:${server}`, false)
             return
           }
           configQueueRef.current.delete(server)
-          markSaving(`mcp-config:${server}`, true)
+          if (mounted.current) markSaving(`mcp-config:${server}`, true)
           const sequence = configSeqRef.current.get(server) ?? 0
           const patch = { ...job }
           const body = { server, ...patch }
           const previous = configChainsRef.current.get(server) ?? Promise.resolve()
           const run = previous.then(async () => {
-            if (!mounted.current) return
+            // The unmount path still sends: a description typed a moment before
+            // the dialog closed is a user edit, not a draft to discard.
+            if (!mounted.current && !force) return
             try {
               const payload = await request(`${API}/mcp/config`, { method: 'POST', body })
               if (!mounted.current) return
@@ -2848,19 +2863,20 @@ window.__ModuleLoader__.load({
 
       /** Flush one pending `/mcp/tool` save for `server` + NUL + `tool`. */
       const flushTool = useCallback(
-        async (jobKey) => {
+        async (jobKey, options) => {
+          const force = options !== undefined && options !== null && options.force === true
           const job = toolQueueRef.current.get(jobKey)
           if (!job) {
             markSaving(`mcp-tool:${jobKey}`, false)
             return
           }
           toolQueueRef.current.delete(jobKey)
-          markSaving(`mcp-tool:${jobKey}`, true)
+          if (mounted.current) markSaving(`mcp-tool:${jobKey}`, true)
           const sequence = toolSeqRef.current.get(jobKey) ?? 0
           const body = buildToolSaveBody(job.server, job.tool, job.draft)
           const previous = toolChainsRef.current.get(jobKey) ?? Promise.resolve()
           const run = previous.then(async () => {
-            if (!mounted.current) return
+            if (!mounted.current && !force) return
             try {
               const payload = await request(`${API}/mcp/tool`, { method: 'POST', body })
               if (!mounted.current) return
@@ -2907,6 +2923,14 @@ window.__ModuleLoader__.load({
         },
         [clearRowError, markSaving, setRowError, surfaceWarning],
       )
+
+      // Everything still debounced at unmount time is a user edit; keep a way
+      // to send those requests after the panel is gone (see the cleanup effect).
+      flushOnUnmountRef.current = () => {
+        for (const key of [...pendingRef.current.keys()]) void flushItem(key, { force: true })
+        for (const server of [...configQueueRef.current.keys()]) void flushMcpConfig(server, { force: true })
+        for (const jobKey of [...toolQueueRef.current.keys()]) void flushTool(jobKey, { force: true })
+      }
 
       /**
        * Queue one per-tool save. `draft` is either a complete
@@ -3222,21 +3246,26 @@ window.__ModuleLoader__.load({
 
       loadMcpToolsRef.current = loadMcpTools
 
-      const toolOpenServers = useMemo(
-        () => mcpNames.filter((server) => expanded[`mcp-tools:${server}`] !== false),
-        [mcpNames, expanded],
-      )
-
+      // The per-tool block is collapsed by default, but the card always shows
+      // the injection switch, whose "can this switch to progressive?" answer
+      // comes from the same request. So the catalog is read for every member
+      // once, not only for the block the user has opened.
       useEffect(() => {
         if (!board) return
-        for (const server of toolOpenServers) {
+        for (const server of mcpNames) {
           if (!mcpToolCatalog[server]) void loadMcpTools(server)
         }
-      }, [board, toolOpenServers, mcpToolCatalog, loadMcpTools])
+      }, [board, mcpNames, mcpToolCatalog, loadMcpTools])
 
       const toggleMcpTools = useCallback((server) => {
         const key = `mcp-tools:${server}`
-        setExpanded((current) => ({ ...current, [key]: current[key] !== false ? false : true }))
+        setExpanded((current) => ({ ...current, [key]: current[key] !== true }))
+      }, [])
+
+      /** Per-tool description disclosure: closed until the row is opened. */
+      const toggleMcpToolSummary = useCallback((server, tool) => {
+        const key = `mcp-tool-summary:${server}:${tool}`
+        setExpanded((current) => ({ ...current, [key]: current[key] !== true }))
       }, [])
 
       const toggleToolScope = useCallback((server, tool) => {
@@ -3410,9 +3439,13 @@ window.__ModuleLoader__.load({
       )
 
       /**
-       * Put an AI-generated description into the editable draft without saving
-       * it: `/mcp/describe` is a suggestion, and the user confirms by editing /
-       * leaving the field (the normal debounced save then commits it).
+       * Put an AI-generated description into the field and commit it.
+       *
+       * The generated text is a real edit, not a preview: leaving it as a
+       * queue-less draft meant the field showed a description the Host never
+       * received, so closing the panel (or any board reload) silently dropped
+       * it. It goes through the normal queued save instead, and the user can
+       * still edit the field afterwards (each keystroke re-queues).
        */
       const applyMcpDescriptionDraft = useCallback(
         (server, text) => {
@@ -3433,14 +3466,17 @@ window.__ModuleLoader__.load({
             if (!member) return current
             return { ...current, state: withEntry(current.state, MCP, name, { ...member, description: value }) }
           })
+          // Commit without waiting for a keystroke: the generated text is only
+          // worth anything once the Host has it.
+          queueMcpConfig(name, { description: value }, { immediate: true })
           // Nothing is queued for the draft, so the row is not saving. Without
           // this a superseded in-flight save would leave the spinner on forever.
           if (!configQueueRef.current.has(name)) markSaving(`mcp-config:${name}`, false)
         },
-        [markSaving],
+        [markSaving, queueMcpConfig],
       )
 
-      /** Ask the default model for a short purpose description (never auto-saves). */
+      /** Ask the default model for a short purpose description and save it. */
       const generateMcpDescription = useCallback(
         async (server) => {
           const name = asString(server)
@@ -4090,15 +4126,58 @@ window.__ModuleLoader__.load({
         const savingRow = saving[`mcp-tool:${jobKey}`] === true
         const toolError = rowErrors[`mcp-tool:${jobKey}`]
         const scopeOpen = expanded[`mcp-tool-scope:${server}:${name}`] === true
+        const summaryOpen = expanded[`mcp-tool-summary:${server}:${name}`] === true
+        const summary = asString(tool.summary)
+        // The MCP member is the scope source of a tool: an empty dimension means
+        // "follow the server" (the Host already ANDs both layers), so the row
+        // shows the member's value plus an inherited tag instead of a misleading
+        // "All modes" that the member scope then overrides.
+        const serverModes = asStringArray(entry.modes)
+        const serverWorkspaces = asStringArray(entry.workspaces)
+        // Only a non-empty server dimension is worth inheriting: when the member
+        // itself is unrestricted, "inherit" and "explicitly all" would look the
+        // same and the inherit button would do nothing.
+        const inheritsModes = serverModes.length > 0 && config.modes.length === 0
+        const inheritsWorkspaces = serverWorkspaces.length > 0 && config.workspaces.length === 0
+        const effectiveModes = inheritsModes ? serverModes : config.modes
+        const effectiveWorkspaces = inheritsWorkspaces ? serverWorkspaces : config.workspaces
         const modeLabels = new Map(inventory.modes.map((mode) => [mode.id, mode.name]))
-        const modeText = summarizeList(config.modes, TEXT.allModes, (value) => modeLabels.get(value) || value)
-        const workspaceText = summarizeList(config.workspaces, TEXT.allWorkspaces, (value) => baseName(value))
+        const modeText = summarizeList(effectiveModes, TEXT.allModes, (value) => modeLabels.get(value) || value)
+        const workspaceText = summarizeList(effectiveWorkspaces, TEXT.allWorkspaces, (value) => baseName(value))
+        const serverModeText = summarizeList(serverModes, TEXT.allModes, (value) => modeLabels.get(value) || value)
+        const serverWorkspaceText = summarizeList(serverWorkspaces, TEXT.allWorkspaces, (value) => baseName(value))
         const modeItems = inventory.modes.map((mode) => ({ value: mode.id, label: mode.name, hint: mode.id }))
         const workspaceItems = inventory.workspaces.map((row) => ({
           value: row.path,
           label: row.name || baseName(row.path),
           hint: row.path,
         }))
+        // One "inherit / set separately" choice per dimension, like a group
+        // member: inheriting writes the empty list back, choosing "separately"
+        // seeds the editor with the inherited value so nothing changes silently.
+        const scopeToggle = (inheriting, inheritLabel, onInherit, onSelf) =>
+          h(
+            'div',
+            { style: S.row },
+            h(
+              'button',
+              {
+                type: 'button',
+                style: { ...S.buttonSmall, ...(inheriting ? SX.inheritOn : null) },
+                onClick: inheriting ? undefined : onInherit,
+              },
+              `${TEXT.groupInherit} · ${inheritLabel}`,
+            ),
+            h(
+              'button',
+              {
+                type: 'button',
+                style: { ...S.buttonSmall, ...(inheriting ? null : SX.inheritOn) },
+                onClick: inheriting ? onSelf : undefined,
+              },
+              TEXT.groupSelf,
+            ),
+          )
         return h(
           'div',
           { key: name, style: { ...SX.mcpToolRow, ...(unavailable ? SX.mcpToolHistory : null) } },
@@ -4111,12 +4190,36 @@ window.__ModuleLoader__.load({
               h(
                 'div',
                 { style: S.rowName },
-                h('span', { style: S.mono }, name),
+                summary.length > 0
+                  ? h(
+                      'span',
+                      {
+                        role: 'button',
+                        tabIndex: 0,
+                        'aria-label': summaryOpen ? TEXT.groupCollapse : TEXT.groupExpand,
+                        'aria-expanded': summaryOpen ? 'true' : 'false',
+                        title: summaryOpen ? TEXT.groupCollapse : TEXT.groupExpand,
+                        style: { ...SX.groupCaret, transform: summaryOpen ? 'rotate(90deg)' : 'none' },
+                        onClick: () => toggleMcpToolSummary(server, name),
+                      },
+                      '▸',
+                    )
+                  : null,
+                h(
+                  'span',
+                  {
+                    style: { ...S.mono, cursor: summary.length > 0 ? 'pointer' : 'inherit' },
+                    role: summary.length > 0 ? 'button' : undefined,
+                    tabIndex: summary.length > 0 ? 0 : undefined,
+                    onClick: summary.length > 0 ? () => toggleMcpToolSummary(server, name) : undefined,
+                  },
+                  name,
+                ),
                 unavailable ? h('span', { style: S.badgeWarn }, TEXT.mcpToolUnavailable) : null,
                 ambiguous ? h('span', { style: S.badgeError }, TEXT.mcpToolAmbiguous) : null,
                 savingRow ? h('span', { style: S.savingDot }, TEXT.savingItem) : null,
               ),
-              asString(tool.summary).length > 0 ? h('div', { style: S.rowDesc }, asString(tool.summary)) : null,
+              summary.length > 0 && summaryOpen ? h('div', { style: S.rowDesc }, summary) : null,
             ),
             h(
               'div',
@@ -4156,12 +4259,12 @@ window.__ModuleLoader__.load({
                         style: {
                           ...S.condChip,
                           cursor: 'pointer',
-                          ...(config.modes.length > 0 ? SX.condChipOn : null),
+                          ...(!inheritsModes ? SX.condChipOn : null),
                         },
-                        title: TEXT.editConditions,
+                        title: inheritsModes ? TEXT.mcpToolInheritHint : TEXT.editConditions,
                         onClick: () => toggleToolScope(server, name),
                       },
-                      `${TEXT.rowModes}: ${modeText}`,
+                      `${TEXT.rowModes}: ${modeText}${inheritsModes ? TEXT.mcpInheritTag : ''}`,
                     ),
                     h(
                       'span',
@@ -4172,12 +4275,12 @@ window.__ModuleLoader__.load({
                         style: {
                           ...S.condChip,
                           cursor: 'pointer',
-                          ...(config.workspaces.length > 0 ? SX.condChipOn : null),
+                          ...(!inheritsWorkspaces ? SX.condChipOn : null),
                         },
-                        title: TEXT.editConditions,
+                        title: inheritsWorkspaces ? TEXT.mcpToolInheritHint : TEXT.editConditions,
                         onClick: () => toggleToolScope(server, name),
                       },
-                      `${TEXT.rowWorkspaces}: ${workspaceText}`,
+                      `${TEXT.rowWorkspaces}: ${workspaceText}${inheritsWorkspaces ? TEXT.mcpInheritTag : ''}`,
                     ),
                     h(Toggle, {
                       key: 'enabled',
@@ -4209,39 +4312,63 @@ window.__ModuleLoader__.load({
                   { style: SX.mcpToolEditor },
                   h(
                     Field,
-                    { label: TEXT.rowModes, hint: TEXT.mcpScopeHint },
-                    h(MultiSelect, {
-                      items: modeItems,
-                      selected: config.modes,
-                      onChange: (values) => updateMcpTool(server, name, { modes: values }),
-                      searchPlaceholder: TEXT.previewAllModes,
-                      emptyHint: TEXT.allModes,
-                      emptyText: TEXT.noMatches,
-                      selectAllLabel: TEXT.selectAll,
-                      clearAllLabel: TEXT.clearAll,
-                    }),
+                    { label: TEXT.rowModes, hint: TEXT.mcpToolInheritHint },
+                    serverModes.length > 0
+                      ? scopeToggle(
+                          inheritsModes,
+                          serverModeText,
+                          () => updateMcpTool(server, name, { modes: [] }),
+                          () => updateMcpTool(server, name, { modes: effectiveModes }),
+                        )
+                      : null,
+                    inheritsModes
+                      ? null
+                      : h(MultiSelect, {
+                          items: modeItems,
+                          selected: config.modes,
+                          onChange: (values) => updateMcpTool(server, name, { modes: values }),
+                          searchPlaceholder: TEXT.previewAllModes,
+                          emptyHint: TEXT.allModes,
+                          emptyText: TEXT.noMatches,
+                          selectAllLabel: TEXT.selectAll,
+                          clearAllLabel: TEXT.clearAll,
+                        }),
                   ),
                   h(
                     Field,
-                    { label: TEXT.rowWorkspaces, hint: TEXT.mcpScopeHint },
-                    h(MultiSelect, {
-                      items: workspaceItems,
-                      selected: config.workspaces,
-                      onChange: (values) => updateMcpTool(server, name, { workspaces: values }),
-                      searchPlaceholder: TEXT.previewAllWorkspaces,
-                      emptyHint: TEXT.allWorkspaces,
-                      emptyText: TEXT.noMatches,
-                      selectAllLabel: TEXT.selectAll,
-                      clearAllLabel: TEXT.clearAll,
-                    }),
-                    h(AddPathRow, {
-                      placeholder: TEXT.addPathPlaceholder,
-                      label: TEXT.addPath,
-                      onAdd: (path) =>
-                        updateMcpTool(server, name, {
-                          workspaces: uniqueStrings([...config.workspaces, normalizePath(path)]),
-                        }),
-                    }),
+                    { label: TEXT.rowWorkspaces, hint: TEXT.mcpToolInheritHint },
+                    serverWorkspaces.length > 0
+                      ? scopeToggle(
+                          inheritsWorkspaces,
+                          serverWorkspaceText,
+                          () => updateMcpTool(server, name, { workspaces: [] }),
+                          () => updateMcpTool(server, name, { workspaces: effectiveWorkspaces }),
+                        )
+                      : null,
+                    inheritsWorkspaces
+                      ? null
+                      : [
+                          h(MultiSelect, {
+                            key: 'select',
+                            items: workspaceItems,
+                            selected: config.workspaces,
+                            onChange: (values) => updateMcpTool(server, name, { workspaces: values }),
+                            searchPlaceholder: TEXT.previewAllWorkspaces,
+                            emptyHint: TEXT.allWorkspaces,
+                            emptyText: TEXT.noMatches,
+                            selectAllLabel: TEXT.selectAll,
+                            clearAllLabel: TEXT.clearAll,
+                          }),
+                          h(AddPathRow, {
+                            key: 'add',
+                            placeholder: TEXT.addPathPlaceholder,
+                            label: TEXT.addPath,
+                            onAdd: (path) =>
+                              updateMcpTool(server, name, {
+                                workspaces: uniqueStrings([...config.workspaces, normalizePath(path)]),
+                              }),
+                          }),
+                        ],
                   ),
                 )
               : null,
@@ -4278,7 +4405,9 @@ window.__ModuleLoader__.load({
           })
         }
         const rows = [...listed.values()]
-        const open = expanded[`mcp-tools:${server}`] !== false
+        // Collapsed by default: a 15-tool server would otherwise push the next
+        // member off-screen the moment the card appears.
+        const open = expanded[`mcp-tools:${server}`] === true
         const failed = catalog.status === 'error'
         const loading = catalog.status === 'loading'
         return h(

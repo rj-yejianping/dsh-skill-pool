@@ -187,13 +187,47 @@ function boardPayload() {
 }
 
 let itemResponse = null
+/** Tool rows served by `GET /mcp/tools`. */
+let mcpToolRows = []
+/** Text served by `POST /mcp/describe`. */
+let describeText = ''
 
 globalThis.fetch = async (url, init = {}) => {
   const method = (init.method || 'GET').toUpperCase()
   const target = String(url)
   calls.push({ method, target, body: init.body })
   let payload
-  if (target.includes('/item')) {
+  if (target.includes('/mcp/tools')) {
+    payload = {
+      ok: true,
+      server: 'kb',
+      description: '',
+      disclosure: 'progressive',
+      discover: { ok: true, reason: '' },
+      tools: mcpToolRows,
+    }
+  } else if (target.includes('/mcp/tool')) {
+    const body = JSON.parse(init.body || '{}')
+    const member = boardState.mcp[body.server]
+    const tools = { ...member.tools }
+    if (body.clear === true) delete tools[body.tool]
+    else tools[body.tool] = { enabled: body.enabled, modes: body.modes, workspaces: body.workspaces }
+    boardState = {
+      ...boardState,
+      mcp: { ...boardState.mcp, [body.server]: { ...member, tools } },
+    }
+    payload = { ok: true, state: boardState }
+  } else if (target.includes('/mcp/config')) {
+    const body = JSON.parse(init.body || '{}')
+    const member = boardState.mcp[body.server]
+    const next = { ...member }
+    if (body.description !== undefined) next.description = body.description
+    if (body.disclosure !== undefined) next.disclosure = body.disclosure
+    boardState = { ...boardState, mcp: { ...boardState.mcp, [body.server]: next } }
+    payload = { ok: true, state: boardState }
+  } else if (target.includes('/mcp/describe')) {
+    payload = { ok: true, description: describeText }
+  } else if (target.includes('/item')) {
     const body = JSON.parse(init.body || '{}')
     if (typeof itemResponse === 'function') payload = await itemResponse(body)
     else payload = { ok: true, state: boardState }
@@ -209,6 +243,15 @@ globalThis.fetch = async (url, init = {}) => {
 // ------------------------------------------------------------------- render
 
 let tree = null
+
+/** Drop every hook slot so a test can start from a fresh first render. */
+function resetRuntime() {
+  runtime.cursor = 0
+  runtime.states = []
+  runtime.refs = []
+  runtime.callbacks = []
+  runtime.effects = []
+}
 
 function render() {
   runtime.rendering = true
@@ -322,4 +365,98 @@ console.log(JSON.stringify({
   itemBody: body,
   calls: calls.map((call) => `${call.method} ${call.target.split('?')[0]}`),
 }, null, 2))
+})
+
+test('the MCP card saves an AI-generated description and inherits the member scope', async () => {
+  resetRuntime()
+  calls.length = 0
+  itemResponse = null
+  describeText = 'Generated purpose text.'
+  mcpToolRows = [
+    { name: 'mcp__kb__search', summary: 'Search the knowledge base.', registered: true, ambiguous: false },
+  ]
+  boardState = {
+    version: 4,
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
+    skills: {},
+    sources: {},
+    groups: {},
+    mcp: {
+      kb: {
+        enabled: true,
+        modes: ['standard'],
+        workspaces: [],
+        description: '',
+        disclosure: 'progressive',
+        tools: {},
+        installedAt: '2026-11-18T00:00:00.000Z',
+      },
+    },
+  }
+  runtime.render = render
+  render()
+  await sleep(40)
+
+  // Folded by default: the member card renders, its tool rows do not.
+  assert.equal(textOf(tree).includes('mcp__kb__search'), false, 'tools folded by default')
+
+  const toolsHead = findAll(
+    tree,
+    (node) => node.props && node.props.role === 'button' && textOf(node).includes('Tools'),
+  )[0]
+  assert.ok(toolsHead, 'tools header rendered')
+  click(toolsHead, 'tools header')
+  await sleep(40)
+  assert.ok(textOf(tree).includes('mcp__kb__search'), 'the tool row appears after expanding')
+
+  // A second disclosure level: the row summary stays folded until the name is
+  // clicked, so a long catalog stays a list.
+  assert.equal(textOf(tree).includes('Search the knowledge base.'), false, 'row summary folded')
+  const toolName = findAll(
+    tree,
+    (node) => node.props && node.props.role === 'button' && textOf(node).trim() === 'mcp__kb__search',
+  )[0]
+  assert.ok(toolName, 'the tool name is a disclosure trigger')
+  click(toolName, 'tool name')
+  await sleep(40)
+  assert.ok(textOf(tree).includes('Search the knowledge base.'), 'row summary opens on click')
+
+  // An unconfigured tool follows the member scope and says so.
+  assert.ok(textOf(tree).includes('Modes: Standard (from server)'), textOf(tree))
+
+  // AI generation must reach the Host, not only the field: a description the
+  // panel never queued used to vanish on the next board read.
+  const aiButton = byText(tree, 'AI generate')[0]
+  assert.ok(aiButton, 'AI generate rendered')
+  click(aiButton, 'AI generate')
+  await sleep(200)
+  const configCall = calls.find((call) => call.method === 'POST' && call.target.includes('/mcp/config'))
+  assert.ok(configCall, 'the generated description was saved')
+  assert.equal(JSON.parse(configCall.body).description, describeText)
+  assert.equal(boardState.mcp.kb.description, describeText, 'the Host kept the generated text')
+
+  // Choosing "set separately" seeds the editor with the inherited value, so the
+  // switch from inherit to explicit never drops the member scope.
+  const modesChip = findAll(
+    tree,
+    (node) =>
+      node.props &&
+      node.props.role === 'button' &&
+      textOf(node).trim().startsWith('Modes: Standard (from server)'),
+  )[0]
+  assert.ok(modesChip, 'the inherited modes chip rendered')
+  click(modesChip, 'tool modes chip')
+  await sleep(40)
+  const custom = findAll(
+    tree,
+    (node) => node.props && typeof node.props.onClick === 'function' && textOf(node).trim() === 'custom',
+  )[0]
+  assert.ok(custom, 'the separate-setting control rendered')
+  click(custom, 'tool modes custom')
+  await sleep(500)
+  const toolCall = calls.find((call) => call.method === 'POST' && call.target.includes('/mcp/tool'))
+  assert.ok(toolCall, 'per-tool scope save fired')
+  const toolBody = JSON.parse(toolCall.body)
+  assert.equal(toolBody.tool, 'mcp__kb__search')
+  assert.deepEqual(toolBody.modes, ['standard'], 'the inherited value was copied, not dropped')
 })

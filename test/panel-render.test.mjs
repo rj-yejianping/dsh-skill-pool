@@ -28,6 +28,12 @@ await import('../client.js')
 let boardSeed = null
 /** Extra seeded `useState` value for one hook index (the MCP tool catalog). */
 let hookSeed = null
+/**
+ * Additional hook seeds by index. The `expanded` map is hook 6, so a test that
+ * wants the tools block open seeds that single object with
+ * `{'mcp-tools:kb': true}`.
+ */
+let hookSeeds = new Map()
 /** Hook call counter for one Panel() invocation (reset by each test). */
 let hookIndex = 0
 
@@ -50,6 +56,7 @@ const React = {
     const index = hookIndex++
     if (index === 0) return [boardSeed, () => {}]
     if (hookSeed !== null && hookSeed.index === index) return [hookSeed.value, () => {}]
+    if (hookSeeds.has(index)) return [hookSeeds.get(index), () => {}]
     return [typeof initial === 'function' ? initial() : initial, () => {}]
   },
   useEffect: () => {},
@@ -83,8 +90,8 @@ function renderPanel() {
 function mcpBoard(options = {}) {
   const entry = plugin.boardState.normalizeEntry({
     enabled: true,
-    modes: [],
-    workspaces: [],
+    modes: options.modes === undefined ? [] : options.modes,
+    workspaces: options.workspaces === undefined ? [] : options.workspaces,
     description: '知识库检索',
     disclosure: options.disclosure === 'full' ? 'full' : 'progressive',
     tools: {
@@ -132,7 +139,7 @@ test('the settings Panel renders without undefined hook state', () => {
   assert.doesNotThrow(() => renderPanel())
 })
 
-test('an MCP row renders its description, injection switch and per-tool block', () => {
+test('an MCP row renders its description and injection switch, with tools folded away', () => {
   boardSeed = mcpBoard()
   const html = renderPanel()
   // `TEXT.cardMcp` (en) and the tool block title are the two anchors the brief
@@ -142,8 +149,80 @@ test('an MCP row renders its description, injection switch and per-tool block', 
   assert.ok(html.includes('Purpose description'), html)
   assert.ok(html.includes('AI generate'), html)
   assert.ok(html.includes('Progressive injection'), html)
-  assert.ok(html.includes('mcp__kb__search'), html)
-  assert.ok(html.includes('mcp__kb__gone'), html)
+  // The per-tool block is collapsed by default: a 15-tool server must not push
+  // the next member off-screen the moment its card renders.
+  assert.equal(html.includes('mcp__kb__search'), false, 'the tool list is folded by default')
+  assert.equal(html.includes('mcp__kb__gone'), false, 'the tool list is folded by default')
+})
+
+/** The per-tool catalog seed for the `kb` fixture (hook 19). */
+const KB_CATALOG = {
+  kb: {
+    status: 'ready',
+    error: '',
+    discover: { ok: true, reason: '' },
+    tools: [
+      {
+        name: 'mcp__kb__search',
+        summary: 'Search the knowledge base for a phrase.',
+        registered: true,
+        ambiguous: false,
+      },
+      { name: 'mcp__kb__gone', summary: '', registered: true, ambiguous: false },
+    ],
+  },
+}
+
+test('an opened tool row keeps its description folded until the name is clicked', () => {
+  boardSeed = mcpBoard()
+  hookSeeds = new Map([
+    [6, { 'mcp-tools:kb': true }],
+    [19, KB_CATALOG],
+  ])
+  const folded = renderPanel()
+  assert.ok(folded.includes('mcp__kb__search'), folded)
+  assert.equal(
+    folded.includes('Search the knowledge base for a phrase.'),
+    false,
+    'the row summary stays folded',
+  )
+
+  hookSeeds = new Map([
+    [6, { 'mcp-tools:kb': true, 'mcp-tool-summary:kb:mcp__kb__search': true }],
+    [19, KB_CATALOG],
+  ])
+  const opened = renderPanel()
+  assert.ok(opened.includes('Search the knowledge base for a phrase.'), opened)
+  hookSeeds = new Map()
+})
+
+test('a tool without its own scope shows the MCP server scope as inherited', () => {
+  boardSeed = mcpBoard({ modes: ['standard'], workspaces: ['/w'] })
+  hookSeeds = new Map([
+    [6, { 'mcp-tools:kb': true }],
+    [19, KB_CATALOG],
+  ])
+  const html = renderPanel()
+  // `mcp__kb__gone` has no explicit modes/workspaces, so both chips follow the
+  // member; `mcp__kb__search` carries its own values and must stay untagged.
+  assert.ok(html.includes('Modes: Standard (from server)'), html)
+  assert.ok(html.includes('Workspaces: w (from server)'), html)
+  assert.equal((html.match(/\(from server\)/g) || []).length, 2, html)
+  assert.ok(html.includes('Modes: Standard'), html)
+  hookSeeds = new Map()
+})
+
+test('a tool of an unrestricted member carries no inherited tag', () => {
+  // "inherit" only means something when the member restricts the dimension;
+  // otherwise the tag would claim an inheritance that grants everything.
+  boardSeed = mcpBoard()
+  hookSeeds = new Map([
+    [6, { 'mcp-tools:kb': true }],
+    [19, KB_CATALOG],
+  ])
+  const html = renderPanel()
+  assert.equal((html.match(/\(from server\)/g) || []).length, 0, html)
+  hookSeeds = new Map()
 })
 
 test('the MCP row warns when the MCP gate is off', () => {

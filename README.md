@@ -127,8 +127,8 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
 dsh plugin --profile web add dsh-skill-pool
 
 # 本地开发：先从源码目录打包，再装真实包
-npm pack                      # → dsh-skill-pool-0.5.0.tgz
-plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.5.0.tgz")
+npm pack                      # → dsh-skill-pool-0.5.1.tgz
+plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.5.1.tgz")
 ```
 
 > 不要用 `link:` / 软链安装：Host 在 profile 目录下按 importer 路径做包解析，
@@ -303,6 +303,18 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 - **只有工具 Schema 与调用受影响**：MCP resources（`list_mcp_resources` / `read_mcp_resource`）
   与 server instructions 不受渐进/逐接口隐藏影响。可选 `mcpManager` 报该服务未连接时 discover
   返回 `offline` 且不展开；没有 manager 或其条目时按注册表工具清单降级。
+
+### 面板默认与保存时机（0.5.1）
+
+- **工具列表默认折叠**：MCP 卡片出现时只有「▸ 工具 · N 个工具」一行，点开才渲染逐接口行；
+  括号里的工具描述同理，每行默认只显示公共名 + 模式/工作区 + 开关，点工具名（或行首 ▸）
+  才展开该工具的描述摘要。
+- **作用范围默认继承服务**：工具没单独设置时，模式/工作区 chip 显示 MCP 成员的值并标
+  「（继承服务）」；行内编辑器默认停在「继承 · <值>」，切到「单独设置」会把继承值拷贝过来再改，
+  不会出现“从继承切到单独设置就变成全部模式/工作区”。
+- **用途描述一定提交**：「AI 生成」把文本填回字段后立即排队保存（不再只是本地草稿）；
+  关闭设置页时会把还在去抖窗口里的描述、注入模式、逐接口改动先发出去，
+  不会因为赶在 320ms 内关页面而丢字。
 
 ### 已知边界
 
