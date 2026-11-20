@@ -19,19 +19,35 @@
 
 import {
   applySettingsPatch,
+  cleanDescription,
+  clearMcpToolConfig,
+  DESCRIPTION_LIMIT,
+  DISCLOSURE_MODES,
   excludeSourceSkill,
+  MCP_TOOL_KEY_LIMIT,
   newId,
   normalizeItemName,
   normalizePath,
   removeItem,
   removeSource,
+  setMcpConfig,
+  setMcpToolConfig,
   StateReadError,
   upsertGroup,
   upsertItem,
   upsertSource,
 } from './store.js'
 import { buildInventory } from './inventory.js'
-import { effectiveEnabled, effectiveScope, groupKeyOfSource, groupOfMember, resolvePool } from './rules.js'
+import {
+  effectiveEnabled,
+  effectiveScope,
+  groupKeyOfSource,
+  groupOfMember,
+  isAmbiguousMcpToolName,
+  mcpServerOf,
+  resolvePool,
+} from './rules.js'
+import { mcpServerOffline } from './disclosure.js'
 import { DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS, mountServer } from './mount.js'
 import {
   buildMcpConfig,
@@ -59,6 +75,28 @@ const GIT_TOKEN_PREFIX = 'RESOURCE_POOL_GIT_'
 /** Body cap for panel writes. */
 // 64MB archive cap in base64 plus JSON overhead; see library.MAX_ARCHIVE_BYTES.
 const MAX_BODY_BYTES = 96 * 1024 * 1024
+
+/** Maximum characters of one tool description copied into a panel summary. */
+const SUMMARY_LIMIT = 200
+
+/** Character budget for the tool list of one description-generation request. */
+const DESCRIBE_TOOL_BUDGET = 8 * 1024
+
+/** Output cap for a generated description (1–2 sentences). */
+const DESCRIBE_MAX_TOKENS = 200
+
+/** Default deadline for one description-generation request. */
+const DESCRIBE_TIMEOUT_MS = 30_000
+
+/**
+ * System prompts for description generation, selected by the panel language.
+ * Both ask for the same shape: 1–2 sentences about which tasks the service
+ * suits and when a model should call it, with no surrounding commentary.
+ */
+const DESCRIBE_SYSTEM = {
+  zh: '你是 MCP 服务的用途说明撰写助手。根据给出的工具清单，用中文输出 1–2 句话，说明这个服务适合什么任务、什么时候应该调用它。只输出描述本身；不要标题、编号、引号或任何解释。',
+  en: 'You write short MCP server summaries. From the given tool list, write 1–2 sentences in English describing which tasks the service suits and when to call it. Output only the description: no heading, numbering, quotes, or explanation.',
+}
 
 /** JSON response helper. */
 function json(value, status = 200) {
@@ -102,22 +140,92 @@ async function readBody(request) {
 }
 
 /**
+ * Condense one registered tool description into a panel summary.
+ * @param {unknown} description - registered tool description.
+ * @returns {string} single-line summary of at most {@link SUMMARY_LIMIT} characters.
+ */
+function summaryOf(description) {
+  if (typeof description !== 'string') return ''
+  return description.replace(/\s+/g, ' ').trim().slice(0, SUMMARY_LIMIT)
+}
+
+/**
+ * Build the two prompt halves for one description-generation request.
+ *
+ * Pure, so the budget and the language switch are testable without a model.
+ * The user half carries only the server's public name plus each tool's public
+ * name and description summary: the stored connection definition (URL, command,
+ * headers, environment, credentials) is deliberately absent, so nothing secret
+ * can be sent to the model by accident. At most {@link DESCRIBE_TOOL_BUDGET}
+ * characters of tool lines are kept; a tool line that does not fit is skipped
+ * on its own, so one oversized entry never drops the tools after it.
+ *
+ * @param {{server?: string, tools?: Array<{name?: string, description?: string}>, language?: string}} input - prompt input.
+ * @returns {{system: string, user: string}} system prompt and user content.
+ */
+export function buildDescribePrompt({ server, tools, language } = {}) {
+  const lang = language === 'en' ? 'en' : 'zh'
+  const name = typeof server === 'string' ? server : ''
+  const header = lang === 'en' ? `Server: ${name}\nTools:\n` : `服务：${name}\n工具清单：\n`
+  const lines = []
+  let used = header.length
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    if (!isObject(tool) || typeof tool.name !== 'string' || tool.name.length === 0) continue
+    const description = summaryOf(tool.description)
+    const line = description.length > 0 ? `- ${tool.name}: ${description}\n` : `- ${tool.name}\n`
+    if (used + line.length > DESCRIBE_TOOL_BUDGET) continue
+    lines.push(line)
+    used += line.length
+  }
+  return { system: DESCRIBE_SYSTEM[lang], user: header + lines.join('') }
+}
+
+/**
+ * Project one stored per-tool configuration, copying its string lists.
+ * @param {unknown} raw - stored tool config.
+ * @returns {{enabled: boolean, modes: string[], workspaces: string[]}} browser-safe config.
+ */
+function publicToolConfig(raw) {
+  const source = isObject(raw) ? raw : {}
+  return {
+    enabled: source.enabled !== false,
+    modes: Array.isArray(source.modes) ? [...source.modes] : [],
+    workspaces: Array.isArray(source.workspaces) ? [...source.workspaces] : [],
+  }
+}
+
+/**
+ * Project one member's per-tool configuration map (deep copy).
+ * @param {unknown} raw - stored `tools` map.
+ * @returns {Record<string, {enabled: boolean, modes: string[], workspaces: string[]}>} browser-safe map.
+ */
+function publicMcpTools(raw) {
+  const source = isObject(raw) ? raw : {}
+  const out = {}
+  for (const [name, config] of Object.entries(source)) out[name] = publicToolConfig(config)
+  return out
+}
+
+/**
  * Project one MCP member onto the fields the Settings page may see.
  *
  * `definition` carries URLs, commands, headers and environment variables —
  * including `Authorization` tokens — and never belongs in a browser response.
- * An explicit allow-list (activation scope only) also keeps any future
- * connection field from leaking by accident.
+ * An explicit allow-list (display configuration, activation scope and per-tool
+ * switches) also keeps any future connection field from leaking by accident.
  *
  * @param {unknown} member - stored MCP member.
  * @returns {object} browser-safe member.
  */
-function publicMcpMember(member) {
+export function publicMcpMember(member) {
   const source = isObject(member) ? member : {}
   const out = {
     enabled: source.enabled !== false,
     modes: Array.isArray(source.modes) ? [...source.modes] : [],
     workspaces: Array.isArray(source.workspaces) ? [...source.workspaces] : [],
+    description: typeof source.description === 'string' ? source.description : '',
+    disclosure: DISCLOSURE_MODES.includes(source.disclosure) ? source.disclosure : 'full',
+    tools: publicMcpTools(source.tools),
   }
   if (typeof source.installedAt === 'string' && source.installedAt.length > 0) out.installedAt = source.installedAt
   return out
@@ -153,13 +261,31 @@ export function publicState(state) {
  * @param {{ debug?: Function, warn?: Function, info?: Function }} [options.logger] - logger.
  * @param {{ timeoutMs?: number, intervalMs?: number }} [options.mountProbe] - MCP readiness window.
  * @param {object} [options.mounts] - shared mount tracker (boot re-mounts land here too).
+ * @param {number} [options.describeTimeoutMs] - override the description-generation deadline (tests).
+ * @param {(server: string) => ({ok: true}|{ok: false, reason: string}|null)|undefined} [options.discoverStatus] -
+ *   read the discover registration status of one progressive service (null when it has no entry).
+ * @param {(server: string) => ({ok: true}|{ok: false, reason: string})|undefined} [options.discoverPreflight] -
+ *   ask, without registering, whether a fully injected service's discover entry could register.
  */
-export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe, mounts = createMountTracker() } = {}) {
+export function registerWebApi({
+  ctx,
+  store,
+  meta,
+  onChanged,
+  logger,
+  mountProbe,
+  mounts = createMountTracker(),
+  describeTimeoutMs,
+  discoverStatus,
+  discoverPreflight,
+} = {}) {
   const debug = logger?.debug ?? (() => {})
   // "ready" means the server's tools are actually registered, not merely that a
   // Loader row exists: an unreachable server creates the row and never connects.
   const probeTimeoutMs = Number.isFinite(mountProbe?.timeoutMs) ? mountProbe.timeoutMs : DEFAULT_PROBE_TIMEOUT_MS
   const probeIntervalMs = Number.isFinite(mountProbe?.intervalMs) ? mountProbe.intervalMs : DEFAULT_PROBE_INTERVAL_MS
+  // The panel button gets a bounded deadline; tests shrink it to prove the abort.
+  const describeTimeout = Number.isFinite(describeTimeoutMs) && describeTimeoutMs > 0 ? describeTimeoutMs : DESCRIBE_TIMEOUT_MS
 
   // Always read the file for the panel: a cached document would hide an
   // external edit (including corruption) until the process restarted.
@@ -819,6 +945,372 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     }
   }
 
+  /** Read the global tool schemas, or `null` when the service is unavailable. */
+  const toolSchemas = () => {
+    const tools = ctx.get('tools')
+    if (tools === undefined || tools === null || typeof tools.schemas !== 'function') return null
+    try {
+      const schemas = tools.schemas()
+      return Array.isArray(schemas) ? schemas : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Report one unknown MCP member as a 404 instead of silently saving nothing. */
+  const unknownServer = (server) =>
+    Object.assign(new Error(`服务 ${server} 不存在`), { code: 'resource-pool/unknown-server', status: 404 })
+
+  /**
+   * Translate a route-thrown error into the panel's failure response: the
+   * explicit code/status win, everything else is an unclassified save failure.
+   */
+  const saveFailure = (error, fallbackCode = 'resource-pool/save-failed') => {
+    const code = typeof error?.code === 'string' ? error.code : fallbackCode
+    const status = error?.status === 404 ? 404 : error?.status === 400 ? 400 : 500
+    return failure(code, error instanceof Error ? error.message : String(error), status)
+  }
+
+  /**
+   * POST /dsh-skill-pool/mcp/config — save the panel description and/or the
+   * disclosure mode of one member.
+   *
+   * Only those two fields are touched: the connection definition, the member
+   * scope and `installedAt` survive the serialized read-modify-write. Invalid
+   * input is rejected here rather than sanitized, because the store's lenient
+   * normalizer would otherwise drop a bad value and silently keep the old one.
+   */
+  const mcpConfigRoute = async (request) => {
+    const body = await readBody(request)
+    const server = textOf(body.server)
+    if (server.length === 0) return failure('resource-pool/bad-server', '缺少 server')
+    const patch = {}
+    if (body.description !== undefined) {
+      if (typeof body.description !== 'string') {
+        return failure('resource-pool/bad-description', 'description 必须是字符串')
+      }
+      if (body.description.length > DESCRIPTION_LIMIT || /[\u0000-\u001f\u007f]/.test(body.description)) {
+        return failure(
+          'resource-pool/bad-description',
+          `description 必须是 ${DESCRIPTION_LIMIT} 字符以内的纯文本`,
+        )
+      }
+      patch.description = cleanDescription(body.description)
+    }
+    if (body.disclosure !== undefined) {
+      if (!DISCLOSURE_MODES.includes(body.disclosure)) {
+        return failure('resource-pool/bad-disclosure', "disclosure 必须是 'full' 或 'progressive'")
+      }
+      patch.disclosure = body.disclosure
+    }
+    try {
+      const state = await store.update((current) => {
+        if (!isObject(current.mcp?.[server])) throw unknownServer(server)
+        return setMcpConfig(current, server, patch)
+      })
+      return committed(state)
+    } catch (error) {
+      return saveFailure(error)
+    }
+  }
+
+  /**
+   * POST /dsh-skill-pool/mcp/tool — save or clear one tool's configuration.
+   *
+   * A new key must be a public name that can be attributed to exactly one
+   * service (`mcp__<server>__*`, unambiguous). A key that is already stored is
+   * accepted even while its tool is unregistered: a temporarily missing tool
+   * must keep its settings so they apply again when it comes back.
+   */
+  const mcpToolRoute = async (request) => {
+    const body = await readBody(request)
+    const server = textOf(body.server)
+    if (server.length === 0) return failure('resource-pool/bad-server', '缺少 server')
+    const tool = textOf(body.tool)
+    if (tool.length === 0) return failure('resource-pool/bad-tool', '缺少 tool')
+    if (tool.length > MCP_TOOL_KEY_LIMIT) {
+      return failure('resource-pool/bad-tool', `tool 长度不能超过 ${MCP_TOOL_KEY_LIMIT}`)
+    }
+    const clear = body.clear === true
+    const patch = {}
+    if (!clear) {
+      if (body.enabled !== undefined) {
+        if (typeof body.enabled !== 'boolean') return failure('resource-pool/bad-scope', 'enabled 必须是布尔值')
+        patch.enabled = body.enabled
+      }
+      try {
+        if (body.modes !== undefined) patch.modes = strictModes(body.modes, 'modes')
+        if (body.workspaces !== undefined) patch.workspaces = strictWorkspaces(body.workspaces, 'workspaces')
+      } catch (error) {
+        return failure('resource-pool/bad-scope', error instanceof Error ? error.message : String(error))
+      }
+    }
+    try {
+      const state = await store.update((current) => {
+        const member = isObject(current.mcp?.[server]) ? current.mcp[server] : undefined
+        if (member === undefined) throw unknownServer(server)
+        if (clear) return clearMcpToolConfig(current, server, tool)
+        const tools = isObject(member.tools) ? member.tools : {}
+        const known = Object.hasOwn(tools, tool)
+        if (!known && !(mcpServerOf(tool) === server && !isAmbiguousMcpToolName(tool))) {
+          throw Object.assign(new Error(`工具 ${tool} 无法唯一归属到服务 ${server}`), {
+            code: 'resource-pool/bad-tool',
+            status: 400,
+          })
+        }
+        return setMcpToolConfig(current, server, tool, patch)
+      })
+      return committed(state)
+    } catch (error) {
+      return saveFailure(error)
+    }
+  }
+
+  /**
+   * GET /dsh-skill-pool/mcp/tools?server= — the registered tools of one service
+   * plus the configuration preserved for tools that are currently absent.
+   *
+   * Only public names and description summaries are returned; the connection
+   * definition never appears here.
+   */
+  const mcpToolsRoute = async (request) => {
+    const server = textOf(new URL(request.url).searchParams.get('server'))
+    if (server.length === 0) return failure('resource-pool/bad-server', '缺少 server')
+    const state = await readState()
+    const member = isObject(state.mcp?.[server]) ? state.mcp[server] : undefined
+    if (member === undefined) return failure('resource-pool/unknown-server', `服务 ${server} 不存在`, 404)
+    const schemas = toolSchemas()
+    if (schemas === null) return failure('resource-pool/tools-unavailable', '无法读取 MCP 工具列表', 500)
+
+    // Register order wins: the first schema seen for a name is the one shown.
+    const registered = new Map()
+    for (const schema of schemas) {
+      if (!isObject(schema) || typeof schema.name !== 'string') continue
+      if (mcpServerOf(schema.name) !== server) continue
+      if (!registered.has(schema.name)) registered.set(schema.name, schema.description)
+    }
+    const configs = publicMcpTools(member.tools)
+    const names = new Set(registered.keys())
+    for (const name of Object.keys(configs)) {
+      // History is only listed for tools that belong (or belonged) to this
+      // service; a foreign key is never shown as this service's tool.
+      if (mcpServerOf(name) === server) names.add(name)
+    }
+
+    const tools = [...names].sort().map((name) => ({
+      name,
+      summary: registered.has(name) ? summaryOf(registered.get(name)) : '',
+      registered: registered.has(name),
+      config: Object.hasOwn(configs, name) ? configs[name] : null,
+      ambiguous: isAmbiguousMcpToolName(name),
+    }))
+    // A progressive member cannot work without its discover entry: the panel
+    // must be able to explain a name conflict or an unreadable tool list
+    // instead of offering an injection switch that cannot take effect. The
+    // status carries a machine reason only (never a tool name or a definition).
+    const progressive = member.disclosure === 'progressive'
+    const gateOn = state.settings?.enabled !== false && state.settings?.mcpGate !== false
+    let discover = null
+    if (gateOn && member.enabled !== false) {
+      if (progressive) {
+        discover = typeof discoverStatus === 'function'
+          ? discoverStatus(server) ?? { ok: false, reason: 'unavailable' }
+          : null
+      } else if (typeof discoverPreflight === 'function') {
+        // Still fully injected: the panel needs to know whether switching to
+        // progressive could register its discover entry at all.
+        discover = discoverPreflight(server) ?? { ok: false, reason: 'unavailable' }
+      }
+    }
+    return json({
+      ok: true,
+      server,
+      description: typeof member.description === 'string' ? member.description : '',
+      disclosure: DISCLOSURE_MODES.includes(member.disclosure) ? member.disclosure : 'full',
+      discover,
+      tools,
+    })
+  }
+
+  /**
+   * Failure answer for the describe route: a stable machine code plus a short
+   * panel-facing message.
+   *
+   * This route is the one panel call whose failure the UI renders directly, so
+   * it answers `{ok:false, error, message}` with `error` as the code string (the
+   * spec's shape) instead of the nested `{code, message}` other routes use.
+   * Provider and state details never reach the browser or the log.
+   */
+  const describeFailure = (code, message, status) => json({ ok: false, error: code, message }, status)
+
+  /**
+   * Combine the generation deadline with the panel request's own abort signal,
+   * so a closed tab cancels the model call instead of waiting out the deadline.
+   *
+   * @param {{signal?: AbortSignal}|undefined} request - incoming panel request.
+   * @param {AbortController} controller - deadline controller for this call.
+   * @returns {{signal: AbortSignal, detach?: () => void}} signal to pass to the model and optional cleanup.
+   */
+  const streamSignalOf = (request, controller) => {
+    const client = request?.signal
+    if (!(client instanceof AbortSignal)) return { signal: controller.signal }
+    if (typeof AbortSignal.any === 'function') {
+      return { signal: AbortSignal.any([controller.signal, client]) }
+    }
+    const forward = () => controller.abort()
+    if (client.aborted) controller.abort()
+    else client.addEventListener('abort', forward, { once: true })
+    return { signal: controller.signal, detach: () => client.removeEventListener('abort', forward) }
+  }
+
+  /**
+   * POST /dsh-skill-pool/mcp/describe — draft a purpose description for one
+   * MCP server with the default model.
+   *
+   * Only the service's current public tool names and description summaries are
+   * sent to the model (ambiguous and foreign names are dropped). The stored
+   * connection definition — URL, command, headers, environment, credentials —
+   * is never part of the request. The generated text is returned to the panel
+   * as a draft and is deliberately not saved: the user confirms through
+   * `/mcp/config`. A service the optional `mcpManager` reports as not connected
+   * answers `offline` before its stale catalog is read.
+   *
+   * `LlmRuntime.stream()` does not throw on adapter failures: it normalizes
+   * them into a terminal `finish` chunk, so the terminal reason decides the
+   * answer. Only a `stop` finish is a complete description; `error`, `aborted`,
+   * `max-tokens` and unknown reasons yield no draft at all. The deadline and
+   * the panel request both abort the call, and the stream iterator is always
+   * closed so an abandoned generation cannot outlive the request.
+   */
+  const mcpDescribeRoute = async (request) => {
+    const body = await readBody(request)
+    const server = textOf(body.server)
+    if (server.length === 0) return describeFailure('bad-server', '缺少 server', 400)
+
+    let state
+    try {
+      state = await readState()
+    } catch (error) {
+      // Fail closed: an untrusted document yields no generation attempt at all.
+      if (error instanceof StateReadError) return describeFailure(error.code, '状态不可读，无法生成描述', 500)
+      throw error
+    }
+    if (!isObject(state.mcp?.[server])) return describeFailure('unknown-server', `服务 ${server} 不存在`, 404)
+
+    // Offline first: a catalog left behind by a dead connection is not usable,
+    // so no description is generated for it. This is the same optional manager
+    // check the discover tool uses; an absent manager or a missing entry
+    // degrades to the registry.
+    if (mcpServerOffline(ctx, server)) return describeFailure('offline', `服务 ${server} 当前离线`, 503)
+
+    const schemas = toolSchemas()
+    if (schemas === null) return describeFailure('tools-unavailable', '无法读取 MCP 工具列表', 500)
+    const tools = []
+    for (const schema of schemas) {
+      if (!isObject(schema) || typeof schema.name !== 'string') continue
+      if (mcpServerOf(schema.name) !== server) continue
+      // A name that cannot be attributed to exactly one service is not offered
+      // as this service's tool, in the prompt or anywhere else.
+      if (isAmbiguousMcpToolName(schema.name)) continue
+      tools.push({ name: schema.name, description: schema.description })
+    }
+    if (tools.length === 0) return describeFailure('no-tools', '该服务当前没有可用工具', 400)
+
+    // Both host services are optional and read without an inject requirement.
+    // The default model is resolved first: without it there is nothing to call.
+    const defaults = ctx.get('agentDefaultModel')
+    let selection
+    try {
+      selection = typeof defaults?.currentSelection === 'function' ? defaults.currentSelection() : undefined
+    } catch {
+      selection = undefined
+    }
+    if (!isObject(selection) || textOf(selection.provider).length === 0 || textOf(selection.model).length === 0) {
+      return describeFailure('no-default-model', '没有可用的默认模型', 503)
+    }
+    const llm = ctx.get('llm')
+    if (llm === null || llm === undefined || typeof llm.stream !== 'function') {
+      return describeFailure('no-llm', '缺少 llm 服务，无法生成描述', 503)
+    }
+
+    const prompt = buildDescribePrompt({ server, tools, language: body.language })
+    const controller = new AbortController()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, describeTimeout)
+    const { signal, detach } = streamSignalOf(request, controller)
+    let text = ''
+    let failure = ''
+    let iterator
+    try {
+      iterator = llm.stream({
+        provider: selection.provider,
+        model: selection.model,
+        ...(typeof selection.reasoningEffort === 'string' && selection.reasoningEffort.length > 0
+          ? { reasoningEffort: selection.reasoningEffort }
+          : {}),
+        // One-shot user input in the host's model-facing text-block shape.
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt.user }] }],
+        system: prompt.system,
+        maxTokens: DESCRIBE_MAX_TOKENS,
+        signal,
+      })[Symbol.asyncIterator]()
+      while (failure.length === 0) {
+        const step = await iterator.next()
+        if (step.done === true) break
+        const chunk = step.value
+        if (!isObject(chunk)) continue
+        if (chunk.type === 'text-delta') {
+          if (typeof chunk.text === 'string') text += chunk.text
+          continue
+        }
+        if (chunk.type !== 'finish') continue
+        const kind = isObject(chunk.reason) ? chunk.reason.kind : undefined
+        // Only a normal stop is a complete description. A truncated completion
+        // (`max-tokens`), a provider failure (`error`), a cancellation
+        // (`aborted`) or an unknown terminal reason all discard the text.
+        if (kind !== 'stop') failure = 'generate-failed'
+        break
+      }
+    } catch {
+      // Middleware may still throw; the runtime's own failures arrive as
+      // finish chunks and are handled above.
+      failure = 'generate-failed'
+    } finally {
+      clearTimeout(timer)
+      detach?.()
+      // Close the iterator so a timeout or a closed tab cancels the model call.
+      // Deliberately not awaited: a stalled provider must not outlive the
+      // deadline just because its generator never settles.
+      try {
+        const closed = iterator?.return?.()
+        if (closed !== undefined && typeof closed.then === 'function') closed.catch(() => {})
+      } catch {
+        // The stream is already gone; nothing to close.
+      }
+    }
+    if (timedOut) {
+      debug(`[resource-pool] describe ${server}: timed out`)
+      return describeFailure('timeout', '生成超时，请重试', 504)
+    }
+    if (failure.length > 0) {
+      // Never log provider text or model output: either may echo the request.
+      debug(`[resource-pool] describe ${server}: generation failed`)
+      return describeFailure('generate-failed', '模型生成失败，请重试', 502)
+    }
+
+    // The draft must be a value the panel can save unchanged: plain text within
+    // the stored description limit, never a half sentence padded with markup.
+    const description = cleanDescription(text)
+    if (description.length === 0) {
+      debug(`[resource-pool] describe ${server}: empty output`)
+      return describeFailure('generate-failed', '模型未返回可用描述', 502)
+    }
+    return json({ ok: true, description })
+  }
+
   /** POST /dsh-skill-pool/skill/upload — install skill bundles from plain files. */
   const skillUploadRoute = async (request) => {
     const body = await readBody(request)
@@ -1237,6 +1729,10 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     ['/source/delete', ['POST'], guarded(sourceDeleteRoute)],
     ['/mcp/import', ['POST'], guarded(mcpImportRoute)],
     ['/mcp/remove', ['POST'], guarded(mcpRemoveRoute)],
+    ['/mcp/config', ['POST'], guarded(mcpConfigRoute)],
+    ['/mcp/tool', ['POST'], guarded(mcpToolRoute)],
+    ['/mcp/tools', ['GET'], guarded(mcpToolsRoute)],
+    ['/mcp/describe', ['POST'], guarded(mcpDescribeRoute)],
     ['/mounts', ['GET'], guarded(mountsRoute)],
   ]
 
@@ -1301,11 +1797,22 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       await writeNodeResponse(failure('resource-pool/too-large', error instanceof Error ? error.message : String(error), 413), res)
       return
     }
+    // A panel tab closing mid-request must cancel what the handler is waiting
+    // on (the describe route forwards this signal to the model call). The Node
+    // response emits 'close' both when it finished normally and when the socket
+    // died; only the latter means the client is gone.
+    const disconnect = new AbortController()
+    if (typeof res.on === 'function') {
+      res.on('close', () => {
+        if (res.writableFinished !== true) disconnect.abort()
+      })
+    }
     let request
     try {
       request = new Request(url.toString(), {
         method,
         headers,
+        signal: disconnect.signal,
         ...(body === undefined || body.length === 0 ? {} : { body }),
       })
     } catch (error) {
@@ -1376,6 +1883,10 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     debug(`registered ${routes.length} resource pool routes under ${ROUTE_PREFIX} (exact fetch)`)
   }
 
-  // Host-independent seam for scope-preservation tests; production ignores it.
-  return { testHooks: { captureEffectiveScopes, installItems } }
+  // Host-independent seams for tests; production ignores them.
+  //
+  // `routes` is the same array the transport registers, so a Node test can call
+  // one handler directly without a web server. `testHooks` keeps the previous
+  // scope-preservation seam working; existing callers ignore the whole object.
+  return { routes, testHooks: { captureEffectiveScopes, installItems } }
 }

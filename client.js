@@ -102,6 +102,36 @@ window.__ModuleLoader__.load({
         sourceFrom: '来源',
         sourceNone: '无来源',
         skillMissing: '（清单中已不存在，可能已被删除）',
+        // MCP member card: purpose description, injection mode and per-tool rows.
+        mcpDescription: '用途描述',
+        mcpDescriptionPlaceholder: '这个 MCP 服务适合什么任务？',
+        mcpDescriptionHint: '用于发现入口的说明；留空时使用通用描述。最多 {count} 字符。',
+        mcpDescribe: 'AI 生成',
+        mcpDescribing: '生成中…',
+        mcpDescribeFailed: '生成失败',
+        mcpDescribeEmpty: '模型没有返回可用的描述',
+        mcpInjectMode: '工具注入',
+        mcpInjectFull: '完整注入',
+        mcpInjectProgressive: '渐进注入',
+        mcpInjectFullHint: '会话启动时注入该服务的全部工具。',
+        mcpInjectProgressiveHint: '会话先只出现一个发现入口，调用后才展开工具。',
+        mcpGateOff: 'MCP 门控已关闭，渐进注入不生效',
+        mcpToolsTitle: '工具',
+        mcpToolsLoading: '工具加载中…',
+        mcpToolsFailed: '工具列表读取失败',
+        mcpToolsEmpty: '当前没有可配置的工具。',
+        mcpToolUnavailable: '不可用',
+        mcpToolAmbiguous: '名称无法唯一归属，不能单独配置',
+        mcpToolClear: '清除配置',
+        mcpScopeHint: '逐接口作用域与成员作用域是 AND。',
+        mcpHint: '渐进注入只隐藏工具 Schema；MCP resources 与 server instructions 不受影响；展开状态每个会话独立，重启/重连后重新发现；逐接口作用域与成员作用域是 AND。',
+        mcpDiscoverUnavailable: '发现入口不可用：{reason}',
+        mcpDiscoverReasonConflict: '名称冲突',
+        mcpDiscoverReasonInvalidName: '名称不合法',
+        mcpDiscoverReasonToolsUnavailable: '工具列表不可读',
+        mcpDiscoverReasonRegisterFailed: '注册失败',
+        mcpDiscoverReasonUnavailable: '渐进注入当前不可用',
+        mcpDiscoverBlocked: '发现入口不可用时不能切到渐进注入；请先解决名称冲突或工具列表读取失败。',
         emptyTitle: '还没有资源',
         emptyHint: '用右上角的「导入资源」上传技能文件、ZIP 包、从 Git 导入，或粘贴 MCP JSON。导入后立即成为技能池成员，条件在资源行上单独设置。',
         systemSkillsTitle: '系统技能',
@@ -302,6 +332,36 @@ window.__ModuleLoader__.load({
         sourceFrom: 'Source',
         sourceNone: 'No source',
         skillMissing: '(no longer in the inventory; it may have been deleted)',
+        // MCP member card: purpose description, injection mode and per-tool rows.
+        mcpDescription: 'Purpose description',
+        mcpDescriptionPlaceholder: 'What is this MCP server good for?',
+        mcpDescriptionHint: 'Used in the discover entry description; empty falls back to the generic one. At most {count} characters.',
+        mcpDescribe: 'AI generate',
+        mcpDescribing: 'Generating…',
+        mcpDescribeFailed: 'Generation failed',
+        mcpDescribeEmpty: 'The model returned no usable description',
+        mcpInjectMode: 'Tool injection',
+        mcpInjectFull: 'Full injection',
+        mcpInjectProgressive: 'Progressive injection',
+        mcpInjectFullHint: 'Every tool of this server is injected when a session starts.',
+        mcpInjectProgressiveHint: 'A session starts with one discover entry and expands the tools only when it is called.',
+        mcpGateOff: 'MCP gate is off, progressive injection has no effect',
+        mcpToolsTitle: 'Tools',
+        mcpToolsLoading: 'Loading tools…',
+        mcpToolsFailed: 'Could not read the tool list',
+        mcpToolsEmpty: 'No configurable tools right now.',
+        mcpToolUnavailable: 'Unavailable',
+        mcpToolAmbiguous: 'Name cannot be attributed uniquely; it cannot be configured alone',
+        mcpToolClear: 'Clear config',
+        mcpScopeHint: 'Per-tool scope and member scope are combined with AND.',
+        mcpHint: 'Progressive injection hides tool schemas only; MCP resources and server instructions are unaffected. Expansion is per session and is rediscovered after a restart/reconnect. Per-tool scope and member scope are combined with AND.',
+        mcpDiscoverUnavailable: 'Discover entry unavailable: {reason}',
+        mcpDiscoverReasonConflict: 'name conflict',
+        mcpDiscoverReasonInvalidName: 'invalid name',
+        mcpDiscoverReasonToolsUnavailable: 'tool list unreadable',
+        mcpDiscoverReasonRegisterFailed: 'registration failed',
+        mcpDiscoverReasonUnavailable: 'progressive injection is currently unavailable',
+        mcpDiscoverBlocked: 'Progressive injection cannot be selected while the discover entry is unavailable; resolve the name conflict or the unreadable tool list first.',
         emptyTitle: 'No resources yet',
         emptyHint: 'Use “Import” in the top-right corner to upload skill files, a ZIP archive, import from Git, or paste MCP JSON. Everything you import joins the pool immediately; conditions are set on its row.',
         systemSkillsTitle: 'System skills',
@@ -470,6 +530,17 @@ window.__ModuleLoader__.load({
     const SKILL = 'skill'
     const MCP = 'mcp'
     const ITEM_DEBOUNCE_MS = 320
+    const ROW_DRAFT_KEYS = Object.freeze([
+      'enabled',
+      'modes',
+      'workspaces',
+      'modesFrom',
+      'workspacesFrom',
+    ])
+    // Mirrors the Host's limits so the panel can stop an invalid draft before
+    // it reaches a route that would reject it with 400.
+    const MCP_DESCRIPTION_LIMIT = 500
+    const MCP_TOOL_KEY_LIMIT = 128
     const MOUNT_POLL_MS = 1600
     const MAX_UPLOAD_BYTES = 5 * 1024 * 1024
     const MAX_ZIP_BYTES = 20 * 1024 * 1024
@@ -548,6 +619,28 @@ window.__ModuleLoader__.load({
       return String(cause === undefined || cause === null ? '' : cause)
     }
 
+    /**
+     * Readable failure text from an API failure body.
+     *
+     * Most routes answer `{ok:false, error:{code,message}}`, but `/mcp/describe`
+     * answers the flat `{ok:false, error:<code>, message}` shape. The panel must
+     * show the reason for both instead of a bare HTTP status; a body without a
+     * message falls back to the code.
+     */
+    function failureTextOf(payload) {
+      const source = asObject(payload)
+      const error = source.error
+      if (typeof error === 'string') {
+        const code = error.trim()
+        const message = asString(source.message).trim()
+        if (message.length === 0) return code
+        return code.length === 0 ? message : `${code}: ${message}`
+      }
+      const detail = asObject(error)
+      const message = asString(detail.message).trim()
+      return message.length > 0 ? message : asString(detail.code).trim()
+    }
+
     function baseName(path) {
       const text = asString(path).replace(/\\/g, '/')
       const parts = text.split('/').filter((part) => part.length > 0)
@@ -574,6 +667,81 @@ window.__ModuleLoader__.load({
       return text.length > 10 ? text.slice(0, 8) + '…' : text
     }
 
+    /**
+     * Strip the characters the `/mcp/config` route rejects (C0 controls and DEL)
+     * before a draft is shown or sent. The textarea must never hand the Host a
+     * value it will answer with 400, including pasted multi-line text.
+     */
+    function cleanPanelDescription(raw) {
+      return asString(raw)
+        .replace(/[\u0000-\u001f\u007f]/g, '')
+        .slice(0, MCP_DESCRIPTION_LIMIT)
+    }
+
+    /**
+     * Human-readable reason for a discover registration failure.
+     *
+     * The Host sends only a stable machine reason (never a tool name or a
+     * definition), so the map is closed; an unknown reason falls back to a
+     * generic "currently unavailable" instead of echoing raw text.
+     */
+    function discoverUnavailableText(discover) {
+      if (!discover || typeof discover !== 'object' || discover.ok !== false) return ''
+      const reasons = {
+        'name-conflict': t('mcpDiscoverReasonConflict'),
+        'invalid-name': t('mcpDiscoverReasonInvalidName'),
+        'tools-unavailable': t('mcpDiscoverReasonToolsUnavailable'),
+        'register-failed': t('mcpDiscoverReasonRegisterFailed'),
+      }
+      const reason = typeof discover.reason === 'string' ? discover.reason : ''
+      return tf('mcpDiscoverUnavailable', {
+        reason: Object.hasOwn(reasons, reason) ? reasons[reason] : t('mcpDiscoverReasonUnavailable'),
+      })
+    }
+
+    /** Normalize one per-tool scope, defaulting to enabled/unrestricted. */
+    function normalizeToolScope(raw) {
+      const source = asObject(raw)
+      return {
+        enabled: source.enabled !== false,
+        modes: asStringArray(source.modes),
+        workspaces: uniqueStrings(asArray(source.workspaces).map(normalizePath)),
+      }
+    }
+
+    /**
+     * Normalize the per-tool configuration map of one MCP member.
+     *
+     * The Host accepts only keys that can be MCP tool names, and the panel keeps
+     * the same rule so a malformed draft can never become a toggle that writes
+     * something the route will reject. An unusable entry is dropped.
+     */
+    function normalizeMcpTools(raw) {
+      const source = asObject(raw)
+      const out = {}
+      for (const [key, value] of Object.entries(source)) {
+        if (typeof key !== 'string' || !key.startsWith('mcp__') || key.length > MCP_TOOL_KEY_LIMIT) continue
+        out[key] = normalizeToolScope(value)
+      }
+      return out
+    }
+
+    /**
+     * Scope-only projection of a member. Row drafts carry exactly these keys:
+     * copying the whole entry would let an unsaved scope draft restore stale
+     * `description`/`disclosure`/`tools` over newer saved values on a reload.
+     */
+    function rowDraftOf(raw) {
+      const source = asObject(raw)
+      return {
+        enabled: source.enabled !== false,
+        modes: asStringArray(source.modes),
+        workspaces: uniqueStrings(asArray(source.workspaces).map(normalizePath)),
+        modesFrom: asString(source.modesFrom) === 'self' ? 'self' : 'group',
+        workspacesFrom: asString(source.workspacesFrom) === 'self' ? 'self' : 'group',
+      }
+    }
+
     function blankEntry() {
       return {
         enabled: true,
@@ -584,20 +752,22 @@ window.__ModuleLoader__.load({
         sourceId: '',
         digest: '',
         installedAt: '',
+        description: '',
+        disclosure: 'full',
+        tools: {},
       }
     }
 
     function normalizeEntry(raw) {
       const source = asObject(raw)
       const entry = {
-        enabled: source.enabled !== false,
-        modes: asStringArray(source.modes),
-        workspaces: uniqueStrings(asArray(source.workspaces).map(normalizePath)),
-        modesFrom: asString(source.modesFrom) === 'self' ? 'self' : 'group',
-        workspacesFrom: asString(source.workspacesFrom) === 'self' ? 'self' : 'group',
+        ...rowDraftOf(source),
         sourceId: asString(source.sourceId),
         digest: asString(source.digest),
         installedAt: asString(source.installedAt),
+        description: cleanPanelDescription(source.description),
+        disclosure: source.disclosure === 'progressive' ? 'progressive' : 'full',
+        tools: normalizeMcpTools(source.tools),
       }
       return entry
     }
@@ -614,6 +784,47 @@ window.__ModuleLoader__.load({
         modesFrom: entry.modesFrom === 'self' ? 'self' : 'group',
         workspacesFrom: entry.workspacesFrom === 'self' ? 'self' : 'group',
       }
+    }
+
+    /**
+     * Build the `/mcp/tool` request body for one pending per-tool save.
+     *
+     * A clear request carries only the identity: sending `enabled`/`modes` with
+     * `clear` would make the route's intent ambiguous. Any other draft is sent in
+     * full so one toggle can never drop the tool's other fields.
+     */
+    function buildToolSaveBody(server, tool, draft) {
+      const source = asObject(draft)
+      if (source.clear === true) return { server, tool, clear: true }
+      const scope = normalizeToolScope(source)
+      return {
+        server,
+        tool,
+        enabled: scope.enabled,
+        modes: scope.modes,
+        workspaces: scope.workspaces,
+      }
+    }
+
+    /**
+     * Remove the config fields a completed save wrote from the local draft map.
+     *
+     * A request carries only the fields the user changed; deleting the whole
+     * server entry would throw away a newer draft that was never sent (for
+     * example an AI-generated description followed by an injection-mode save).
+     * A field still queued or holding a newer local value is kept.
+     */
+    function configDraftAfterSave(draft, patch, queued) {
+      const source = asObject(draft)
+      const sent = asObject(patch)
+      const waiting = asObject(queued)
+      const out = { ...source }
+      for (const key of ['description', 'disclosure']) {
+        if (sent[key] === undefined) continue
+        if (waiting[key] !== undefined) continue
+        if (Object.hasOwn(out, key) && out[key] === sent[key]) delete out[key]
+      }
+      return out
     }
 
     /**
@@ -897,10 +1108,9 @@ window.__ModuleLoader__.load({
         throw new Error(`${TEXT.networkFailed}: ${messageOf(cause)}`)
       }
       const payload = await response.json().catch(() => null)
-      const apiError =
-        payload && typeof payload === 'object' && payload.error && typeof payload.error.message === 'string'
-          ? payload.error.message
-          : ''
+      // Accept both failure shapes: most routes nest `{error:{code,message}}`,
+      // while `/mcp/describe` returns `{ok:false, error:<code>, message}`.
+      const apiError = payload && typeof payload === 'object' ? failureTextOf(payload) : ''
       if (!response.ok) throw new Error(apiError || `HTTP ${response.status}`)
       if (!payload || typeof payload !== 'object' || payload.ok !== true) {
         throw new Error(apiError || TEXT.badResponse)
@@ -918,6 +1128,22 @@ window.__ModuleLoader__.load({
       const next = { ...state[key] }
       delete next[name]
       return { ...state, [key]: next }
+    }
+
+    /**
+     * Stable queue key for one per-tool save. A NUL separator cannot appear in a
+     * server or public tool name, so two members can never collide.
+     */
+    function mcpToolJobKey(server, tool) {
+      return `${asString(server)}\u0000${asString(tool)}`
+    }
+
+    /** Split a `server\0tool` job key back into its two names. */
+    function mcpToolJobParts(key) {
+      const text = asString(key)
+      const separator = text.indexOf('\u0000')
+      if (separator <= 0) return null
+      return { server: text.slice(0, separator), tool: text.slice(separator + 1) }
     }
 
     /** Split a `kind:name` row key into its namespace and member name. */
@@ -968,7 +1194,15 @@ window.__ModuleLoader__.load({
         // Never resurrect a member the authoritative document no longer has:
         // another tab may have deleted it while this draft was being typed.
         if (!hasLoadedMember(loadedState, key)) continue
-        next = withEntry(next, row.kind, row.name, entry)
+        const bucket = row.kind === MCP ? next.mcp : next.skills
+        const loaded = bucket[row.name] || {}
+        // A row draft owns the scope only; never let it roll back MCP display or
+        // per-tool fields that a newer save may have written.
+        const patch = {}
+        for (const field of ROW_DRAFT_KEYS) {
+          if (Object.hasOwn(entry, field)) patch[field] = entry[field]
+        }
+        next = withEntry(next, row.kind, row.name, { ...loaded, ...patch })
       }
       return next
     }
@@ -2171,6 +2405,49 @@ window.__ModuleLoader__.load({
         borderTop: '1px solid var(--rp-line)',
         paddingTop: '12px',
       },
+      // MCP member card: display configuration sits above the per-tool rows so
+      // the row's enabled switch keeps its usual place on the right.
+      mcpConfig: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '8px',
+        border: '1px solid var(--rp-line)',
+        borderRadius: '8px',
+        background: 'var(--rp-card-2)',
+        padding: '10px',
+        minWidth: 0,
+      },
+      mcpConfigActions: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', minWidth: 0 },
+      mcpToolBlock: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 },
+      mcpToolHead: {
+        display: 'flex',
+        alignItems: 'center',
+        flexWrap: 'wrap',
+        gap: '8px',
+        padding: '2px',
+        cursor: 'pointer',
+        minWidth: 0,
+      },
+      mcpToolRow: {
+        display: 'flex',
+        flexDirection: 'column',
+        gap: '4px',
+        borderTop: '1px solid var(--rp-line)',
+        padding: '7px 2px',
+        minWidth: 0,
+      },
+      mcpToolMain: { display: 'flex', flexDirection: 'column', gap: '2px', minWidth: 0 },
+      mcpToolHistory: { opacity: 0.62 },
+      mcpToolEditor: {
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+        gap: '10px',
+        border: '1px solid var(--rp-line)',
+        borderRadius: '8px',
+        background: 'var(--rp-card-2)',
+        padding: '10px',
+      },
+      mcpHint: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.5 },
       resultBox: {
         display: 'flex',
         flexDirection: 'column',
@@ -2216,6 +2493,12 @@ window.__ModuleLoader__.load({
       const [pool, setPool] = useState(null)
       const [previewBusy, setPreviewBusy] = useState(false)
       const [previewError, setPreviewError] = useState('')
+      // Per-server `GET /mcp/tools` result. Kept outside the board because it is
+      // a derived catalog: the Host remains the authority for the board state.
+      const [mcpToolCatalog, setMcpToolCatalog] = useState({})
+      // Set right after `loadMcpTools` exists; a disclosure save uses it to
+      // refresh the card's discover status (the callback is defined earlier).
+      const loadMcpToolsRef = useRef(null)
       const mounted = useRef(true)
       const loadingRef = useRef(false)
       const pendingRef = useRef(new Map())
@@ -2226,6 +2509,20 @@ window.__ModuleLoader__.load({
       const boardRevisionRef = useRef(0)
       const timersRef = useRef(new Map())
       const groupTimersRef = useRef(new Map())
+      // MCP display configuration and per-tool saves are debounced and
+      // serialized like rows, but kept in their own queues: a description save
+      // must never be merged into the member-scope `/item` body (that route does
+      // not own those fields).
+      const configQueueRef = useRef(new Map())
+      const configSeqRef = useRef(new Map())
+      const configTimersRef = useRef(new Map())
+      const configChainsRef = useRef(new Map())
+      const configDraftsRef = useRef(new Map())
+      const toolQueueRef = useRef(new Map())
+      const toolSeqRef = useRef(new Map())
+      const toolTimersRef = useRef(new Map())
+      const toolChainsRef = useRef(new Map())
+      const toolDraftsRef = useRef(new Map())
       const noticeTimer = useRef(null)
       const previewInitialized = useRef(false)
       const boardRef = useRef(null)
@@ -2238,10 +2535,22 @@ window.__ModuleLoader__.load({
           mounted.current = false
           for (const timer of timersRef.current.values()) clearTimeout(timer)
           timersRef.current.clear()
+          for (const timer of configTimersRef.current.values()) clearTimeout(timer)
+          configTimersRef.current.clear()
+          for (const timer of toolTimersRef.current.values()) clearTimeout(timer)
+          toolTimersRef.current.clear()
           pendingRef.current.clear()
           editSeqRef.current.clear()
           writeChainsRef.current.clear()
           draftsRef.current.clear()
+          configQueueRef.current.clear()
+          configSeqRef.current.clear()
+          configChainsRef.current.clear()
+          configDraftsRef.current.clear()
+          toolQueueRef.current.clear()
+          toolSeqRef.current.clear()
+          toolChainsRef.current.clear()
+          toolDraftsRef.current.clear()
           removingRef.current.clear()
           if (noticeTimer.current) clearTimeout(noticeTimer.current)
         }
@@ -2297,7 +2606,12 @@ window.__ModuleLoader__.load({
       }, [])
 
       const setRowError = useCallback((key, message) => {
-        setRowErrors((current) => ({ ...current, [key]: message }))
+        setRowErrors((current) => {
+          // A superseded failure still has to surface; only an identical message
+          // is deduped, never dropped because a newer request exists.
+          if (current[key] === message) return current
+          return { ...current, [key]: message }
+        })
       }, [])
 
       const clearRowError = useCallback((key) => {
@@ -2348,7 +2662,22 @@ window.__ModuleLoader__.load({
                 const canonical = job.kind === MCP ? nextState.mcp[job.name] : nextState.skills[job.name]
                 setBoard((current) => {
                   if (!current) return current
-                  const state = applyItemSave(current.state, job.kind, job.name, canonical)
+                  // `/item` owns only the member scope. Its response is a snapshot
+                  // and may predate a concurrent config/tool save, so keep the
+                  // fields that route never writes from the local document.
+                  let effective = canonical
+                  if (job.kind === MCP && canonical) {
+                    const local = current.state.mcp[job.name]
+                    if (local) {
+                      effective = {
+                        ...canonical,
+                        description: local.description,
+                        disclosure: local.disclosure,
+                        tools: local.tools,
+                      }
+                    }
+                  }
+                  const state = applyItemSave(current.state, job.kind, job.name, effective)
                   return state === current.state ? current : { ...current, state }
                 })
               }
@@ -2396,6 +2725,282 @@ window.__ModuleLoader__.load({
         [flushItem, markSaving],
       )
 
+      /**
+       * Flush one server's pending `/mcp/config` patch.
+       *
+       * Only the fields this request owns are applied from the canonical
+       * response: the route returns the whole member, and replacing it wholesale
+       * could roll back a concurrent per-tool or scope save.
+       */
+      const flushMcpConfig = useCallback(
+        async (server) => {
+          const job = configQueueRef.current.get(server)
+          if (!job) {
+            markSaving(`mcp-config:${server}`, false)
+            return
+          }
+          configQueueRef.current.delete(server)
+          markSaving(`mcp-config:${server}`, true)
+          const sequence = configSeqRef.current.get(server) ?? 0
+          const patch = { ...job }
+          const body = { server, ...patch }
+          const previous = configChainsRef.current.get(server) ?? Promise.resolve()
+          const run = previous.then(async () => {
+            if (!mounted.current) return
+            try {
+              const payload = await request(`${API}/mcp/config`, { method: 'POST', body })
+              if (!mounted.current) return
+              surfaceWarning(payload)
+              boardRevisionRef.current += 1
+              // Drop only the fields this request carried. A description that
+              // arrived later (an AI draft, or a queued edit) must survive an
+              // injection-mode save; a field still queued stays a draft too.
+              const remaining = configDraftAfterSave(
+                configDraftsRef.current.get(server),
+                patch,
+                configQueueRef.current.get(server),
+              )
+              if (Object.keys(remaining).length === 0) configDraftsRef.current.delete(server)
+              else configDraftsRef.current.set(server, remaining)
+              const currentSequence = configSeqRef.current.get(server) ?? 0
+              if (currentSequence !== sequence) return
+              const canonical = payload.state ? normalizeState(payload.state).mcp[server] : undefined
+              if (canonical) {
+                setBoard((current) => {
+                  if (!current) return current
+                  const member = current.state.mcp[server]
+                  if (!member) return current
+                  const next = { ...member }
+                  if (patch.description !== undefined) next.description = canonical.description
+                  if (patch.disclosure !== undefined) next.disclosure = canonical.disclosure
+                  return { ...current, state: withEntry(current.state, MCP, server, next) }
+                })
+              }
+              // Reconcile this member's discover status immediately: switching
+              // to progressive may have failed (already taken name, unreadable
+              // list) or an earlier failure may just have been repaired.
+              if (patch.disclosure !== undefined) void loadMcpToolsRef.current?.(server)
+              if (!configQueueRef.current.has(server)) clearRowError(`mcp-config:${server}`)
+            } catch (cause) {
+              // Keep the optimistic value and its draft: an inline error means the
+              // user can retry, never that the text silently vanished. A failure
+              // whose edit was superseded still surfaces (an identical message is
+              // deduped by setRowError) instead of vanishing with its sequence.
+              if (mounted.current) setRowError(`mcp-config:${server}`, messageOf(cause))
+            } finally {
+              if (
+                mounted.current &&
+                !configQueueRef.current.has(server) &&
+                (configSeqRef.current.get(server) ?? 0) === sequence
+              ) {
+                markSaving(`mcp-config:${server}`, false)
+              }
+            }
+          })
+          configChainsRef.current.set(server, run.catch(() => {}))
+          await run.catch(() => {})
+        },
+        [clearRowError, markSaving, setRowError, surfaceWarning],
+      )
+
+      /**
+       * Queue a description/disclosure patch with the same debounce and serial
+       * chain as row saves. `immediate` is used by the injection switch: the
+       * spec wants the mode change to take effect at once.
+       */
+      const queueMcpConfig = useCallback(
+        (server, patch, options) => {
+          const name = asString(server)
+          const changes = asObject(patch)
+          if (name.length === 0 || Object.keys(changes).length === 0) return
+          // Once removal owns the member, an edit must not schedule a write that
+          // would hit a deleted row (and could resurrect its draft).
+          if (removingRef.current.has(`mcp:${name}`)) return
+          const current = boardRef.current
+          const member = current ? current.state.mcp[name] : null
+          if (!member) return
+          const queued = configQueueRef.current.get(name) || {}
+          configQueueRef.current.set(name, { ...queued, ...changes })
+          configDraftsRef.current.set(name, { ...(configDraftsRef.current.get(name) || {}), ...changes })
+          configSeqRef.current.set(name, (configSeqRef.current.get(name) ?? 0) + 1)
+          boardRevisionRef.current += 1
+          setBoard((boardNow) => {
+            if (!boardNow) return boardNow
+            const existing = boardNow.state.mcp[name]
+            if (!existing) return boardNow
+            return { ...boardNow, state: withEntry(boardNow.state, MCP, name, { ...existing, ...changes }) }
+          })
+          clearRowError(`mcp-config:${name}`)
+          const timer = configTimersRef.current.get(name)
+          if (timer) clearTimeout(timer)
+          markSaving(`mcp-config:${name}`, true)
+          const delay = options && options.immediate === true ? 0 : ITEM_DEBOUNCE_MS
+          configTimersRef.current.set(
+            name,
+            setTimeout(() => {
+              configTimersRef.current.delete(name)
+              void flushMcpConfig(name)
+            }, delay),
+          )
+        },
+        [clearRowError, flushMcpConfig, markSaving],
+      )
+
+      /** Flush one pending `/mcp/tool` save for `server` + NUL + `tool`. */
+      const flushTool = useCallback(
+        async (jobKey) => {
+          const job = toolQueueRef.current.get(jobKey)
+          if (!job) {
+            markSaving(`mcp-tool:${jobKey}`, false)
+            return
+          }
+          toolQueueRef.current.delete(jobKey)
+          markSaving(`mcp-tool:${jobKey}`, true)
+          const sequence = toolSeqRef.current.get(jobKey) ?? 0
+          const body = buildToolSaveBody(job.server, job.tool, job.draft)
+          const previous = toolChainsRef.current.get(jobKey) ?? Promise.resolve()
+          const run = previous.then(async () => {
+            if (!mounted.current) return
+            try {
+              const payload = await request(`${API}/mcp/tool`, { method: 'POST', body })
+              if (!mounted.current) return
+              surfaceWarning(payload)
+              boardRevisionRef.current += 1
+              const currentSequence = toolSeqRef.current.get(jobKey) ?? 0
+              if (currentSequence !== sequence) return
+              const canonical = payload.state ? normalizeState(payload.state).mcp[job.server] : undefined
+              setBoard((current) => {
+                if (!current) return current
+                const member = current.state.mcp[job.server]
+                if (!member) return current
+                const tools = { ...member.tools }
+                if (body.clear === true) {
+                  if (!Object.hasOwn(tools, job.tool)) return current
+                  delete tools[job.tool]
+                } else if (canonical && canonical.tools && Object.hasOwn(canonical.tools, job.tool)) {
+                  tools[job.tool] = canonical.tools[job.tool]
+                } else {
+                  tools[job.tool] = normalizeToolScope(body)
+                }
+                return { ...current, state: withEntry(current.state, MCP, job.server, { ...member, tools }) }
+              })
+              if (!toolQueueRef.current.has(jobKey)) {
+                toolDraftsRef.current.delete(jobKey)
+                clearRowError(`mcp-tool:${jobKey}`)
+              }
+            } catch (cause) {
+              if (mounted.current && (toolSeqRef.current.get(jobKey) ?? 0) === sequence) {
+                setRowError(`mcp-tool:${jobKey}`, messageOf(cause))
+              }
+            } finally {
+              if (
+                mounted.current &&
+                !toolQueueRef.current.has(jobKey) &&
+                (toolSeqRef.current.get(jobKey) ?? 0) === sequence
+              ) {
+                markSaving(`mcp-tool:${jobKey}`, false)
+              }
+            }
+          })
+          toolChainsRef.current.set(jobKey, run.catch(() => {}))
+          await run.catch(() => {})
+        },
+        [clearRowError, markSaving, setRowError, surfaceWarning],
+      )
+
+      /**
+       * Queue one per-tool save. `draft` is either a complete
+       * `{enabled,modes,workspaces}` scope or `{clear:true}`; the optimistic
+       * board update happens here so a row never waits for the round trip.
+       */
+      const queueToolSave = useCallback(
+        (server, tool, draft) => {
+          const name = asString(server)
+          const toolName = asString(tool)
+          if (name.length === 0 || !toolName.startsWith('mcp__')) return
+          if (removingRef.current.has(`mcp:${name}`)) return
+          const current = boardRef.current
+          const member = current ? current.state.mcp[name] : null
+          if (!member) return
+          const key = mcpToolJobKey(name, toolName)
+          const source = asObject(draft)
+          const next = source.clear === true ? { clear: true } : normalizeToolScope(source)
+          toolQueueRef.current.set(key, { server: name, tool: toolName, draft: next })
+          toolSeqRef.current.set(key, (toolSeqRef.current.get(key) ?? 0) + 1)
+          boardRevisionRef.current += 1
+          if (next.clear === true) toolDraftsRef.current.set(key, { clear: true })
+          else toolDraftsRef.current.set(key, next)
+          setBoard((boardNow) => {
+            if (!boardNow) return boardNow
+            const existing = boardNow.state.mcp[name]
+            if (!existing) return boardNow
+            const tools = { ...existing.tools }
+            if (next.clear === true) delete tools[toolName]
+            else tools[toolName] = next
+            return { ...boardNow, state: withEntry(boardNow.state, MCP, name, { ...existing, tools }) }
+          })
+          clearRowError(`mcp-tool:${key}`)
+          const timer = toolTimersRef.current.get(key)
+          if (timer) clearTimeout(timer)
+          markSaving(`mcp-tool:${key}`, true)
+          toolTimersRef.current.set(
+            key,
+            setTimeout(() => {
+              toolTimersRef.current.delete(key)
+              void flushTool(key)
+            }, ITEM_DEBOUNCE_MS),
+          )
+        },
+        [clearRowError, flushTool, markSaving],
+      )
+
+      /**
+       * Keep this tab's MCP display/tool fields when a whole-document response
+       * replaces the board. Those routes never write them, and their snapshot can
+       * predate a concurrent save; only members still present are touched.
+       */
+      function preserveLocalMcpConfig(nextState, currentState) {
+        let next = nextState
+        for (const [server, member] of Object.entries(currentState.mcp || {})) {
+          if (!next.mcp[server]) continue
+          next = withEntry(next, MCP, server, {
+            ...next.mcp[server],
+            description: member.description,
+            disclosure: member.disclosure,
+            tools: member.tools,
+          })
+        }
+        return next
+      }
+
+      /** Discard every queued/draft MCP write for a member that is being removed. */
+      function dropMcpPending(server) {
+        const name = asString(server)
+        if (name.length === 0) return
+        const configTimer = configTimersRef.current.get(name)
+        if (configTimer) {
+          clearTimeout(configTimer)
+          configTimersRef.current.delete(name)
+        }
+        configQueueRef.current.delete(name)
+        configSeqRef.current.delete(name)
+        configDraftsRef.current.delete(name)
+        markSaving(`mcp-config:${name}`, false)
+        for (const key of [...toolQueueRef.current.keys()]) {
+          const parts = mcpToolJobParts(key)
+          if (!parts || parts.server !== name) continue
+          const timer = toolTimersRef.current.get(key)
+          if (timer) {
+            clearTimeout(timer)
+            toolTimersRef.current.delete(key)
+          }
+          toolQueueRef.current.delete(key)
+          toolSeqRef.current.delete(key)
+          toolDraftsRef.current.delete(key)
+          markSaving(`mcp-tool:${key}`, false)
+        }
+      }
+
       const flushPending = useCallback(async () => {
         const keys = [...pendingRef.current.keys()]
         for (const key of keys) {
@@ -2406,7 +3011,25 @@ window.__ModuleLoader__.load({
           }
           await flushItem(key)
         }
-      }, [flushItem])
+        // MCP display/tool saves share the same debounce; flush them before a GET
+        // so the reload reads what the user already sees.
+        for (const name of [...configQueueRef.current.keys()]) {
+          const timer = configTimersRef.current.get(name)
+          if (timer) {
+            clearTimeout(timer)
+            configTimersRef.current.delete(name)
+          }
+          await flushMcpConfig(name)
+        }
+        for (const key of [...toolQueueRef.current.keys()]) {
+          const timer = toolTimersRef.current.get(key)
+          if (timer) {
+            clearTimeout(timer)
+            toolTimersRef.current.delete(key)
+          }
+          await flushTool(key)
+        }
+      }, [flushItem, flushMcpConfig, flushTool])
 
       // ---------------------------------------------------------- loading
 
@@ -2429,10 +3052,42 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      /**
+       * Re-apply unsaved MCP display/tool drafts over a document just read from
+       * the Host. `applyLoadedBoard` only knows the row-draft map; description,
+       * disclosure and per-tool edits live in their own queues, and a failed save
+       * must not lose them on a refresh.
+       */
+      function mergeMcpPendingDrafts(loadedState) {
+        let next = loadedState
+        for (const [server, patch] of configDraftsRef.current) {
+          const member = next.mcp[server]
+          if (!member) continue
+          next = withEntry(next, MCP, server, { ...member, ...patch })
+        }
+        for (const [jobKey, draft] of toolDraftsRef.current) {
+          const parts = mcpToolJobParts(jobKey)
+          if (!parts) continue
+          const member = next.mcp[parts.server]
+          if (!member) continue
+          const tools = { ...member.tools }
+          if (draft.clear === true) delete tools[parts.tool]
+          else tools[parts.tool] = normalizeToolScope(draft)
+          next = withEntry(next, MCP, parts.server, { ...member, tools })
+        }
+        return next
+      }
+
       const loadBoard = useCallback(
         async (options) => {
           const silent = options && options.silent === true
-          if (pendingRef.current.size > 0) await flushPending()
+          if (
+            pendingRef.current.size > 0 ||
+            configQueueRef.current.size > 0 ||
+            toolQueueRef.current.size > 0
+          ) {
+            await flushPending()
+          }
           if (loadingRef.current) return
           loadingRef.current = true
           const startedRevision = boardRevisionRef.current
@@ -2462,13 +3117,14 @@ window.__ModuleLoader__.load({
                 setError(draftLossMessage(orphans))
               }
             }
-            setBoard((current) =>
-              applyLoadedBoard(current, loaded, {
+            setBoard((current) => {
+              const applied = applyLoadedBoard(current, loaded, {
                 startedRevision,
                 currentRevision,
                 drafts: draftsRef.current,
-              }),
-            )
+              })
+              return { ...applied, state: mergeMcpPendingDrafts(applied.state) }
+            })
             if (!previewInitialized.current) {
               previewInitialized.current = true
               const mode =
@@ -2521,6 +3177,72 @@ window.__ModuleLoader__.load({
         () => Object.keys(state.mcp).sort((left, right) => left.localeCompare(right)),
         [state.mcp],
       )
+
+      /** Load one server's tool catalog for the per-tool rows on demand. */
+      const loadMcpTools = useCallback(async (server) => {
+        const name = asString(server)
+        if (name.length === 0) return
+        setMcpToolCatalog((current) => ({
+          ...current,
+          [name]: { status: 'loading', error: '', tools: [], discover: null },
+        }))
+        try {
+          const payload = await request(`${API}/mcp/tools?server=${encodeURIComponent(name)}`, { method: 'GET' })
+          if (!mounted.current) return
+          const tools = []
+          for (const row of asArray(payload.tools)) {
+            const item = asObject(row)
+            const toolName = asString(item.name)
+            if (!toolName.startsWith('mcp__')) continue
+            tools.push({
+              name: toolName,
+              summary: asString(item.summary),
+              registered: item.registered !== false,
+              ambiguous: item.ambiguous === true,
+            })
+          }
+          const discoverRaw = asObject(payload.discover)
+          const discover = typeof discoverRaw.ok === 'boolean'
+            ? { ok: discoverRaw.ok, reason: asString(discoverRaw.reason) }
+            : null
+          setMcpToolCatalog((current) => ({
+            ...current,
+            [name]: { status: 'ready', error: '', tools, discover },
+          }))
+        } catch (cause) {
+          // A catalog failure is shown in the card; there is no fake switch
+          // without the Host's answer (the spec forbids guessing tool state).
+          if (!mounted.current) return
+          setMcpToolCatalog((current) => ({
+            ...current,
+            [name]: { status: 'error', error: messageOf(cause), tools: [], discover: null },
+          }))
+        }
+      }, [])
+
+      loadMcpToolsRef.current = loadMcpTools
+
+      const toolOpenServers = useMemo(
+        () => mcpNames.filter((server) => expanded[`mcp-tools:${server}`] !== false),
+        [mcpNames, expanded],
+      )
+
+      useEffect(() => {
+        if (!board) return
+        for (const server of toolOpenServers) {
+          if (!mcpToolCatalog[server]) void loadMcpTools(server)
+        }
+      }, [board, toolOpenServers, mcpToolCatalog, loadMcpTools])
+
+      const toggleMcpTools = useCallback((server) => {
+        const key = `mcp-tools:${server}`
+        setExpanded((current) => ({ ...current, [key]: current[key] !== false ? false : true }))
+      }, [])
+
+      const toggleToolScope = useCallback((server, tool) => {
+        const key = `mcp-tool-scope:${server}:${tool}`
+        setExpanded((current) => ({ ...current, [key]: current[key] !== true }))
+      }, [])
       const sourceList = useMemo(() => {
         const rows = Object.values(state.sources || {})
         rows.sort((left, right) => asString(right.createdAt).localeCompare(asString(left.createdAt)))
@@ -2637,7 +3359,10 @@ window.__ModuleLoader__.load({
             kind === MCP
               ? boardRef.current && boardRef.current.state.mcp[name]
               : boardRef.current && boardRef.current.state.skills[name]
-          const base = draft || source || blankEntry()
+          const base = rowDraftOf(draft || source || blankEntry())
+          // Scope only. MCP display/tool fields are owned by their own queues and
+          // must never be snapshotted into a scope draft (a reload would restore
+          // them over values saved afterwards).
           const next = {
             ...base,
             enabled: typeof patch.enabled === 'boolean' ? patch.enabled : base.enabled,
@@ -2653,11 +3378,126 @@ window.__ModuleLoader__.load({
                 : base.workspacesFrom,
           }
           draftsRef.current.set(key, next)
-          setBoard((current) => (current ? { ...current, state: withEntry(current.state, kind, name, next) } : current))
+          setBoard((current) => {
+            if (!current) return current
+            const member = (kind === MCP ? current.state.mcp[name] : current.state.skills[name]) || {}
+            return {
+              ...current,
+              state: withEntry(current.state, kind, name, { ...member, ...next }),
+            }
+          })
           clearRowError(key)
           queueItem(kind, name, next)
         },
         [clearRowError, queueItem],
+      )
+
+      /** Save the MCP purpose description and/or injection mode. */
+      const updateMcpConfig = useCallback(
+        (server, patch, options) => {
+          const source = asObject(patch)
+          const changes = {}
+          if (source.description !== undefined) {
+            changes.description = cleanPanelDescription(source.description)
+          }
+          if (source.disclosure !== undefined) {
+            changes.disclosure = source.disclosure === 'progressive' ? 'progressive' : 'full'
+          }
+          if (Object.keys(changes).length === 0) return
+          queueMcpConfig(server, changes, options)
+        },
+        [queueMcpConfig],
+      )
+
+      /**
+       * Put an AI-generated description into the editable draft without saving
+       * it: `/mcp/describe` is a suggestion, and the user confirms by editing /
+       * leaving the field (the normal debounced save then commits it).
+       */
+      const applyMcpDescriptionDraft = useCallback(
+        (server, text) => {
+          const name = asString(server)
+          const value = cleanPanelDescription(text)
+          if (name.length === 0 || removingRef.current.has(`mcp:${name}`)) return
+          // The generated text is a newer local edit than any request already in
+          // flight; bumping the sequence stops that response from overwriting it.
+          configSeqRef.current.set(name, (configSeqRef.current.get(name) ?? 0) + 1)
+          configDraftsRef.current.set(name, {
+            ...(configDraftsRef.current.get(name) || {}),
+            description: value,
+          })
+          boardRevisionRef.current += 1
+          setBoard((current) => {
+            if (!current) return current
+            const member = current.state.mcp[name]
+            if (!member) return current
+            return { ...current, state: withEntry(current.state, MCP, name, { ...member, description: value }) }
+          })
+          // Nothing is queued for the draft, so the row is not saving. Without
+          // this a superseded in-flight save would leave the spinner on forever.
+          if (!configQueueRef.current.has(name)) markSaving(`mcp-config:${name}`, false)
+        },
+        [markSaving],
+      )
+
+      /** Ask the default model for a short purpose description (never auto-saves). */
+      const generateMcpDescription = useCallback(
+        async (server) => {
+          const name = asString(server)
+          const busyKey = 'mcp-describe:' + name
+          setBusyKey(busyKey, true)
+          clearRowError(busyKey)
+          try {
+            const payload = await request(`${API}/mcp/describe`, {
+              method: 'POST',
+              body: { server: name, language: ZH ? 'zh' : 'en' },
+            })
+            if (!mounted.current) return
+            const text = asString(payload.description).trim().slice(0, MCP_DESCRIPTION_LIMIT)
+            if (text.length === 0) throw new Error(TEXT.mcpDescribeEmpty)
+            applyMcpDescriptionDraft(name, text)
+          } catch (cause) {
+            if (mounted.current) {
+              setRowError(busyKey, `${TEXT.mcpDescribeFailed}: ${messageOf(cause)}`)
+            }
+          } finally {
+            if (mounted.current) setBusyKey(busyKey, false)
+          }
+        },
+        [applyMcpDescriptionDraft, clearRowError, setBusyKey, setRowError],
+      )
+
+      /**
+       * Edit one tool's enabled/scope draft. The full scope is sent every time so
+       * changing one dimension cannot drop the other.
+       */
+      const updateMcpTool = useCallback(
+        (server, tool, patch) => {
+          const name = asString(server)
+          const toolName = asString(tool)
+          const current = boardRef.current
+          const member = current ? current.state.mcp[name] : null
+          if (!member || !toolName.startsWith('mcp__')) return
+          const base = normalizeToolScope(member.tools[toolName])
+          const next = {
+            enabled: typeof patch.enabled === 'boolean' ? patch.enabled : base.enabled,
+            modes: patch.modes !== undefined ? asStringArray(patch.modes) : base.modes,
+            workspaces:
+              patch.workspaces !== undefined
+                ? uniqueStrings(asArray(patch.workspaces).map(normalizePath))
+                : base.workspaces,
+          }
+          queueToolSave(name, toolName, next)
+        },
+        [queueToolSave],
+      )
+
+      /** Drop one tool's stored configuration (history entries stay visible). */
+      const clearMcpTool = useCallback(
+        (server, tool) => {
+          queueToolSave(server, tool, { clear: true })
+        },
+        [queueToolSave],
       )
 
       const removeItem = useCallback(
@@ -2679,6 +3519,9 @@ window.__ModuleLoader__.load({
             }
             pendingRef.current.delete(key)
             markSaving(key, false)
+            // A per-tool or description save must not outlive the member it
+            // belongs to (the Host would answer 404 and the draft could return).
+            if (kind === MCP) dropMcpPending(name)
 
             // Settle the row's last in-flight write before removing it. Without
             // this, the older `/item` request can be processed after the delete
@@ -2694,7 +3537,14 @@ window.__ModuleLoader__.load({
             surfaceWarning(payload)
             boardRevisionRef.current += 1
             if (payload.state) {
-              setBoard((current) => (current ? { ...current, state: normalizeState(payload.state) } : current))
+              setBoard((current) =>
+                current
+                  ? {
+                      ...current,
+                      state: preserveLocalMcpConfig(normalizeState(payload.state), current.state),
+                    }
+                  : current,
+              )
             } else {
               setBoard((current) =>
                 current ? { ...current, state: withoutEntry(current.state, kind, name) } : current,
@@ -3228,6 +4078,340 @@ window.__ModuleLoader__.load({
         )
       }
 
+      /** One per-tool row: name, summary, enabled switch, scope and history marks. */
+      function renderMcpToolRow(server, entry, tool) {
+        const name = asString(tool.name)
+        const configs = asObject(entry.tools)
+        const configured = Object.hasOwn(configs, name)
+        const config = normalizeToolScope(configs[name])
+        const unavailable = tool.registered === false
+        const ambiguous = tool.ambiguous === true
+        const jobKey = mcpToolJobKey(server, name)
+        const savingRow = saving[`mcp-tool:${jobKey}`] === true
+        const toolError = rowErrors[`mcp-tool:${jobKey}`]
+        const scopeOpen = expanded[`mcp-tool-scope:${server}:${name}`] === true
+        const modeLabels = new Map(inventory.modes.map((mode) => [mode.id, mode.name]))
+        const modeText = summarizeList(config.modes, TEXT.allModes, (value) => modeLabels.get(value) || value)
+        const workspaceText = summarizeList(config.workspaces, TEXT.allWorkspaces, (value) => baseName(value))
+        const modeItems = inventory.modes.map((mode) => ({ value: mode.id, label: mode.name, hint: mode.id }))
+        const workspaceItems = inventory.workspaces.map((row) => ({
+          value: row.path,
+          label: row.name || baseName(row.path),
+          hint: row.path,
+        }))
+        return h(
+          'div',
+          { key: name, style: { ...SX.mcpToolRow, ...(unavailable ? SX.mcpToolHistory : null) } },
+          h(
+            'div',
+            { style: S.rowMain },
+            h(
+              'div',
+              { style: SX.mcpToolMain },
+              h(
+                'div',
+                { style: S.rowName },
+                h('span', { style: S.mono }, name),
+                unavailable ? h('span', { style: S.badgeWarn }, TEXT.mcpToolUnavailable) : null,
+                ambiguous ? h('span', { style: S.badgeError }, TEXT.mcpToolAmbiguous) : null,
+                savingRow ? h('span', { style: S.savingDot }, TEXT.savingItem) : null,
+              ),
+              asString(tool.summary).length > 0 ? h('div', { style: S.rowDesc }, asString(tool.summary)) : null,
+            ),
+            h(
+              'div',
+              { style: S.rowActions },
+              ambiguous
+                ? [
+                    // The Host refuses to save this name (checkbox stays dead),
+                    // but clearing a stored config has no attribution check and
+                    // must remain possible or the entry becomes uncleanable.
+                    h(Toggle, {
+                      key: 'enabled',
+                      checked: config.enabled === true,
+                      disabled: true,
+                      label: name,
+                      title: TEXT.mcpToolAmbiguous,
+                    }),
+                    configured
+                      ? h(
+                          'button',
+                          {
+                            key: 'clear',
+                            type: 'button',
+                            style: S.ghostDanger,
+                            onClick: () => clearMcpTool(server, name),
+                          },
+                          TEXT.mcpToolClear,
+                        )
+                      : null,
+                  ]
+                : [
+                    h(
+                      'span',
+                      {
+                        key: 'modes',
+                        role: 'button',
+                        tabIndex: 0,
+                        style: {
+                          ...S.condChip,
+                          cursor: 'pointer',
+                          ...(config.modes.length > 0 ? SX.condChipOn : null),
+                        },
+                        title: TEXT.editConditions,
+                        onClick: () => toggleToolScope(server, name),
+                      },
+                      `${TEXT.rowModes}: ${modeText}`,
+                    ),
+                    h(
+                      'span',
+                      {
+                        key: 'workspaces',
+                        role: 'button',
+                        tabIndex: 0,
+                        style: {
+                          ...S.condChip,
+                          cursor: 'pointer',
+                          ...(config.workspaces.length > 0 ? SX.condChipOn : null),
+                        },
+                        title: TEXT.editConditions,
+                        onClick: () => toggleToolScope(server, name),
+                      },
+                      `${TEXT.rowWorkspaces}: ${workspaceText}`,
+                    ),
+                    h(Toggle, {
+                      key: 'enabled',
+                      checked: config.enabled === true,
+                      label: name,
+                      title: config.enabled === true ? TEXT.enabled : TEXT.disabled,
+                      onChange: (value) => updateMcpTool(server, name, { enabled: value }),
+                    }),
+                    configured
+                      ? h(
+                          'button',
+                          {
+                            key: 'clear',
+                            type: 'button',
+                            style: S.ghostDanger,
+                            onClick: () => clearMcpTool(server, name),
+                          },
+                          TEXT.mcpToolClear,
+                        )
+                      : null,
+                  ],
+            ),
+          ),
+          ambiguous
+            ? h('div', { style: SX.inlineError }, TEXT.mcpToolAmbiguous)
+            : scopeOpen
+              ? h(
+                  'div',
+                  { style: SX.mcpToolEditor },
+                  h(
+                    Field,
+                    { label: TEXT.rowModes, hint: TEXT.mcpScopeHint },
+                    h(MultiSelect, {
+                      items: modeItems,
+                      selected: config.modes,
+                      onChange: (values) => updateMcpTool(server, name, { modes: values }),
+                      searchPlaceholder: TEXT.previewAllModes,
+                      emptyHint: TEXT.allModes,
+                      emptyText: TEXT.noMatches,
+                      selectAllLabel: TEXT.selectAll,
+                      clearAllLabel: TEXT.clearAll,
+                    }),
+                  ),
+                  h(
+                    Field,
+                    { label: TEXT.rowWorkspaces, hint: TEXT.mcpScopeHint },
+                    h(MultiSelect, {
+                      items: workspaceItems,
+                      selected: config.workspaces,
+                      onChange: (values) => updateMcpTool(server, name, { workspaces: values }),
+                      searchPlaceholder: TEXT.previewAllWorkspaces,
+                      emptyHint: TEXT.allWorkspaces,
+                      emptyText: TEXT.noMatches,
+                      selectAllLabel: TEXT.selectAll,
+                      clearAllLabel: TEXT.clearAll,
+                    }),
+                    h(AddPathRow, {
+                      placeholder: TEXT.addPathPlaceholder,
+                      label: TEXT.addPath,
+                      onAdd: (path) =>
+                        updateMcpTool(server, name, {
+                          workspaces: uniqueStrings([...config.workspaces, normalizePath(path)]),
+                        }),
+                    }),
+                  ),
+                )
+              : null,
+          toolError ? h('div', { style: SX.rowError, role: 'alert' }, toolError) : null,
+        )
+      }
+
+      /** The collapsible per-tool block of one MCP member. */
+      function renderMcpToolRows(server, entry) {
+        const catalog = mcpToolCatalog[server] || { status: 'idle', error: '', tools: [] }
+        const configs = asObject(entry.tools)
+        const listed = new Map()
+        for (const row of asArray(catalog.tools)) {
+          const item = asObject(row)
+          const name = asString(item.name)
+          if (name.length === 0) continue
+          listed.set(name, {
+            name,
+            summary: asString(item.summary),
+            registered: item.registered !== false,
+            ambiguous: item.ambiguous === true,
+          })
+        }
+        // A configured tool that the catalog has not answered for yet (or no
+        // longer lists) still gets a row: its configuration must stay visible
+        // and clearable, and a failed catalog read must not hide it.
+        for (const name of Object.keys(configs)) {
+          if (listed.has(name)) continue
+          listed.set(name, {
+            name,
+            summary: '',
+            registered: catalog.status === 'ready' ? false : true,
+            ambiguous: false,
+          })
+        }
+        const rows = [...listed.values()]
+        const open = expanded[`mcp-tools:${server}`] !== false
+        const failed = catalog.status === 'error'
+        const loading = catalog.status === 'loading'
+        return h(
+          'div',
+          { style: SX.mcpToolBlock },
+          h(
+            'div',
+            {
+              style: SX.mcpToolHead,
+              role: 'button',
+              tabIndex: 0,
+              'aria-label': open ? TEXT.groupCollapse : TEXT.groupExpand,
+              title: open ? TEXT.groupCollapse : TEXT.groupExpand,
+              onClick: () => toggleMcpTools(server),
+            },
+            h(
+              'span',
+              { style: { ...SX.groupCaret, transform: open ? 'rotate(90deg)' : 'none' } },
+              '▸',
+            ),
+            h('span', { style: SX.groupName }, TEXT.mcpToolsTitle),
+            h('span', { style: S.countBadge }, `${rows.length} ${TEXT.toolsUnit}`),
+            loading ? h('span', { style: S.savingDot }, TEXT.mcpToolsLoading) : null,
+          ),
+          open
+            ? failed
+              ? h(
+                  'div',
+                  { style: S.stack },
+                  h('div', { style: SX.inlineError, role: 'alert' }, `${TEXT.mcpToolsFailed}: ${catalog.error}`),
+                  h(
+                    'button',
+                    { type: 'button', style: S.buttonSmall, onClick: () => void loadMcpTools(server) },
+                    TEXT.retry,
+                  ),
+                )
+              : rows.length === 0
+                ? h('div', { style: S.empty }, loading ? TEXT.mcpToolsLoading : TEXT.mcpToolsEmpty)
+                : rows.map((row) => renderMcpToolRow(server, entry, row))
+            : null,
+        )
+      }
+
+      /** Purpose description, injection mode and per-tool rows of one MCP member. */
+      function renderMcpConfig(server, entry) {
+        const description = cleanPanelDescription(entry.description)
+        const progressive = entry.disclosure === 'progressive'
+        const catalog = mcpToolCatalog[server] || { status: 'idle', error: '', tools: [], discover: null }
+        const discoverFailure =
+          catalog.status === 'ready' && catalog.discover !== null && catalog.discover !== undefined
+            && catalog.discover.ok === false
+            ? catalog.discover
+            : null
+        const discoverNotice = discoverUnavailableText(discoverFailure)
+        // Turning progressive on cannot work while its discover entry cannot
+        // register, so that direction is disabled. Switching an already
+        // progressive member back to full stays possible.
+        const discoverBlocksProgressive = discoverFailure !== null && !progressive
+        const describeBusy = isBusy('mcp-describe:' + server)
+        const describeError = rowErrors[`mcp-describe:${server}`]
+        const configError = rowErrors[`mcp-config:${server}`]
+        const configSaving = saving[`mcp-config:${server}`] === true
+        const modeLabel = progressive ? TEXT.mcpInjectProgressive : TEXT.mcpInjectFull
+        return h(
+          'div',
+          { style: SX.mcpConfig },
+          h(
+            Field,
+            { label: TEXT.mcpDescription, hint: tf('mcpDescriptionHint', { count: MCP_DESCRIPTION_LIMIT }) },
+            h(
+              'div',
+              { style: S.row },
+              h('textarea', {
+                style: { ...S.textarea, flex: 1, minHeight: '58px' },
+                value: description,
+                maxLength: MCP_DESCRIPTION_LIMIT,
+                placeholder: TEXT.mcpDescriptionPlaceholder,
+                'aria-label': TEXT.mcpDescription,
+                onChange: (event) => updateMcpConfig(server, { description: event.target.value }),
+              }),
+              h(
+                'div',
+                { style: { display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '4px' } },
+                h(
+                  'button',
+                  {
+                    type: 'button',
+                    style: S.buttonSmall,
+                    disabled: describeBusy,
+                    onClick: () => void generateMcpDescription(server),
+                  },
+                  describeBusy ? TEXT.mcpDescribing : TEXT.mcpDescribe,
+                ),
+                h('span', { style: S.fieldHint }, `${description.length}/${MCP_DESCRIPTION_LIMIT}`),
+              ),
+            ),
+          ),
+          // Generation and saving have separate failures; one must not hide the
+          // other when they happen close together.
+          describeError ? h('div', { style: SX.inlineError, role: 'alert' }, describeError) : null,
+          configError ? h('div', { style: SX.inlineError, role: 'alert' }, configError) : null,
+          discoverNotice ? h('div', { style: SX.inlineError, role: 'alert' }, discoverNotice) : null,
+          h(
+            'div',
+            { style: SX.mcpConfigActions },
+            h('span', { style: S.switchLabel }, `${TEXT.mcpInjectMode}: ${modeLabel}`),
+            h(Toggle, {
+              checked: progressive,
+              disabled: discoverBlocksProgressive,
+              label: TEXT.mcpInjectMode,
+              title: discoverBlocksProgressive
+                ? `${discoverNotice} ${TEXT.mcpDiscoverBlocked}`
+                : progressive
+                  ? TEXT.mcpInjectProgressiveHint
+                  : TEXT.mcpInjectFullHint,
+              onChange: (value) =>
+                updateMcpConfig(server, { disclosure: value ? 'progressive' : 'full' }, { immediate: true }),
+            }),
+            h(
+              'span',
+              { style: S.fieldHint },
+              progressive ? TEXT.mcpInjectProgressiveHint : TEXT.mcpInjectFullHint,
+            ),
+            // Progressive injection only exists while the MCP gate is active;
+            // saying so next to the switch avoids a silently inert toggle.
+            settings.mcpGate === false ? h('span', { style: S.badgeWarn }, TEXT.mcpGateOff) : null,
+            configSaving ? h('span', { style: S.savingDot }, TEXT.savingItem) : null,
+          ),
+          renderMcpToolRows(server, entry),
+          h('div', { style: SX.mcpHint }, TEXT.mcpHint),
+        )
+      }
+
       function renderItemRow(kind, name, isLast) {
         const isMcp = kind === MCP
         const entry = (isMcp ? state.mcp[name] : state.skills[name]) || blankEntry()
@@ -3372,6 +4556,9 @@ window.__ModuleLoader__.load({
               )
             : null,
           open ? renderCondEditor(kind, name, entry) : null,
+          // The new MCP block goes after the existing row actions and condition
+          // editor so clicking 删除 / Modes still changes something adjacent.
+          isMcp ? renderMcpConfig(name, entry) : null,
           rowErrors[key] ? h('div', { style: SX.rowError, role: 'alert' }, rowErrors[key]) : null,
         )
       }
@@ -4610,6 +5797,13 @@ window.__ModuleLoader__.load({
         draftLossMessage,
         orphanedDrafts,
         buildItemSaveBody,
+        normalizeEntry,
+        normalizeMcpTools,
+        buildToolSaveBody,
+        discoverUnavailableText,
+        rowDraftOf,
+        configDraftAfterSave,
+        failureTextOf,
         activationWarningOf,
         mergeActivationWarning,
         dismissActivationWarning,

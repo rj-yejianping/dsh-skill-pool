@@ -24,6 +24,7 @@ import z from '@deepseek-ai/schemastery'
 import { StateReadError, StateStore, defaultState, statePath } from './src/store.js'
 import { registerWebApi } from './src/web-api.js'
 import { createActivation, modeOf, workspaceOf } from './src/activation.js'
+import { createMcpDisclosure } from './src/disclosure.js'
 import { createMountTracker } from './src/uploads.js'
 import { remountPoolServers } from './src/remount.js'
 import { resolvePool } from './src/rules.js'
@@ -127,9 +128,64 @@ export function apply(ctx, config = {}) {
     })
   })
 
-  // Registrations live on each Agent's context; release them when the plugin
-  // unloads instead of waiting for Agent disposal.
-  ctx.effect(() => () => activation.disposeAll(), 'resource-pool.activation')
+  // The one always-resident `<server>_discover` entry per progressive service.
+  // It reads the per-Agent record and expands through the same activation layer
+  // the pool already owns, so a discover call can never grant more than the pool
+  // would have. `enabled` is the activation layer's guard fact: without the
+  // global guard there is no backstop to a hidden schema, so progressive is off
+  // and no discover entry may be offered.
+  const disclosure = createMcpDisclosure({
+    ctx,
+    logger,
+    getState,
+    recordOf: activation.recordOf,
+    expandService: activation.expandService,
+    modeOf: (agent) => modeOf(ctx, agent),
+    workspaceOf: (agent) => workspaceOf(agent),
+    enabled: () => activation.progressiveAvailable,
+    defineTool,
+  })
+
+  /**
+   * Reconcile the global discover registrations with the stored document.
+   *
+   * Never rejects: a panel save must still succeed (and report the re-apply
+   * result) when the document cannot be read for this extra sync, and a failed
+   * startup sync must not break the mount. `disclosure.sync` itself reports
+   * per-service problems; only the read can throw here.
+   */
+  const resyncDisclosure = async () => {
+    try {
+      disclosure.sync(await getState())
+    } catch (error) {
+      logger?.warn?.(
+        `[skill-pool] discover registry sync failed: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  // Registrations live on each Agent's context and the discover entries on the
+  // plugin's; release both when the plugin unloads instead of waiting for Agent
+  // disposal. The global guard is released by its own effect on the same fiber.
+  ctx.effect(() => () => {
+    disclosure.dispose()
+    activation.disposeAll()
+  }, 'resource-pool.lifecycle')
+
+  // A panel or a hand-edited document may already select progressive injection;
+  // publish those entries before the first Agent assembles a request.
+  void resyncDisclosure().catch((error) => {
+    // `resyncDisclosure` is already failure-contained; this is the log-only
+    // backstop for the log call itself, so the startup path can never surface an
+    // unhandled rejection.
+    try {
+      logger?.warn?.(
+        `[skill-pool] discover registry sync rejected: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    } catch {
+      /* a logger failure must not break the mount */
+    }
+  })
 
   const mounts = createMountTracker()
 
@@ -139,7 +195,18 @@ export function apply(ctx, config = {}) {
     mounts,
     meta,
     logger,
-    onChanged: () => activation.reapplyAll(),
+    // Per-server discover registration status: the panel must be able to say
+    // "发现入口不可用：名称冲突" instead of offering a switch that cannot work.
+    discoverStatus: (server) => disclosure.statusOf(server),
+    discoverPreflight: (server) => disclosure.preflightOf(server),
+    // The panel's counts describe the activation result, so the discover registry
+    // is reconciled only after every live Agent was re-applied, with the document
+    // that re-apply just used (the panel's own request already committed it).
+    onChanged: async () => {
+      const result = await activation.reapplyAll()
+      await resyncDisclosure()
+      return result
+    },
   })
 
   // Storage keeps each MCP member's connection definition precisely so this

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { resolvePool, scopeMatches } from '../src/rules.js'
+import { resolvePool, scopeMatches, toolActive } from '../src/rules.js'
 
 /** A v3-shaped document: repositories, skills and their scopes. */
 function legacyDocument() {
@@ -115,4 +115,12 @@ test('ambiguous MCP names include overlapping separators and malformed splits', 
   for (const name of ['mcp__a__b', 'mcp__alpha__search', 'mcp__a_b__c', 'not-mcp']) {
     assert.equal(isAmbiguousMcpToolName(name), false, name)
   }
+})
+
+test('toolActive applies enabled and AND scope', () => {
+  assert.equal(toolActive({ enabled: false }, { mode: 'standard', cwd: '/w' }), false)
+  assert.equal(toolActive({ enabled: true, modes: ['standard'] }, { mode: 'fleet', cwd: '/w' }), false)
+  assert.equal(toolActive({ enabled: true, modes: ['standard'] }, { mode: 'standard', cwd: '/w' }), true)
+  assert.equal(toolActive({ enabled: true, modes: [], workspaces: ['/w'] }, { mode: 'standard', cwd: '/w/sub' }), true)
+  assert.equal(toolActive({ enabled: true, workspaces: ['/w'] }, { mode: 'standard', cwd: '/other' }), false)
 })

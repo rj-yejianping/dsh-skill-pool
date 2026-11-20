@@ -8,7 +8,10 @@
  *   resource is in the pool exactly when it has an entry: an import writes the
  *   entry in the same transaction, there is no separate "add to pool" step.
  *   An `mcp` member also keeps its `definition` (URL/command/headers), which is
- *   what a Host restart re-mounts the `mcp-client` row from — see remount.js.
+ *   what a Host restart re-mounts the `mcp-client` row from — see remount.js —
+ *   plus its panel `description`, its `disclosure` mode (`full` injects every
+ *   tool; `progressive` hides them behind a discover tool) and the per-tool
+ *   `tools` configuration (`enabled`/`modes`/`workspaces`).
  *   A skill additionally carries `modesFrom` / `workspacesFrom`: `group` means
  *   "use the group of its source", `self` means "use my own list".
  * - `groups`: one scope per *repository* (`repo:<project>`) or, for imports
@@ -82,6 +85,19 @@ export const CHECK_STATUSES = ['up-to-date', 'update-available', 'error']
 /** Switches the panel may patch. */
 export const SETTING_KEYS = ['enabled', 'mcpGate', 'gateDefaultSkills']
 
+/**
+ * How one MCP member injects its tools into an Agent: `full` keeps the historic
+ * behaviour (every tool is registered up front), `progressive` hides them behind
+ * the member's discover tool until the Agent expands the service.
+ */
+export const DISCLOSURE_MODES = ['full', 'progressive']
+
+/** Maximum stored length of one MCP service description. */
+export const DESCRIPTION_LIMIT = 500
+
+/** Maximum length of one public MCP tool name (a per-tool config key). */
+export const MCP_TOOL_KEY_LIMIT = 128
+
 /** Conservative identifier grammar for resource names and mode ids. */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/
 
@@ -127,6 +143,23 @@ export function normalizeItemName(value) {
 function optionalString(value, limit = 4096) {
   if (typeof value !== 'string') return ''
   return value.trim().slice(0, limit)
+}
+
+/**
+ * Normalize one free-text MCP service description.
+ *
+ * The description is display text for the panel and for a discover tool, never
+ * a credential or a path: it may hold any character except control characters,
+ * is trimmed, and is capped at {@link DESCRIPTION_LIMIT} characters. A
+ * non-string is discarded instead of being coerced (`String(object)` would store
+ * `[object Object]`).
+ *
+ * @param {unknown} raw - candidate description.
+ * @returns {string} plain, trimmed description, or '' when unusable.
+ */
+export function cleanDescription(raw) {
+  if (typeof raw !== 'string') return ''
+  return raw.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, DESCRIPTION_LIMIT)
 }
 
 /** Timestamp helper: keep a stored value, else use now. */
@@ -216,6 +249,29 @@ export function normalizeScope(raw) {
 }
 
 /**
+ * Normalize the per-tool configuration of one MCP member.
+ *
+ * A key is the public tool name (`mcp__<server>__<raw>`): only keys that could
+ * name an MCP tool are kept, and each value is the same `{enabled, modes,
+ * workspaces}` scope a member uses, so one predicate serves both. An unusable
+ * entry is dropped rather than guessed at.
+ *
+ * @param {unknown} raw - candidate `tools` map.
+ * @returns {Record<string, {enabled: boolean, modes: string[], workspaces: string[]}>} cleaned map.
+ */
+export function normalizeMcpTools(raw) {
+  if (!isObject(raw)) return {}
+  const out = {}
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof key !== 'string' || !key.startsWith('mcp__') || key.length > MCP_TOOL_KEY_LIMIT) continue
+    const scope = normalizeScope(value)
+    if (scope === null) continue
+    out[key] = scope
+  }
+  return out
+}
+
+/**
  * Normalize the provenance fields of one member (`sourceId`/`digest`/`installedAt`).
  * Empty optional values are omitted; `installedAt` is always present.
  *
@@ -251,6 +307,21 @@ function itemExtras(kind, extra, base) {
     // the connection definition that makes the member survive a Host restart.
     const defined = cleanMcpDefinition(provided.definition) ?? cleanMcpDefinition(previous.definition)
     if (defined !== undefined) out.definition = defined
+    // Description, disclosure and per-tool switches are user configuration, not
+    // provenance: carry them across a scope-only write exactly like `definition`.
+    const description =
+      typeof provided.description === 'string'
+        ? cleanDescription(provided.description)
+        : cleanDescription(previous.description)
+    if (description.length > 0) out.description = description
+    out.disclosure = DISCLOSURE_MODES.includes(provided.disclosure)
+      ? provided.disclosure
+      : DISCLOSURE_MODES.includes(previous.disclosure)
+        ? previous.disclosure
+        : 'full'
+    const providedTools = normalizeMcpTools(provided.tools)
+    const tools = isObject(provided.tools) ? providedTools : normalizeMcpTools(previous.tools)
+    if (isObject(provided.tools) || isObject(previous.tools)) out.tools = tools
   }
   out.installedAt = pick('installedAt') || new Date().toISOString()
   return out
@@ -319,6 +390,15 @@ function normalizeMember(kind, raw) {
   if (kind === 'mcp') {
     const definition = cleanMcpDefinition(raw.definition)
     if (definition !== undefined) member.definition = definition
+    const description = cleanDescription(raw.description)
+    if (description.length > 0) member.description = description
+    // Complete injection is the default: only an explicit, supported mode turns
+    // progressive disclosure on. An unknown stored value never wins.
+    member.disclosure = DISCLOSURE_MODES.includes(raw.disclosure) ? raw.disclosure : 'full'
+    // A present `tools` map is kept even when empty: clearing the last per-tool
+    // entry must leave the default empty map, not a member whose `tools` field
+    // disappeared (the panel and POST /mcp/tool read it directly).
+    if (isObject(raw.tools)) member.tools = normalizeMcpTools(raw.tools)
   }
   const installedAt = optionalString(raw.installedAt, 64)
   member.installedAt = installedAt
@@ -709,6 +789,37 @@ function validateDefinition(raw, what) {
   }
 }
 
+/**
+ * Validate one optional MCP service description.
+ *
+ * A readable document is the output of `normalizeState`, which already stripped
+ * control characters; finding one here (or an over-long value) means the file
+ * was edited by hand and cannot be trusted for display or discover prompts.
+ *
+ * @param {unknown} raw - stored description.
+ * @param {string} what - field label for the error.
+ */
+function validateDescription(raw, what) {
+  if (raw === undefined) return
+  if (typeof raw !== 'string' || raw.length > DESCRIPTION_LIMIT || /[\u0000-\u001f\u007f]/.test(raw)) {
+    invalidDocument(`${what} must be plain text of at most ${DESCRIPTION_LIMIT} characters`)
+  }
+}
+
+/** Validate the per-tool configuration map of one MCP member. */
+function validateMcpTools(raw, what) {
+  requireObject(raw, what)
+  for (const [key, value] of Object.entries(raw)) {
+    if (typeof key !== 'string' || !key.startsWith('mcp__') || key.length > MCP_TOOL_KEY_LIMIT) {
+      invalidDocument(`${what} contains an invalid tool key`)
+    }
+    requireObject(value, `${what} entry`)
+    if (typeof value.enabled !== 'boolean') invalidDocument(`${what} entry.enabled must be a boolean`)
+    requireNameList(value.modes, `${what} entry.modes`)
+    requirePathList(value.workspaces, `${what} entry.workspaces`)
+  }
+}
+
 /** Validate one pool member (`skills` / `mcp`). */
 function validateMember(raw, what, { version, kind, sources }) {
   requireObject(raw, what)
@@ -733,6 +844,11 @@ function validateMember(raw, what, { version, kind, sources }) {
   }
   if (kind === 'mcp') {
     if (raw.definition !== undefined) validateDefinition(raw.definition, `${what}.definition`)
+    validateDescription(raw.description, `${what}.description`)
+    if (raw.disclosure !== undefined && !DISCLOSURE_MODES.includes(raw.disclosure)) {
+      invalidDocument(`${what}.disclosure must be 'full' or 'progressive'`)
+    }
+    if (raw.tools !== undefined) validateMcpTools(raw.tools, `${what}.tools`)
   }
 }
 
@@ -956,6 +1072,99 @@ export function removeItem(state, kind, name) {
   const next = { ...currentBucket }
   delete next[key]
   return normalizeState({ ...state, [bucket]: next })
+}
+
+/**
+ * Locate one stored MCP member by server name.
+ *
+ * @param {object} state - normalized document.
+ * @param {unknown} server - resource name.
+ * @returns {{key: string, bucket: object, member: object}|null} located member, or null.
+ */
+function findMcpMember(state, server) {
+  const key = cleanName(server)
+  if (key.length === 0) return null
+  const bucket = isObject(state) && isObject(state.mcp) ? state.mcp : {}
+  const member = Object.hasOwn(bucket, key) ? bucket[key] : undefined
+  if (!isObject(member)) return null
+  return { key, bucket, member }
+}
+
+/**
+ * Save the panel description and/or disclosure mode of one MCP member.
+ *
+ * Only those two fields are patched: the connection `definition`, the member
+ * scope and `installedAt` are preserved, so saving a description can never
+ * disconnect a server or widen what an Agent may reach. An unknown server is
+ * returned untouched.
+ *
+ * @param {object} state - normalized document.
+ * @param {unknown} server - existing MCP member name.
+ * @param {unknown} patch - `{description?, disclosure?}`.
+ * @returns {object} normalized document.
+ */
+export function setMcpConfig(state, server, patch) {
+  const found = findMcpMember(state, server)
+  if (found === null) return state
+  const provided = isObject(patch) ? patch : {}
+  const member = { ...found.member }
+  if (typeof provided.description === 'string') {
+    const description = cleanDescription(provided.description)
+    if (description.length > 0) member.description = description
+    else delete member.description
+  }
+  if (DISCLOSURE_MODES.includes(provided.disclosure)) member.disclosure = provided.disclosure
+  return normalizeState({ ...state, mcp: { ...found.bucket, [found.key]: member } })
+}
+
+/**
+ * Save one tool's `enabled`/`modes`/`workspaces` over the stored configuration.
+ *
+ * The patch only names the fields it changes; omitted fields keep their stored
+ * value (a new entry starts enabled and unrestricted). Empty `modes`/
+ * `workspaces` mean "no restriction". The public name is stored verbatim so a
+ * temporarily disconnected tool keeps its settings until it is registered again.
+ *
+ * @param {object} state - normalized document.
+ * @param {unknown} server - existing MCP member name.
+ * @param {unknown} tool - public tool name (`mcp__<server>__<raw>`).
+ * @param {unknown} patch - `{enabled?, modes?, workspaces?}`.
+ * @returns {object} normalized document (unchanged when the server is unknown or the key is unusable).
+ */
+export function setMcpToolConfig(state, server, tool, patch) {
+  const found = findMcpMember(state, server)
+  if (found === null) return state
+  const toolName = typeof tool === 'string' ? tool.trim() : ''
+  if (!toolName.startsWith('mcp__') || toolName.length > MCP_TOOL_KEY_LIMIT) return state
+  const tools = normalizeMcpTools(found.member.tools)
+  const base = Object.hasOwn(tools, toolName) ? tools[toolName] : { enabled: true, modes: [], workspaces: [] }
+  const provided = isObject(patch) ? patch : {}
+  const merged = {
+    enabled: typeof provided.enabled === 'boolean' ? provided.enabled : base.enabled,
+    modes: Array.isArray(provided.modes) ? provided.modes : base.modes,
+    workspaces: Array.isArray(provided.workspaces) ? provided.workspaces : base.workspaces,
+  }
+  const nextTools = normalizeMcpTools({ ...tools, [toolName]: merged })
+  return normalizeState({ ...state, mcp: { ...found.bucket, [found.key]: { ...found.member, tools: nextTools } } })
+}
+
+/**
+ * Forget one tool's configuration, restoring the default (enabled, unrestricted).
+ *
+ * @param {object} state - normalized document.
+ * @param {unknown} server - existing MCP member name.
+ * @param {unknown} tool - public tool name.
+ * @returns {object} normalized document (unchanged when the server or entry is unknown).
+ */
+export function clearMcpToolConfig(state, server, tool) {
+  const found = findMcpMember(state, server)
+  if (found === null) return state
+  const toolName = typeof tool === 'string' ? tool.trim() : ''
+  if (toolName.length === 0) return state
+  const tools = normalizeMcpTools(found.member.tools)
+  if (!Object.hasOwn(tools, toolName)) return state
+  delete tools[toolName]
+  return normalizeState({ ...state, mcp: { ...found.bucket, [found.key]: { ...found.member, tools } } })
 }
 
 /** Upsert one skill source. */

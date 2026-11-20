@@ -270,3 +270,19 @@ export function mcpServerOf(toolName) {
   const server = separator >= 0 ? rest.slice(0, separator) : rest
   return server.trim()
 }
+
+/**
+ * Whether one MCP tool's stored config admits a session.
+ *
+ * Tools carry the same `{enabled, modes, workspaces}` shape as pool members and
+ * follow the same AND semantics, so this is exactly {@link itemActive}. It is
+ * exported under its own name because the activation layer asks this question
+ * of a bare tool config, not of a whole member.
+ *
+ * @param {{enabled?: boolean, modes?: string[], workspaces?: string[]}|null|undefined} toolConfig - stored per-tool config.
+ * @param {{mode?: string, cwd?: string, allModes?: boolean, allWorkspaces?: boolean}} target - session identity.
+ * @returns {boolean} whether the tool may be visible in the session.
+ */
+export function toolActive(toolConfig, target = {}) {
+  return itemActive(toolConfig, target)
+}
