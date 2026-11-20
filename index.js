@@ -174,7 +174,18 @@ export function apply(ctx, config = {}) {
 
   // A panel or a hand-edited document may already select progressive injection;
   // publish those entries before the first Agent assembles a request.
-  void resyncDisclosure()
+  void resyncDisclosure().catch((error) => {
+    // `resyncDisclosure` is already failure-contained; this is the log-only
+    // backstop for the log call itself, so the startup path can never surface an
+    // unhandled rejection.
+    try {
+      logger?.warn?.(
+        `[skill-pool] discover registry sync rejected: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    } catch {
+      /* a logger failure must not break the mount */
+    }
+  })
 
   const mounts = createMountTracker()
 

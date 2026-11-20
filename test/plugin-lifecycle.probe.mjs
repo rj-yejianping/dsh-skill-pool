@@ -490,10 +490,13 @@ test('a discover sync that cannot read the document never fails the panel save',
       await mounted.handlers.get('agent/created')({ agent: live })
       const response = await mounted.panel('POST', '/mcp/config', { server: 'kb', description: '知识库' })
       // The state was committed; the failed discover sync is logged, not thrown,
-      // and the re-apply result still reaches the panel.
+      // and the re-apply result still reaches the panel with its structured code:
+      // the document is unreadable, so the fixture produces the conservative deny.
       assert.equal(response.status, 200)
       assert.equal(response.payload.ok, true)
-      assert.equal(typeof response.payload.warning?.code, 'string')
+      assert.equal(response.payload.warning?.code, 'resource-pool/activation-conservative')
+      assert.equal(response.payload.warning?.conservative, 1)
+      assert.equal(response.payload.warning?.failed, 1)
       assert.equal(
         mounted.warnings.some((line) => line.includes('discover registry sync failed')),
         true,
