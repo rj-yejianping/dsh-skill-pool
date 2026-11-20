@@ -771,9 +771,11 @@ async function readTreeViaApi(repo, branch, token) {
 /**
  * Resolve the remote commit id of one branch without downloading the archive.
  *
- * This is what makes "check for updates" cheap: one API call per source instead
- * of a full tarball download. The endpoint comes from the parsed URL, so this
- * works against gitlab.com, a self-hosted GitLab, or GitHub Enterprise alike.
+ * This is what makes "check for updates" cheap: one lookup per source instead of
+ * a full tarball download. GitHub sources ask git first ({@link remoteShaViaGit}),
+ * which is a single small response; the endpoint below comes from the parsed URL,
+ * so the API fallback works against gitlab.com, a self-hosted GitLab, or GitHub
+ * Enterprise alike.
  *
  * @param {object} options - lookup options.
  * @param {object} options.repo - `parseRepoUrl` result.
@@ -782,6 +784,17 @@ async function readTreeViaApi(repo, branch, token) {
  * @returns {Promise<string>} commit id.
  */
 async function resolveRemoteSha({ repo, branch, token }) {
+  // `git ls-remote` answers one line instead of the commits API's ~30 KB JSON,
+  // which is most of the wait on a slow link and keeps the lookup out of the
+  // unauthenticated rate limit. Branches only: the helper throws for a tag or a
+  // missing ref so the API path below still answers those.
+  if (repo.provider === 'github' && await gitAvailable()) {
+    try {
+      return await remoteShaViaGit({ repo, branch, token })
+    } catch {
+      // Fall through: no git endpoint, a tag, or a host that refuses ls-remote.
+    }
+  }
   const url = commitsUrlOf(repo, branch)
   const headers = repo.provider === 'github'
     ? { ...providerHeaders(repo.provider, token), accept: 'application/vnd.github+json' }
@@ -795,6 +808,32 @@ async function resolveRemoteSha({ repo, branch, token }) {
   const id = repo.provider === 'github' ? payload?.sha : payload?.id
   if (typeof id === 'string' && id.length > 0) return id
   throw new Error(`查询提交失败：响应缺少 ${repo.provider === 'github' ? 'sha' : 'id'}`)
+}
+
+/**
+ * Resolve one branch's commit through `git ls-remote`.
+ *
+ * The commits API answers a whole commit document per source; `ls-remote`
+ * answers one line, which is the difference between a slow check and a fast one
+ * on a throttled link, and it stays off the unauthenticated rate limit.
+ *
+ * @param {object} options - lookup options.
+ * @param {object} options.repo - `parseRepoUrl` result.
+ * @param {string} options.branch - branch name (tags are not handled here).
+ * @param {string} [options.token] - access token.
+ * @returns {Promise<string>} commit id of `refs/heads/<branch>`.
+ */
+export async function remoteShaViaGit({ repo, branch, token = '' } = {}) {
+  if (typeof repo !== 'object' || repo === null) throw new Error('缺少仓库信息')
+  if (typeof branch !== 'string' || branch.length === 0) throw new Error('缺少分支名')
+  const out = await runGit(['ls-remote', cloneUrlOf(repo), `refs/heads/${branch}`], { env: gitEnv(token) })
+  const line = out
+    .split('\n')
+    .map((value) => value.trim())
+    .find((value) => value.length > 0)
+  const sha = line === undefined ? '' : line.split(/\s+/)[0]
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error(`查询提交失败：远端没有分支 ${branch}`)
+  return sha
 }
 
 /** Cached answer of {@link gitAvailable}; `undefined` until the first probe. */

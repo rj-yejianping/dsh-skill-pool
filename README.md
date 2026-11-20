@@ -131,8 +131,8 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
 dsh plugin --profile web add dsh-skill-pool
 
 # 本地开发：先从源码目录打包，再装真实包
-npm pack                      # → dsh-skill-pool-0.5.2.tgz
-plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.5.2.tgz")
+npm pack                      # → dsh-skill-pool-0.5.3.tgz
+plugin_manager(action: "install_bundle", target: "/path/to/dsh-skill-pool-0.5.3.tgz")
 ```
 
 > 不要用 `link:` / 软链安装：Host 在 profile 目录下按 importer 路径做包解析，
@@ -324,11 +324,14 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
 |---|---|
 | ![工具列表默认折叠](docs/screenshots/v0.5.1-mcp-tools-folded.png) | ![逐行继承](docs/screenshots/v0.5.1-mcp-tool-inherit.png) |
 
-### 0.5.2 修复
+### 0.5.2 / 0.5.3 修复
 
 - **GitHub 来源不再全量下载**：稀疏检出（`--depth 1 --filter=blob:none --sparse` + 只检出子目录）
   之前只在分支上、没进发布，所以每个来源仍在下载整包 tarball。实测 `anthropics/skills`
   整包 **4.15 MB / 161 s**（25 KB/s 的链路上还会撞上 45 s 超时），同一个子目录稀疏检出 **7.4 s**。
+- **「检查」也走 git 了**（0.5.3）：GitHub 来源的提交号优先用 `git ls-remote` 取（一行返回），
+  不再每次拉 ~30 KB 的 commits API JSON；分支不存在/是 tag/被代理拦截时自动回退到 API。
+  实测同一条链路：API 4.4 s → `ls-remote` 2.9 s，也顺手避开了未认证 60 次/小时的限制。
 - **导入对话框分段标签的白框**：分段的底样式从 `border` 简写改为 `borderWidth/borderStyle/borderColor`
   三件长写。React 会删除下一次渲染没给的 inline 长写，而没变的简写不会重新应用，于是
   Files → ZIP 切换时 `border-color` 被删掉、回落 `currentColor`，先选中的那个标签就留下一个

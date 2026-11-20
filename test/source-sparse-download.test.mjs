@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { downloadRepo, sparseCloneRepo } from '../src/library.js'
+import { downloadRepo, remoteShaViaGit, sparseCloneRepo } from '../src/library.js'
 
 /** Every file below `dir`, as slash-separated paths relative to it. */
 async function listFiles(dir, prefix = '') {
@@ -163,4 +163,21 @@ test('a sub-directory name that looks like a glob is still checked out literally
   })
 
   assert.deepEqual(await listFiles(result.extractDir), ['repo/skills/b[eta]/SKILL.md'])
+})
+
+test('remoteShaViaGit reads the branch head without the commits API', async (t) => {
+  const fixture = await makeFixtureRepo(t)
+
+  const sha = await remoteShaViaGit({ repo: githubRepo(fixture), branch: 'main' })
+
+  assert.equal(sha, fixture.sha)
+})
+
+test('remoteShaViaGit refuses a missing branch so the API fallback can answer', async (t) => {
+  const fixture = await makeFixtureRepo(t)
+
+  await assert.rejects(
+    remoteShaViaGit({ repo: githubRepo(fixture), branch: 'no-such-branch' }),
+    /查询提交失败：远端没有分支 no-such-branch/,
+  )
 })
