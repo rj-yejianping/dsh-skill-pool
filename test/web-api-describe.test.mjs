@@ -78,6 +78,22 @@ function textStream(text) {
 }
 
 /**
+ * Emit chunks the way the real `LlmRuntime.stream()` does: text deltas followed
+ * by a terminal `finish` chunk. The runtime never throws on adapter failures; it
+ * normalizes them into `error`/`aborted` finish reasons.
+ */
+function chunkStream(chunks) {
+  return {
+    stream: async function* () {
+      for (const chunk of chunks) yield chunk
+    },
+  }
+}
+
+/** Terminal chunk of a complete, non-truncated completion. */
+const stopFinish = { type: 'finish', reason: { kind: 'stop' } }
+
+/**
  * Build the real route handlers over a temporary Store plus a fake context.
  *
  * `registerWebApi` returns its internal `routes` array so a Node test can call
@@ -114,18 +130,19 @@ async function withApi(options, run) {
     })
     assert.ok(Array.isArray(registry.routes), 'registerWebApi returns its routes array')
 
-    const invoke = async (method, target, body) => {
+    const invoke = async (method, target, body, extra = {}) => {
       const pathname = target.split('?')[0]
       const route = registry.routes.find(([suffix, methods]) => suffix === pathname && methods.includes(method))
       assert.equal(typeof route?.[2], 'function', `route ${method} ${pathname} is registered`)
       const request = {
         url: `http://x${ROUTE_PREFIX}${target}`,
         ...(body === undefined ? {} : { json: async () => body }),
+        ...extra,
       }
       const response = await route[2](request)
       return { status: response.status, payload: await response.json() }
     }
-    const describe = (body = { server: 'alpha' }) => invoke('POST', '/mcp/describe', body)
+    const describe = (body = { server: 'alpha' }, extra) => invoke('POST', '/mcp/describe', body, extra)
 
     return await run({ invoke, describe, store, file })
   } finally {
@@ -171,6 +188,22 @@ test('buildDescribePrompt switches language and stays inside the 8 KB budget', (
   }
   assert.notEqual(zh.system, en.system)
   assert.equal(fallback.system, zh.system, 'an unknown language falls back to Chinese')
+})
+
+test('buildDescribePrompt skips one oversized tool without dropping later tools', () => {
+  const prompt = buildDescribePrompt({
+    server: 'alpha',
+    language: 'zh',
+    tools: [
+      // The name alone already exceeds the whole budget, so this line can never
+      // fit; the tools after it must still reach the prompt.
+      { name: `mcp__alpha__${'x'.repeat(9000)}`, description: 'oversized entry' },
+      { name: 'mcp__alpha__search', description: 'search docs' },
+    ],
+  })
+  assert.ok(prompt.user.length <= 8 * 1024)
+  assert.equal(prompt.user.includes('oversized entry'), false)
+  assert.ok(prompt.user.includes('mcp__alpha__search: search docs'))
 })
 
 test('describe refuses without a default model', async () => {
@@ -233,6 +266,7 @@ test('describe asks the default model with the tool list only', async () => {
       calls.push(options)
       return (async function* () {
         yield { type: 'text-delta', text: '用于检索知识库。' }
+        yield stopFinish
       })()
     },
   }
@@ -286,6 +320,7 @@ test('describe omits reasoningEffort when the default selection has none', async
       calls.push(options)
       return (async function* () {
         yield { type: 'text-delta', text: '用于检索知识库。' }
+        yield stopFinish
       })()
     },
   }
@@ -297,22 +332,24 @@ test('describe omits reasoningEffort when the default selection has none', async
 test('describe aborts the model stream when generation times out', async () => {
   let aborted = false
   let signal
+  let closed = false
   const llm = {
     stream: (options) => {
       signal = options.signal
       return {
         async *[Symbol.asyncIterator]() {
-          yield { type: 'text-delta', text: '半' }
-          await new Promise((_resolve, reject) => {
-            const onAbort = () => {
-              aborted = true
-              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }))
-            }
-            // Tolerate an abort that landed before this listener was attached;
-            // event listeners on an already-aborted signal never fire.
-            if (options.signal.aborted) onAbort()
-            else options.signal.addEventListener('abort', onAbort, { once: true })
-          })
+          try {
+            yield { type: 'text-delta', text: '半' }
+            await new Promise((resolve) => {
+              if (options.signal.aborted) resolve()
+              else options.signal.addEventListener('abort', resolve, { once: true })
+            })
+            aborted = true
+            // The runtime's normalized terminal chunk for an aborted request.
+            yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted' } } }
+          } finally {
+            closed = true
+          }
         },
       }
     },
@@ -326,9 +363,105 @@ test('describe aborts the model stream when generation times out', async () => {
   assert.equal(payload.error, 'timeout')
   assert.equal(aborted, true, 'the route aborted the request instead of leaving it hanging')
   assert.equal(signal.aborted, true)
+  assert.equal(closed, true, 'the route closed the abandoned stream')
 })
 
-test('describe reports a failed generation without a partial description', async () => {
+test('describe cancels generation when the panel request is aborted', async () => {
+  const controller = new AbortController()
+  let entered = false
+  let closed = false
+  let signal
+  const llm = {
+    stream: (options) => {
+      signal = options.signal
+      return {
+        async *[Symbol.asyncIterator]() {
+          try {
+            yield { type: 'text-delta', text: '半' }
+            entered = true
+            await new Promise((resolve) => {
+              if (options.signal.aborted) resolve()
+              else options.signal.addEventListener('abort', resolve, { once: true })
+            })
+            yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted' } } }
+          } finally {
+            closed = true
+          }
+        },
+      }
+    },
+  }
+  const result = await withApi({ llm, selection: { provider: 'p', model: 'm' } }, async (api) => {
+    const pending = api.describe({ server: 'alpha' }, { signal: controller.signal })
+    for (let tick = 0; tick < 100 && !entered; tick += 1) await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(entered, true, 'the request reached the model before the client aborted')
+    controller.abort()
+    return pending
+  })
+  // The client abort is not our deadline, so it is a failed generation, not a timeout.
+  assert.equal(result.payload.ok, false)
+  assert.equal(result.payload.error, 'generate-failed')
+  assert.equal(result.payload.description, undefined)
+  assert.equal(signal.aborted, true)
+  for (let tick = 0; tick < 100 && !closed; tick += 1) await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(closed, true, 'a closed panel request closes the stream iterator')
+})
+
+test('describe discards the text of an error finish', async () => {
+  const payload = await describeHarness({
+    llm: chunkStream([
+      { type: 'text-delta', index: 0, text: '半成品的描述' },
+      { type: 'finish', reason: { kind: 'error', failure: { code: 'PROVIDER_ERROR', message: 'sk-secret' } } },
+    ]),
+    selection: { provider: 'p', model: 'm' },
+  })
+  assert.equal(payload.ok, false)
+  assert.equal(payload.error, 'generate-failed')
+  assert.equal('description' in payload, false, 'a failed generation returns no draft')
+  assert.equal(JSON.stringify(payload).includes('sk-secret'), false)
+})
+
+test('describe refuses a truncated max-tokens completion', async () => {
+  const payload = await describeHarness({
+    llm: chunkStream([
+      { type: 'text-delta', index: 0, text: '用于检索' },
+      { type: 'finish', reason: { kind: 'max-tokens' } },
+    ]),
+    selection: { provider: 'p', model: 'm' },
+  })
+  assert.equal(payload.ok, false)
+  assert.equal(payload.error, 'generate-failed')
+  assert.equal('description' in payload, false)
+})
+
+test('describe answers timeout for an aborted finish once the deadline fired', async () => {
+  let signal
+  const llm = {
+    stream: (options) => {
+      signal = options.signal
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield { type: 'text-delta', index: 0, text: '半' }
+          await new Promise((resolve) => {
+            if (options.signal.aborted) resolve()
+            else options.signal.addEventListener('abort', resolve, { once: true })
+          })
+          yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'aborted' } } }
+        },
+      }
+    },
+  }
+  const payload = await describeHarness({
+    llm,
+    selection: { provider: 'p', model: 'm' },
+    describeTimeoutMs: 100,
+  })
+  assert.equal(payload.ok, false)
+  assert.equal(payload.error, 'timeout')
+  assert.equal(signal.aborted, true)
+})
+
+test('describe reports a middleware throw without a partial description', async () => {
   const payload = await describeHarness({
     llm: {
       stream: async function* () {
@@ -346,7 +479,7 @@ test('describe reports a failed generation without a partial description', async
 
 test('describe reports an empty generation as a failure', async () => {
   const payload = await describeHarness({
-    llm: { stream: async function* () {} },
+    llm: chunkStream([stopFinish]),
     selection: { provider: 'p', model: 'm' },
   })
   assert.equal(payload.ok, false)

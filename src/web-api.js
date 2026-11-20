@@ -156,7 +156,8 @@ function summaryOf(description) {
  * name and description summary: the stored connection definition (URL, command,
  * headers, environment, credentials) is deliberately absent, so nothing secret
  * can be sent to the model by accident. At most {@link DESCRIBE_TOOL_BUDGET}
- * characters of tool lines are kept; tools that do not fit are dropped whole.
+ * characters of tool lines are kept; a tool line that does not fit is skipped
+ * on its own, so one oversized entry never drops the tools after it.
  *
  * @param {{server?: string, tools?: Array<{name?: string, description?: string}>, language?: string}} input - prompt input.
  * @returns {{system: string, user: string}} system prompt and user content.
@@ -171,7 +172,7 @@ export function buildDescribePrompt({ server, tools, language } = {}) {
     if (!isObject(tool) || typeof tool.name !== 'string' || tool.name.length === 0) continue
     const description = summaryOf(tool.description)
     const line = description.length > 0 ? `- ${tool.name}: ${description}\n` : `- ${tool.name}\n`
-    if (used + line.length > DESCRIBE_TOOL_BUDGET) break
+    if (used + line.length > DESCRIBE_TOOL_BUDGET) continue
     lines.push(line)
     used += line.length
   }
@@ -1108,6 +1109,26 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
   const describeFailure = (code, message, status) => json({ ok: false, error: code, message }, status)
 
   /**
+   * Combine the generation deadline with the panel request's own abort signal,
+   * so a closed tab cancels the model call instead of waiting out the deadline.
+   *
+   * @param {{signal?: AbortSignal}|undefined} request - incoming panel request.
+   * @param {AbortController} controller - deadline controller for this call.
+   * @returns {{signal: AbortSignal, detach?: () => void}} signal to pass to the model and optional cleanup.
+   */
+  const streamSignalOf = (request, controller) => {
+    const client = request?.signal
+    if (!(client instanceof AbortSignal)) return { signal: controller.signal }
+    if (typeof AbortSignal.any === 'function') {
+      return { signal: AbortSignal.any([controller.signal, client]) }
+    }
+    const forward = () => controller.abort()
+    if (client.aborted) controller.abort()
+    else client.addEventListener('abort', forward, { once: true })
+    return { signal: controller.signal, detach: () => client.removeEventListener('abort', forward) }
+  }
+
+  /**
    * POST /dsh-skill-pool/mcp/describe — draft a purpose description for one
    * MCP server with the default model.
    *
@@ -1117,6 +1138,13 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
    * is never part of the request. The generated text is returned to the panel
    * as a draft and is deliberately not saved: the user confirms through
    * `/mcp/config`.
+   *
+   * `LlmRuntime.stream()` does not throw on adapter failures: it normalizes
+   * them into a terminal `finish` chunk, so the terminal reason decides the
+   * answer. Only a `stop` finish is a complete description; `error`, `aborted`,
+   * `max-tokens` and unknown reasons yield no draft at all. The deadline and
+   * the panel request both abort the call, and the stream iterator is always
+   * closed so an abandoned generation cannot outlive the request.
    */
   const mcpDescribeRoute = async (request) => {
     const body = await readBody(request)
@@ -1170,9 +1198,12 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       timedOut = true
       controller.abort()
     }, describeTimeout)
+    const { signal, detach } = streamSignalOf(request, controller)
     let text = ''
+    let failure = ''
+    let iterator
     try {
-      for await (const chunk of llm.stream({
+      iterator = llm.stream({
         provider: selection.provider,
         model: selection.model,
         ...(typeof selection.reasoningEffort === 'string' && selection.reasoningEffort.length > 0
@@ -1182,23 +1213,50 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
         messages: [{ role: 'user', content: [{ type: 'text', text: prompt.user }] }],
         system: prompt.system,
         maxTokens: DESCRIBE_MAX_TOKENS,
-        signal: controller.signal,
-      })) {
-        if (timedOut) break
-        if (isObject(chunk) && chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+        signal,
+      })[Symbol.asyncIterator]()
+      while (failure.length === 0) {
+        const step = await iterator.next()
+        if (step.done === true) break
+        const chunk = step.value
+        if (!isObject(chunk)) continue
+        if (chunk.type === 'text-delta') {
+          if (typeof chunk.text === 'string') text += chunk.text
+          continue
+        }
+        if (chunk.type !== 'finish') continue
+        const kind = isObject(chunk.reason) ? chunk.reason.kind : undefined
+        // Only a normal stop is a complete description. A truncated completion
+        // (`max-tokens`), a provider failure (`error`), a cancellation
+        // (`aborted`) or an unknown terminal reason all discard the text.
+        if (kind !== 'stop') failure = 'generate-failed'
+        break
       }
     } catch {
-      // Never log provider text or model output: either may echo the request.
-      debug(`[resource-pool] describe ${server}: generation failed`)
-      return timedOut
-        ? describeFailure('timeout', '生成超时，请重试', 504)
-        : describeFailure('generate-failed', '模型生成失败，请重试', 502)
+      // Middleware may still throw; the runtime's own failures arrive as
+      // finish chunks and are handled above.
+      failure = 'generate-failed'
     } finally {
       clearTimeout(timer)
+      detach?.()
+      // Close the iterator so a timeout or a closed tab cancels the model call.
+      // Deliberately not awaited: a stalled provider must not outlive the
+      // deadline just because its generator never settles.
+      try {
+        const closed = iterator?.return?.()
+        if (closed !== undefined && typeof closed.then === 'function') closed.catch(() => {})
+      } catch {
+        // The stream is already gone; nothing to close.
+      }
     }
     if (timedOut) {
       debug(`[resource-pool] describe ${server}: timed out`)
       return describeFailure('timeout', '生成超时，请重试', 504)
+    }
+    if (failure.length > 0) {
+      // Never log provider text or model output: either may echo the request.
+      debug(`[resource-pool] describe ${server}: generation failed`)
+      return describeFailure('generate-failed', '模型生成失败，请重试', 502)
     }
 
     // The draft must be a value the panel can save unchanged: plain text within
@@ -1697,11 +1755,22 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       await writeNodeResponse(failure('resource-pool/too-large', error instanceof Error ? error.message : String(error), 413), res)
       return
     }
+    // A panel tab closing mid-request must cancel what the handler is waiting
+    // on (the describe route forwards this signal to the model call). The Node
+    // response emits 'close' both when it finished normally and when the socket
+    // died; only the latter means the client is gone.
+    const disconnect = new AbortController()
+    if (typeof res.on === 'function') {
+      res.on('close', () => {
+        if (res.writableFinished !== true) disconnect.abort()
+      })
+    }
     let request
     try {
       request = new Request(url.toString(), {
         method,
         headers,
+        signal: disconnect.signal,
         ...(body === undefined || body.length === 0 ? {} : { body }),
       })
     } catch (error) {
