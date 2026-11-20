@@ -93,10 +93,10 @@ export const SETTING_KEYS = ['enabled', 'mcpGate', 'gateDefaultSkills']
 export const DISCLOSURE_MODES = ['full', 'progressive']
 
 /** Maximum stored length of one MCP service description. */
-const DESCRIPTION_LIMIT = 500
+export const DESCRIPTION_LIMIT = 500
 
 /** Maximum length of one public MCP tool name (a per-tool config key). */
-const MCP_TOOL_KEY_LIMIT = 128
+export const MCP_TOOL_KEY_LIMIT = 128
 
 /** Conservative identifier grammar for resource names and mode ids. */
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/

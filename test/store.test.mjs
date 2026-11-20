@@ -206,22 +206,37 @@ async function temporaryStore() {
   return { file, store: new StateStore({ file }) }
 }
 
-test('a scope change or re-import preserves the stored connection definition', () => {
-  const base = upsertItem(defaultState(), 'mcp', 'kb', mcpScope, { definition: mcpDefinition })
+test('a scope change or re-import preserves the stored connection definition and panel configuration', () => {
+  const base = upsertItem(defaultState(), 'mcp', 'kb', mcpScope, {
+    definition: mcpDefinition,
+    description: '知识库检索',
+    disclosure: 'progressive',
+    tools: { 'mcp__kb__search': { enabled: false, modes: ['standard'], workspaces: [] } },
+  })
 
-  // Editing conditions must not drop the definition.
+  // Editing conditions must not drop the definition or the panel configuration.
   const scoped = upsertItem(base, 'mcp', 'kb', { enabled: false, modes: [], workspaces: [] })
   assert.equal(scoped.mcp.kb.enabled, false)
   assert.deepEqual(scoped.mcp.kb.definition, mcpDefinition)
+  assert.equal(scoped.mcp.kb.description, '知识库检索')
+  assert.equal(scoped.mcp.kb.disclosure, 'progressive')
+  assert.deepEqual(scoped.mcp.kb.tools, {
+    'mcp__kb__search': { enabled: false, modes: ['standard'], workspaces: [] },
+  })
 
   // Re-importing a changed connection replaces the definition.
   const replacement = { ...mcpDefinition, url: 'http://127.0.0.1:65534/mcp' }
   const reimported = upsertItem(scoped, 'mcp', 'kb', mcpScope, { definition: replacement })
   assert.deepEqual(reimported.mcp.kb.definition, replacement)
 
-  // A write without a definition keeps the stored connection.
+  // A write without a definition keeps the stored connection and panel config.
   const untouched = upsertItem(reimported, 'mcp', 'kb', mcpScope)
   assert.deepEqual(untouched.mcp.kb.definition, replacement)
+  assert.equal(untouched.mcp.kb.description, '知识库检索')
+  assert.equal(untouched.mcp.kb.disclosure, 'progressive')
+  assert.deepEqual(untouched.mcp.kb.tools, {
+    'mcp__kb__search': { enabled: false, modes: ['standard'], workspaces: [] },
+  })
 })
 
 test('concurrent updates to different fields both survive on disk', async () => {
@@ -604,6 +619,26 @@ test('readable state rejects an unknown disclosure and over-long description', (
     () => normalizeReadableState({ ...base, mcp: { a: { enabled: true, modes: [], workspaces: [], description: 'x'.repeat(501) } } }),
     /description/,
   )
+})
+
+test('readable state rejects invalid mcp tool configs and control characters', () => {
+  const base = {
+    version: 4,
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
+    skills: {},
+    sources: {},
+    groups: {},
+  }
+  const withMember = (extra) => ({ ...base, mcp: { a: { enabled: true, modes: [], workspaces: [], ...extra } } })
+  assert.throws(
+    () => normalizeReadableState(withMember({ tools: { 'mcp__a__x': { enabled: 'yes', modes: [], workspaces: [] } } })),
+    /enabled/,
+  )
+  assert.throws(
+    () => normalizeReadableState(withMember({ tools: { 'a__x': { enabled: true, modes: [], workspaces: [] } } })),
+    /invalid tool key/,
+  )
+  assert.throws(() => normalizeReadableState(withMember({ description: 'bad\u0000text' })), /description/)
 })
 
 test('setMcpConfig and setMcpToolConfig preserve definition and scope', () => {
