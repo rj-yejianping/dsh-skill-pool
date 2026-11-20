@@ -144,6 +144,8 @@ export function createMcpDisclosure({
   const make = typeof defineTool === 'function' ? defineTool : (def) => def
   /** @type {Map<string, {name: string, description: string, dispose: Function}>} */
   const entries = new Map()
+  /** Whether a sync pass is running (guards synchronous `tools/change` re-entry). */
+  let syncing = false
 
   /** Log a warning without ever letting logging break a sync. */
   const warn = (message) => {
@@ -248,9 +250,11 @@ export function createMcpDisclosure({
    * The synchronous visibility predicate of one discover entry.
    *
    * It answers from the per-Agent record only: a missing or not-yet-activated
-   * record, a gate-off record and a service the pool no longer treats as
-   * progressive all yield `false`. It is synchronous and side-effect free, as
-   * the tool registry requires.
+   * record, a record built by the conservative fallback (the document was
+   * unreadable, so the record cannot prove what the pool holds), a gate-off
+   * record and a service the pool no longer treats as progressive all yield
+   * `false`. It is synchronous and side-effect free, as the tool registry
+   * requires.
    */
   const whenOf = (server) => (context) => {
     try {
@@ -258,6 +262,10 @@ export function createMcpDisclosure({
       if (agent === undefined || agent === null) return false
       const record = typeof recordOf === 'function' ? recordOf(agent) : undefined
       if (record === undefined || record === null || record.activated !== true) return false
+      // A conservative record is a deny-all snapshot taken while the state was
+      // unreadable. It cannot say which services are progressive, so the entry
+      // stays invisible instead of guessing (spec §2/§7).
+      if (record.conservative === true) return false
       if (record.gateMcp !== true) return false
       return record.progressiveServers instanceof Set && record.progressiveServers.has(server)
     } catch {
@@ -327,6 +335,21 @@ export function createMcpDisclosure({
    * returns a distinct error code and never expands the service, so an empty or
    * stale catalog is never reported as success.
    *
+   * Returned codes are exactly this closed set; upstream strings are never
+   * passed through to the model:
+   * - `state-unavailable` — no activation record, an unfinished activation, a
+   *   conservative (deny-all) record, an unreadable document, or a malformed
+   *   per-tool snapshot;
+   * - `not-in-pool` — the gate is off, the service left this Agent's pool, the
+   *   document now says disabled/full, or the record is malformed;
+   * - `offline` — the `mcpManager` knows the service and it is not connected
+   *   (also returns `service`);
+   * - `tools-unavailable` — the registry cannot be read (also the catch-all for
+   *   an unexpected failure);
+   * - `no-tools` — the catalog exists but offers this Agent nothing it may see
+   *   (also returns `service` and `hidden` counts);
+   * - `expand-failed` — the expansion itself was refused by the activation layer.
+   *
    * @param {{server: string, description: string, member: object}} entry - registration facts.
    * @param {unknown} _args - validated arguments (unused).
    * @param {{agent?: any}} [exec] - execution context.
@@ -339,6 +362,10 @@ export function createMcpDisclosure({
       if (record === undefined || record === null || record.activated !== true) {
         return { ok: false, error: 'state-unavailable' }
       }
+      // A conservative record denies every tool at dispatch because the state
+      // was unreadable when it was built. It cannot bound a catalog, so the
+      // answer stays `state-unavailable` even if the file is readable again.
+      if (record.conservative === true) return { ok: false, error: 'state-unavailable' }
       if (record.gateMcp !== true) return notInPool()
       if (!(record.progressiveServers instanceof Set) || !record.progressiveServers.has(server)) {
         return notInPool()
@@ -416,9 +443,17 @@ export function createMcpDisclosure({
       if (allowed.length === 0) return { ok: false, error: 'no-tools', service: server, hidden }
 
       if (typeof expandService !== 'function') return { ok: false, error: 'expand-failed' }
-      const result = expandService(agent, server)
+      let result
+      try {
+        result = expandService(agent, server)
+      } catch {
+        return { ok: false, error: 'expand-failed' }
+      }
       if (result === null || typeof result !== 'object' || result.ok !== true) {
-        const error = typeof result?.error === 'string' && result.error.length > 0 ? result.error : 'expand-failed'
+        // Only our own closed set reaches the model. `not-activated` means the
+        // record the check above used is already stale, which is unreadable
+        // state; every other upstream code is an expansion failure.
+        const error = result?.error === 'not-activated' ? 'state-unavailable' : 'expand-failed'
         return { ok: false, error }
       }
       return {
@@ -443,12 +478,20 @@ export function createMcpDisclosure({
    * Newly targeted services get an entry, services that left (removed,
    * disabled, gate off, switched to full, or progressive unavailable) lose
    * theirs, and a description edit re-registers so the model sees the new text.
-   * A name that cannot be derived or is already taken is reported and skipped;
-   * it is never silently renamed.
+   * Removal never needs the live tool list; when that list cannot be read only
+   * additions are skipped (a name conflict could not be ruled out). A name that
+   * cannot be derived or is already taken is reported and skipped; it is never
+   * silently renamed.
+   *
+   * A synchronous `tools/change` re-entry returns immediately: the outer pass
+   * has just registered a name but not recorded it yet, so a nested pass would
+   * misread our own tool as a conflict.
    *
    * @param {object} state - current document.
    */
   const sync = (state) => {
+    if (syncing) return
+    syncing = true
     try {
       const targets = progressiveEnabled() ? targetsOf(state) : new Map()
       const tools = toolsOf()
@@ -457,12 +500,20 @@ export function createMcpDisclosure({
         if (targets.size > 0) warn('discover entries are unavailable: the global tools service is not exposed')
         return
       }
+
+      // Removal is authoritative from our own registry: it must not depend on a
+      // readable tool list.
+      for (const server of [...entries.keys()]) {
+        if (!targets.has(server)) release(server)
+      }
+
       const listed = readSchemas()
       if (listed.ok !== true) {
-        // Without the live name list a conflict cannot be ruled out, so nothing
-        // is registered or removed. Existing entries stay truthful: their
-        // `when` and `execute` read the live record and document.
-        warn(`discover registration skipped: ${listed.error}`)
+        // Additions need the live name list because a conflict cannot be ruled
+        // out without it. Entries for still-targeted services are kept; their
+        // `when` and `execute` read the live record and document, so they stay
+        // invisible and unreachable while the service is not progressive.
+        warn(`discover additions skipped: ${listed.error}`)
         return
       }
 
@@ -540,6 +591,8 @@ export function createMcpDisclosure({
       // Registration problems are reported per service where possible; anything
       // that escapes here must still not break the caller's re-apply.
       warn(`discover sync failed: ${messageOf(error)}`)
+    } finally {
+      syncing = false
     }
   }
 

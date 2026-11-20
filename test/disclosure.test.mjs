@@ -27,7 +27,8 @@ const baseState = () => ({
 
 /**
  * Fake controller inputs. The registry `register` captures the `when` option the
- * real `tools.register` receives, and rejects a duplicate exactly like the host.
+ * real `tools.register` receives, rejects a duplicate exactly like the host, and
+ * — also like the host — makes a registered tool appear in `schemas()`.
  */
 function makeHarness(over = {}) {
   const state = over.state ?? baseState()
@@ -41,6 +42,8 @@ function makeHarness(over = {}) {
   }
   const registered = new Map()
   const expanded = []
+  const warnings = []
+  let onRegister
   let schemas = over.schemas ?? [
     { name: 'mcp__alpha__search', description: 'search docs' },
     { name: 'mcp__alpha__read', description: 'read docs' },
@@ -50,11 +53,18 @@ function makeHarness(over = {}) {
   const tools = {
     schemas: () => {
       if (schemasThrows) throw new Error('tool registry is unavailable')
-      return schemas
+      // A globally registered tool is visible here, exactly as in the host.
+      return [
+        ...schemas,
+        ...[...registered.values()].map((def) => ({ name: def.name, description: def.description })),
+      ]
     },
     register: (def, options) => {
       if (registered.has(def.name)) throw new Error(`tool "${def.name}" is already registered`)
       registered.set(def.name, { ...def, when: options?.when })
+      // Registration publishes `tools/change`; the callback below models a
+      // synchronous listener that calls back into sync.
+      onRegister?.(def)
       return () => registered.delete(def.name)
     },
   }
@@ -65,6 +75,10 @@ function makeHarness(over = {}) {
   }
   const controller = createMcpDisclosure({
     ctx,
+    logger: {
+      warn: (message) => warnings.push(message),
+      debug() {},
+    },
     getState: over.getState ?? (async () => state),
     recordOf: over.recordOf ?? (() => record),
     expandService:
@@ -83,6 +97,7 @@ function makeHarness(over = {}) {
     controller,
     registered,
     expanded,
+    warnings,
     record,
     state,
     setSchemasThrows: (next) => {
@@ -90,6 +105,9 @@ function makeHarness(over = {}) {
     },
     setManager: (next) => {
       manager = next
+    },
+    setOnRegister: (next) => {
+      onRegister = next
     },
   }
 }
@@ -137,14 +155,35 @@ test('sync is idempotent and refreshes the description on an edit', () => {
   const h = makeHarness()
   h.controller.sync(h.state)
   const first = h.registered.get('alpha_discover')
+  assert.equal(h.registered.size, 1)
+  // The fake registry now reports `alpha_discover` in `schemas()`, so this pass
+  // only succeeds if our own registration is not mistaken for a conflict.
   h.controller.sync(h.state)
   assert.equal(h.registered.size, 1)
   // Retained, not re-registered: an unchanged document must not churn tools.
   assert.equal(h.registered.get('alpha_discover'), first)
+  assert.deepEqual(h.warnings, [])
   h.state.mcp.alpha.description = '新的用途'
   h.controller.sync(h.state)
   assert.equal(h.registered.size, 1)
   assert.ok(h.registered.get('alpha_discover').description.startsWith('新的用途'))
+})
+
+test('a synchronous re-entrant sync returns immediately without a false conflict', () => {
+  const h = makeHarness()
+  let nested = 0
+  h.setOnRegister(() => {
+    // Models the host's synchronous `tools/change` listener calling back while
+    // the outer registration exists but has not been recorded yet.
+    nested += 1
+    h.controller.sync(h.state)
+  })
+  h.controller.sync(h.state)
+  assert.equal(nested, 1)
+  assert.equal(h.registered.size, 1)
+  assert.equal(h.registered.has('alpha_discover'), true)
+  // The nested pass must not report our own fresh registration as taken.
+  assert.deepEqual(h.warnings, [])
 })
 
 test('sync registers nothing while the MCP gate is off', () => {
@@ -356,13 +395,52 @@ test('discover refuses when the tool catalog cannot be read', async () => {
   const h = makeHarness()
   h.controller.sync(h.state)
   h.setSchemasThrows(true)
-  // A later sync cannot verify names either, so it leaves the live entry alone
-  // instead of registering or removing anything blindly.
+  // The service is still targeted, so the entry is kept; a later sync cannot
+  // verify names, so it must not add (or blindly remove) anything.
   h.controller.sync(h.state)
   assert.equal(h.registered.has('alpha_discover'), true)
   const payload = await h.registered.get('alpha_discover').execute({}, { agent: {} })
   assert.deepEqual(payload, { ok: false, error: 'tools-unavailable' })
   assert.deepEqual(h.expanded, [])
+})
+
+test('sync still removes stale entries while the tool list is unreadable', () => {
+  const h = makeHarness()
+  h.controller.sync(h.state)
+  assert.equal(h.registered.has('alpha_discover'), true)
+  h.setSchemasThrows(true)
+  // alpha leaves the progressive target set, gamma joins it. Removal needs no
+  // name list; the gamma addition does, so it is skipped instead of guessed.
+  h.state.mcp.alpha.disclosure = 'full'
+  h.state.mcp.gamma = { enabled: true, disclosure: 'progressive' }
+  h.controller.sync(h.state)
+  assert.equal(h.registered.has('alpha_discover'), false)
+  assert.equal(h.registered.has('gamma_discover'), false)
+})
+
+test('an expansion refusal is mapped onto the documented error codes', async () => {
+  const stale = makeHarness({ expandService: () => ({ ok: false, error: 'not-activated' }) })
+  stale.controller.sync(stale.state)
+  assert.deepEqual(
+    await stale.registered.get('alpha_discover').execute({}, { agent: {} }),
+    { ok: false, error: 'state-unavailable' },
+  )
+  const refused = makeHarness({ expandService: () => ({ ok: false, error: 'not-in-pool' }) })
+  refused.controller.sync(refused.state)
+  assert.deepEqual(
+    await refused.registered.get('alpha_discover').execute({}, { agent: {} }),
+    { ok: false, error: 'expand-failed' },
+  )
+  const broken = makeHarness({
+    expandService: () => {
+      throw new Error('upstream exploded')
+    },
+  })
+  broken.controller.sync(broken.state)
+  assert.deepEqual(
+    await broken.registered.get('alpha_discover').execute({}, { agent: {} }),
+    { ok: false, error: 'expand-failed' },
+  )
 })
 
 test('discover reports a failed expansion instead of success', async () => {
@@ -387,6 +465,19 @@ test('the discover registration is visible only to an activated, gated, progress
   h.record.gateMcp = true
   h.record.progressiveServers.clear()
   assert.equal(when({ agent: { id: 'a1' } }), false)
+})
+
+test('a conservative record hides the entry and answers state-unavailable', async () => {
+  const h = makeHarness()
+  h.controller.sync(h.state)
+  // The conservative activation keeps activated/gateMcp/snapshots but denies
+  // every visible tool because the document was unreadable.
+  h.record.conservative = true
+  h.record.toolDenied = new Set(['mcp__alpha__search', 'mcp__alpha__read'])
+  assert.equal(h.registered.get('alpha_discover').when({ agent: { id: 'a1' } }), false)
+  const payload = await h.registered.get('alpha_discover').execute({}, { agent: {} })
+  assert.deepEqual(payload, { ok: false, error: 'state-unavailable' })
+  assert.deepEqual(h.expanded, [])
 })
 
 test('dispose releases every registration', () => {
