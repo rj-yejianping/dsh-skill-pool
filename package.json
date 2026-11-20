@@ -1,6 +1,6 @@
 {
   "name": "dsh-skill-pool",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "One pool for all your DSH skills: import from files, ZIP, GitHub or GitLab, then scope each skill to Agent modes and workspaces from the Settings panel — no code editing required.",
   "license": "MIT",
