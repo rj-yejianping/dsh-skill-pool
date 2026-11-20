@@ -6,11 +6,17 @@ import test from 'node:test'
 
 import {
   StateStore,
+  cleanDescription,
+  clearMcpToolConfig,
   defaultState,
   excludeSourceSkill,
+  normalizeMcpTools,
+  normalizeReadableState,
   normalizeState,
   removeItem,
   removeSource,
+  setMcpConfig,
+  setMcpToolConfig,
   upsertGroup,
   upsertItem,
   upsertSource,
@@ -536,4 +542,159 @@ test('an update refuses a non-ENOENT read error (EISDIR) without touching the pa
   await assert.rejects(store.update((current) => current), /could not be read; refusing to overwrite/)
   assert.equal((await stat(file)).isDirectory(), true, 'the path is still the directory we created')
   assert.deepEqual(await readdir(dir), ['state.json'], 'no temporary file was written next to it')
+})
+
+test('mcp member normalizes description, disclosure and per-tool config', () => {
+  const state = normalizeState({
+    version: 4,
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
+    skills: {},
+    sources: {},
+    groups: {},
+    mcp: {
+      alpha: {
+        enabled: true,
+        modes: [],
+        workspaces: [],
+        description: '知识库检索',
+        disclosure: 'progressive',
+        tools: {
+          'mcp__alpha__search': { enabled: false, modes: ['standard'], workspaces: ['/w'] },
+          'mcp__alpha__read': {},
+        },
+      },
+    },
+  })
+  assert.equal(state.mcp.alpha.description, '知识库检索')
+  assert.equal(state.mcp.alpha.disclosure, 'progressive')
+  assert.deepEqual(state.mcp.alpha.tools['mcp__alpha__search'], {
+    enabled: false,
+    modes: ['standard'],
+    workspaces: ['/w'],
+  })
+  assert.deepEqual(state.mcp.alpha.tools['mcp__alpha__read'], { enabled: true, modes: [], workspaces: [] })
+})
+
+test('mcp member defaults to full injection and drops invalid disclosure', () => {
+  const state = normalizeState({
+    version: 4,
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
+    skills: {},
+    sources: {},
+    groups: {},
+    mcp: { alpha: { enabled: true, modes: [], workspaces: [], disclosure: 'bogus', tools: { 'mcp__alpha__x': { enabled: 'yes' } } } },
+  })
+  assert.equal(state.mcp.alpha.disclosure, 'full')
+  assert.deepEqual(state.mcp.alpha.tools['mcp__alpha__x'], { enabled: true, modes: [], workspaces: [] })
+})
+
+test('readable state rejects an unknown disclosure and over-long description', () => {
+  const base = {
+    version: 4,
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
+    skills: {},
+    sources: {},
+    groups: {},
+  }
+  assert.throws(
+    () => normalizeReadableState({ ...base, mcp: { a: { enabled: true, modes: [], workspaces: [], disclosure: 'later' } } }),
+    /disclosure/,
+  )
+  assert.throws(
+    () => normalizeReadableState({ ...base, mcp: { a: { enabled: true, modes: [], workspaces: [], description: 'x'.repeat(501) } } }),
+    /description/,
+  )
+})
+
+test('setMcpConfig and setMcpToolConfig preserve definition and scope', () => {
+  const initial = normalizeState({
+    version: 4,
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
+    skills: {},
+    sources: {},
+    groups: {},
+    mcp: {
+      alpha: {
+        enabled: true,
+        modes: ['standard'],
+        workspaces: ['/w'],
+        definition: { transport: 'streamable-http', serverName: 'alpha', url: 'http://x/mcp' },
+      },
+    },
+  })
+  const configured = setMcpConfig(initial, 'alpha', { description: '检索', disclosure: 'progressive' })
+  assert.equal(configured.mcp.alpha.definition.url, 'http://x/mcp')
+  assert.deepEqual(configured.mcp.alpha.modes, ['standard'])
+  assert.equal(configured.mcp.alpha.description, '检索')
+  const tooled = setMcpToolConfig(configured, 'alpha', 'mcp__alpha__search', { enabled: false })
+  assert.equal(tooled.mcp.alpha.tools['mcp__alpha__search'].enabled, false)
+  const cleared = clearMcpToolConfig(tooled, 'alpha', 'mcp__alpha__search')
+  assert.equal(cleared.mcp.alpha.tools['mcp__alpha__search'], undefined)
+  assert.equal(cleared.mcp.alpha.description, '检索')
+})
+
+test('cleanDescription strips control characters and caps at 500 characters', () => {
+  assert.equal(cleanDescription(42), '')
+  assert.equal(cleanDescription('  spaced  '), 'spaced')
+  assert.equal(cleanDescription('a\u0000b\nc\u007f'), 'abc')
+  assert.equal(cleanDescription('x'.repeat(600)).length, 500)
+})
+
+test('normalizeMcpTools keeps only usable mcp__ keys and defaults the scope', () => {
+  assert.deepEqual(normalizeMcpTools(null), {})
+  assert.deepEqual(
+    normalizeMcpTools({
+      'mcp__alpha__search': { enabled: false, modes: ['standard'], workspaces: ['/w'] },
+      'mcp__alpha__read': {},
+      'alpha__search': {},
+      [`mcp__alpha__${'x'.repeat(200)}`]: {},
+      'mcp__alpha__string': 'nope',
+    }),
+    {
+      'mcp__alpha__search': { enabled: false, modes: ['standard'], workspaces: ['/w'] },
+      'mcp__alpha__read': { enabled: true, modes: [], workspaces: [] },
+    },
+  )
+})
+
+test('mcp config mutators leave an unknown server untouched', () => {
+  const state = normalizeState({
+    version: 4,
+    settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
+    skills: {},
+    sources: {},
+    groups: {},
+    mcp: { alpha: { enabled: true, modes: [], workspaces: [] } },
+  })
+  assert.equal(setMcpConfig(state, 'missing', { description: 'x' }), state)
+  assert.equal(setMcpToolConfig(state, 'missing', 'mcp__missing__x', { enabled: false }), state)
+  assert.equal(clearMcpToolConfig(state, 'missing', 'mcp__missing__x'), state)
+})
+
+test('setMcpToolConfig merges a partial patch over the stored tool config', () => {
+  const state = setMcpToolConfig(
+    normalizeState({
+      version: 4,
+      settings: { enabled: true, mcpGate: true, gateDefaultSkills: false },
+      skills: {},
+      sources: {},
+      groups: {},
+      mcp: { alpha: { enabled: true, modes: [], workspaces: [] } },
+    }),
+    'alpha',
+    'mcp__alpha__search',
+    { enabled: false, modes: ['standard'] },
+  )
+  assert.deepEqual(state.mcp.alpha.tools['mcp__alpha__search'], {
+    enabled: false,
+    modes: ['standard'],
+    workspaces: [],
+  })
+  // A second patch only changes the fields it names.
+  const scoped = setMcpToolConfig(state, 'alpha', 'mcp__alpha__search', { workspaces: ['/w'] })
+  assert.deepEqual(scoped.mcp.alpha.tools['mcp__alpha__search'], {
+    enabled: false,
+    modes: ['standard'],
+    workspaces: ['/w'],
+  })
 })
