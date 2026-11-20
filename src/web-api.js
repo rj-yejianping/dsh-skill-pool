@@ -78,6 +78,25 @@ const MAX_BODY_BYTES = 96 * 1024 * 1024
 /** Maximum characters of one tool description copied into a panel summary. */
 const SUMMARY_LIMIT = 200
 
+/** Character budget for the tool list of one description-generation request. */
+const DESCRIBE_TOOL_BUDGET = 8 * 1024
+
+/** Output cap for a generated description (1–2 sentences). */
+const DESCRIBE_MAX_TOKENS = 200
+
+/** Default deadline for one description-generation request. */
+const DESCRIBE_TIMEOUT_MS = 30_000
+
+/**
+ * System prompts for description generation, selected by the panel language.
+ * Both ask for the same shape: 1–2 sentences about which tasks the service
+ * suits and when a model should call it, with no surrounding commentary.
+ */
+const DESCRIBE_SYSTEM = {
+  zh: '你是 MCP 服务的用途说明撰写助手。根据给出的工具清单，用中文输出 1–2 句话，说明这个服务适合什么任务、什么时候应该调用它。只输出描述本身；不要标题、编号、引号或任何解释。',
+  en: 'You write short MCP server summaries. From the given tool list, write 1–2 sentences in English describing which tasks the service suits and when to call it. Output only the description: no heading, numbering, quotes, or explanation.',
+}
+
 /** JSON response helper. */
 function json(value, status = 200) {
   return Response.json(value, { status, headers: { 'cache-control': 'no-store' } })
@@ -127,6 +146,36 @@ async function readBody(request) {
 function summaryOf(description) {
   if (typeof description !== 'string') return ''
   return description.replace(/\s+/g, ' ').trim().slice(0, SUMMARY_LIMIT)
+}
+
+/**
+ * Build the two prompt halves for one description-generation request.
+ *
+ * Pure, so the budget and the language switch are testable without a model.
+ * The user half carries only the server's public name plus each tool's public
+ * name and description summary: the stored connection definition (URL, command,
+ * headers, environment, credentials) is deliberately absent, so nothing secret
+ * can be sent to the model by accident. At most {@link DESCRIBE_TOOL_BUDGET}
+ * characters of tool lines are kept; tools that do not fit are dropped whole.
+ *
+ * @param {{server?: string, tools?: Array<{name?: string, description?: string}>, language?: string}} input - prompt input.
+ * @returns {{system: string, user: string}} system prompt and user content.
+ */
+export function buildDescribePrompt({ server, tools, language } = {}) {
+  const lang = language === 'en' ? 'en' : 'zh'
+  const name = typeof server === 'string' ? server : ''
+  const header = lang === 'en' ? `Server: ${name}\nTools:\n` : `服务：${name}\n工具清单：\n`
+  const lines = []
+  let used = header.length
+  for (const tool of Array.isArray(tools) ? tools : []) {
+    if (!isObject(tool) || typeof tool.name !== 'string' || tool.name.length === 0) continue
+    const description = summaryOf(tool.description)
+    const line = description.length > 0 ? `- ${tool.name}: ${description}\n` : `- ${tool.name}\n`
+    if (used + line.length > DESCRIBE_TOOL_BUDGET) break
+    lines.push(line)
+    used += line.length
+  }
+  return { system: DESCRIBE_SYSTEM[lang], user: header + lines.join('') }
 }
 
 /**
@@ -210,13 +259,16 @@ export function publicState(state) {
  * @param {{ debug?: Function, warn?: Function, info?: Function }} [options.logger] - logger.
  * @param {{ timeoutMs?: number, intervalMs?: number }} [options.mountProbe] - MCP readiness window.
  * @param {object} [options.mounts] - shared mount tracker (boot re-mounts land here too).
+ * @param {number} [options.describeTimeoutMs] - override the description-generation deadline (tests).
  */
-export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe, mounts = createMountTracker() } = {}) {
+export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe, mounts = createMountTracker(), describeTimeoutMs } = {}) {
   const debug = logger?.debug ?? (() => {})
   // "ready" means the server's tools are actually registered, not merely that a
   // Loader row exists: an unreachable server creates the row and never connects.
   const probeTimeoutMs = Number.isFinite(mountProbe?.timeoutMs) ? mountProbe.timeoutMs : DEFAULT_PROBE_TIMEOUT_MS
   const probeIntervalMs = Number.isFinite(mountProbe?.intervalMs) ? mountProbe.intervalMs : DEFAULT_PROBE_INTERVAL_MS
+  // The panel button gets a bounded deadline; tests shrink it to prove the abort.
+  const describeTimeout = Number.isFinite(describeTimeoutMs) && describeTimeoutMs > 0 ? describeTimeoutMs : DESCRIBE_TIMEOUT_MS
 
   // Always read the file for the panel: a cached document would hide an
   // external edit (including corruption) until the process restarted.
@@ -1044,6 +1096,121 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     })
   }
 
+  /**
+   * Failure answer for the describe route: a stable machine code plus a short
+   * panel-facing message.
+   *
+   * This route is the one panel call whose failure the UI renders directly, so
+   * it answers `{ok:false, error, message}` with `error` as the code string (the
+   * spec's shape) instead of the nested `{code, message}` other routes use.
+   * Provider and state details never reach the browser or the log.
+   */
+  const describeFailure = (code, message, status) => json({ ok: false, error: code, message }, status)
+
+  /**
+   * POST /dsh-skill-pool/mcp/describe — draft a purpose description for one
+   * MCP server with the default model.
+   *
+   * Only the service's current public tool names and description summaries are
+   * sent to the model (ambiguous and foreign names are dropped). The stored
+   * connection definition — URL, command, headers, environment, credentials —
+   * is never part of the request. The generated text is returned to the panel
+   * as a draft and is deliberately not saved: the user confirms through
+   * `/mcp/config`.
+   */
+  const mcpDescribeRoute = async (request) => {
+    const body = await readBody(request)
+    const server = textOf(body.server)
+    if (server.length === 0) return describeFailure('bad-server', '缺少 server', 400)
+
+    let state
+    try {
+      state = await readState()
+    } catch (error) {
+      // Fail closed: an untrusted document yields no generation attempt at all.
+      if (error instanceof StateReadError) return describeFailure(error.code, '状态不可读，无法生成描述', 500)
+      throw error
+    }
+    if (!isObject(state.mcp?.[server])) return describeFailure('unknown-server', `服务 ${server} 不存在`, 404)
+
+    const schemas = toolSchemas()
+    if (schemas === null) return describeFailure('tools-unavailable', '无法读取 MCP 工具列表', 500)
+    const tools = []
+    for (const schema of schemas) {
+      if (!isObject(schema) || typeof schema.name !== 'string') continue
+      if (mcpServerOf(schema.name) !== server) continue
+      // A name that cannot be attributed to exactly one service is not offered
+      // as this service's tool, in the prompt or anywhere else.
+      if (isAmbiguousMcpToolName(schema.name)) continue
+      tools.push({ name: schema.name, description: schema.description })
+    }
+    if (tools.length === 0) return describeFailure('no-tools', '该服务当前没有可用工具', 400)
+
+    // Both host services are optional and read without an inject requirement.
+    // The default model is resolved first: without it there is nothing to call.
+    const defaults = ctx.get('agentDefaultModel')
+    let selection
+    try {
+      selection = typeof defaults?.currentSelection === 'function' ? defaults.currentSelection() : undefined
+    } catch {
+      selection = undefined
+    }
+    if (!isObject(selection) || textOf(selection.provider).length === 0 || textOf(selection.model).length === 0) {
+      return describeFailure('no-default-model', '没有可用的默认模型', 503)
+    }
+    const llm = ctx.get('llm')
+    if (llm === null || llm === undefined || typeof llm.stream !== 'function') {
+      return describeFailure('no-llm', '缺少 llm 服务，无法生成描述', 503)
+    }
+
+    const prompt = buildDescribePrompt({ server, tools, language: body.language })
+    const controller = new AbortController()
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, describeTimeout)
+    let text = ''
+    try {
+      for await (const chunk of llm.stream({
+        provider: selection.provider,
+        model: selection.model,
+        ...(typeof selection.reasoningEffort === 'string' && selection.reasoningEffort.length > 0
+          ? { reasoningEffort: selection.reasoningEffort }
+          : {}),
+        // One-shot user input in the host's model-facing text-block shape.
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt.user }] }],
+        system: prompt.system,
+        maxTokens: DESCRIBE_MAX_TOKENS,
+        signal: controller.signal,
+      })) {
+        if (timedOut) break
+        if (isObject(chunk) && chunk.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text
+      }
+    } catch {
+      // Never log provider text or model output: either may echo the request.
+      debug(`[resource-pool] describe ${server}: generation failed`)
+      return timedOut
+        ? describeFailure('timeout', '生成超时，请重试', 504)
+        : describeFailure('generate-failed', '模型生成失败，请重试', 502)
+    } finally {
+      clearTimeout(timer)
+    }
+    if (timedOut) {
+      debug(`[resource-pool] describe ${server}: timed out`)
+      return describeFailure('timeout', '生成超时，请重试', 504)
+    }
+
+    // The draft must be a value the panel can save unchanged: plain text within
+    // the stored description limit, never a half sentence padded with markup.
+    const description = cleanDescription(text)
+    if (description.length === 0) {
+      debug(`[resource-pool] describe ${server}: empty output`)
+      return describeFailure('generate-failed', '模型未返回可用描述', 502)
+    }
+    return json({ ok: true, description })
+  }
+
   /** POST /dsh-skill-pool/skill/upload — install skill bundles from plain files. */
   const skillUploadRoute = async (request) => {
     const body = await readBody(request)
@@ -1465,6 +1632,7 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     ['/mcp/config', ['POST'], guarded(mcpConfigRoute)],
     ['/mcp/tool', ['POST'], guarded(mcpToolRoute)],
     ['/mcp/tools', ['GET'], guarded(mcpToolsRoute)],
+    ['/mcp/describe', ['POST'], guarded(mcpDescribeRoute)],
     ['/mounts', ['GET'], guarded(mountsRoute)],
   ]
 
