@@ -47,6 +47,7 @@ import {
   mcpServerOf,
   resolvePool,
 } from './rules.js'
+import { mcpServerOffline } from './disclosure.js'
 import { DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS, mountServer } from './mount.js'
 import {
   buildMcpConfig,
@@ -1137,7 +1138,8 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
    * connection definition — URL, command, headers, environment, credentials —
    * is never part of the request. The generated text is returned to the panel
    * as a draft and is deliberately not saved: the user confirms through
-   * `/mcp/config`.
+   * `/mcp/config`. A service the optional `mcpManager` reports as not connected
+   * answers `offline` before its stale catalog is read.
    *
    * `LlmRuntime.stream()` does not throw on adapter failures: it normalizes
    * them into a terminal `finish` chunk, so the terminal reason decides the
@@ -1160,6 +1162,12 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       throw error
     }
     if (!isObject(state.mcp?.[server])) return describeFailure('unknown-server', `服务 ${server} 不存在`, 404)
+
+    // Offline first: a catalog left behind by a dead connection is not usable,
+    // so no description is generated for it. This is the same optional manager
+    // check the discover tool uses; an absent manager or a missing entry
+    // degrades to the registry.
+    if (mcpServerOffline(ctx, server)) return describeFailure('offline', `服务 ${server} 当前离线`, 503)
 
     const schemas = toolSchemas()
     if (schemas === null) return describeFailure('tools-unavailable', '无法读取 MCP 工具列表', 500)

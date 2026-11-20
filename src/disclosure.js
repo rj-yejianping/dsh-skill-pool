@@ -116,6 +116,40 @@ function renderJson(_args, value) {
 }
 
 /**
+ * Whether the optional MCP manager reports this service as not connected.
+ *
+ * Only an authoritative "connected" is treated as usable. A manager that is
+ * absent, unreadable, or has no entry for the service degrades to the registry,
+ * exactly as documented: the catalog is then the visible tool list. This is the
+ * shared answer for the discover tool and the panel's describe route, so both
+ * refuse a dead connection's stale catalog.
+ *
+ * @param {object|undefined|null} ctx - plugin context; only an optional `get` is read.
+ * @param {string} server - pool service name.
+ * @returns {boolean} true only when a manager entry exists and is not connected.
+ */
+export function mcpServerOffline(ctx, server) {
+  if (typeof ctx?.get !== 'function') return false
+  let manager
+  try {
+    manager = ctx.get('mcpManager')
+  } catch {
+    return false
+  }
+  if (manager === null || typeof manager !== 'object' || typeof manager.list !== 'function') return false
+  let views
+  try {
+    views = manager.list()
+  } catch {
+    return false
+  }
+  if (!Array.isArray(views)) return false
+  const view = views.find((candidate) => candidate?.name === server)
+  if (view === undefined) return false
+  return view.status?.state !== 'connected'
+}
+
+/**
  * Create the progressive-disclosure controller.
  *
  * @param {object} options - controller options.
@@ -282,26 +316,7 @@ export function createMcpDisclosure({
    *
    * @returns {boolean} true only when a manager entry exists and is not connected.
    */
-  const isOffline = (server) => {
-    if (typeof ctx?.get !== 'function') return false
-    let manager
-    try {
-      manager = ctx.get('mcpManager')
-    } catch {
-      return false
-    }
-    if (manager === null || typeof manager !== 'object' || typeof manager.list !== 'function') return false
-    let views
-    try {
-      views = manager.list()
-    } catch {
-      return false
-    }
-    if (!Array.isArray(views)) return false
-    const view = views.find((candidate) => candidate?.name === server)
-    if (view === undefined) return false
-    return view.status?.state !== 'connected'
-  }
+  const isOffline = (server) => mcpServerOffline(ctx, server)
 
   /** Read one Agent's mode for per-tool scope evaluation; '' when unavailable. */
   const modeFor = (agent) => {

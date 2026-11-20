@@ -113,6 +113,7 @@ async function withApi(options, run) {
       ...(options.tools === false ? {} : { tools: { schemas: () => schemas() } }),
       ...(selection === undefined ? {} : { agentDefaultModel: { currentSelection: () => selection } }),
       ...(llm === undefined ? {} : { llm }),
+      ...(options.mcpManager === undefined ? {} : { mcpManager: options.mcpManager }),
     }
     const ctx = {
       get: (name) => services[name],
@@ -459,6 +460,49 @@ test('describe answers timeout for an aborted finish once the deadline fired', a
   assert.equal(payload.ok, false)
   assert.equal(payload.error, 'timeout')
   assert.equal(signal.aborted, true)
+})
+
+test('describe refuses an offline server before reading the tool list', async () => {
+  let listed = false
+  const payload = await describeHarness({
+    llm: textStream('用'),
+    selection: { provider: 'p', model: 'm' },
+    mcpManager: { list: () => [{ name: 'alpha', status: { state: 'disconnected' } }] },
+    schemas: () => {
+      listed = true
+      return fixtureSchemas()
+    },
+  })
+  assert.equal(payload.ok, false)
+  assert.equal(payload.error, 'offline')
+  assert.equal(listed, false, 'a dead connection never has its stale catalog read')
+})
+
+test('describe keeps the registry path without a usable manager entry', async () => {
+  const selection = { provider: 'p', model: 'm' }
+  const cases = {
+    // No mcpManager service at all.
+    absent: {},
+    // A manager that reports other services but not this one.
+    noEntry: { mcpManager: { list: () => [{ name: 'beta', status: { state: 'connected' } }] } },
+    // A manager whose list cannot be read degrades to the registry.
+    unreadable: {
+      mcpManager: {
+        list: () => {
+          throw new Error('manager exploded')
+        },
+      },
+    },
+  }
+  for (const [label, options] of Object.entries(cases)) {
+    const payload = await describeHarness({
+      llm: chunkStream([{ type: 'text-delta', index: 0, text: '用于检索知识库。' }, stopFinish]),
+      selection,
+      ...options,
+    })
+    assert.equal(payload.ok, true, `${label}: generation still works`)
+    assert.equal(payload.description, '用于检索知识库。')
+  }
 })
 
 test('describe reports a middleware throw without a partial description', async () => {
