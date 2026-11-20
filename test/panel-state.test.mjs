@@ -420,3 +420,26 @@ test('MCP description input strips characters the Host rejects', () => {
   assert.equal(entry.description, 'abcd')
   assert.equal(plugin.boardState.normalizeEntry({ description: 'x'.repeat(600) }).description.length, 500)
 })
+
+test('import-dialog segments declare the border colour as a longhand', () => {
+  const tab = plugin.boardState.segmentTabStyle
+  assert.equal(typeof tab, 'function', 'segmentTabStyle is exported for the test seam')
+
+  // The base (inactive) style must carry all three border longhands: React deletes
+  // a longhand the next style object omits, and with the `border` shorthand the
+  // removed colour fell back to `currentColor` — the "stuck white border" the user
+  // saw on the tab that was selected first.
+  const base = tab(false)
+  assert.equal(base.border, undefined, 'the base segment must not use the border shorthand')
+  assert.equal(base.borderWidth, '1px')
+  assert.equal(base.borderStyle, 'solid')
+  assert.equal(base.borderColor, 'transparent')
+
+  // The selected style may override the colour but must not turn the base into a
+  // shorthand in one state and a longhand in the other.
+  const selected = tab(true)
+  assert.equal(selected.border, undefined, 'the selected segment must not use the border shorthand')
+  assert.equal(selected.borderWidth, '1px')
+  assert.equal(selected.borderStyle, 'solid')
+  assert.equal(selected.borderColor, 'transparent')
+})

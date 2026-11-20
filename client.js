@@ -1335,6 +1335,13 @@ window.__ModuleLoader__.load({
     }
     // ----------------------------------------------------------------- styles
 
+    // Border colours that a state can override are declared as three longhands
+    // (`borderWidth` / `borderStyle` / `borderColor`), never as the `border`
+    // shorthand plus a `borderColor` override. React diffs inline styles prop by
+    // prop: when the next render omits a longhand it *deletes* it, while an
+    // unchanged shorthand is not re-applied, so the deleted colour falls back to
+    // `currentColor` and the element grows a text-coloured box (the "stuck white
+    // border" on the import tabs and every toggle chip below).
     const S = {
       page: {
         display: 'flex',
@@ -1469,7 +1476,9 @@ window.__ModuleLoader__.load({
         height: '26px',
         whiteSpace: 'nowrap',
         lineHeight: 1,
-        border: '1px solid var(--rp-line)',
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: 'var(--rp-line)',
         background: 'var(--rp-card)',
         color: 'var(--dsw-alias-label-primary)',
         borderRadius: '7px',
@@ -1549,7 +1558,9 @@ window.__ModuleLoader__.load({
         width: '38px',
         height: '20px',
         padding: '2px',
-        border: '1px solid var(--rp-line-strong)',
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: 'var(--rp-line-strong)',
         borderRadius: '999px',
         background: 'var(--rp-card)',
         cursor: 'pointer',
@@ -1632,7 +1643,9 @@ window.__ModuleLoader__.load({
         display: 'inline-flex',
         alignItems: 'center',
         gap: '4px',
-        border: '1px solid var(--rp-line)',
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: 'var(--rp-line)',
         background: 'var(--rp-card-2)',
         borderRadius: '999px',
         padding: '1px 8px',
@@ -1656,7 +1669,9 @@ window.__ModuleLoader__.load({
         flex: '0 0 auto',
         fontSize: '11px',
         color: 'var(--dsw-alias-label-secondary)',
-        border: '1px solid var(--rp-line)',
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: 'var(--rp-line)',
         borderRadius: '5px',
         padding: '1px 6px',
       },
@@ -1807,7 +1822,9 @@ window.__ModuleLoader__.load({
         alignItems: 'center',
         gap: '8px',
         appearance: 'none',
-        border: '1px solid transparent',
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: 'transparent',
         background: 'transparent',
         color: 'var(--dsw-alias-label-primary)',
         borderRadius: '6px',
@@ -1839,7 +1856,9 @@ window.__ModuleLoader__.load({
         height: '14px',
         flex: '0 0 auto',
         borderRadius: '4px',
-        border: '1px solid var(--rp-line-strong)',
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: 'var(--rp-line-strong)',
         fontSize: '11px',
         color: 'var(--rp-accent)',
         lineHeight: 1,
@@ -1961,7 +1980,9 @@ window.__ModuleLoader__.load({
         alignItems: 'flex-start',
         gap: '8px',
         appearance: 'none',
-        border: '1px solid transparent',
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: 'transparent',
         background: 'transparent',
         color: 'var(--dsw-alias-label-primary)',
         borderRadius: '6px',
@@ -2382,7 +2403,9 @@ window.__ModuleLoader__.load({
       },
       segBtn: {
         appearance: 'none',
-        border: '1px solid transparent',
+        borderWidth: '1px',
+        borderStyle: 'solid',
+        borderColor: 'transparent',
         background: 'transparent',
         color: 'var(--dsw-alias-label-secondary)',
         borderRadius: '7px',
@@ -2398,6 +2421,7 @@ window.__ModuleLoader__.load({
         color: 'var(--rp-accent)',
         fontWeight: 600,
       },
+
       confirmRow: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', marginTop: '6px' },
       confirmText: { fontSize: '12px', color: 'var(--dsw-alias-state-error-primary)', lineHeight: 1.5 },
       scopeBox: {
@@ -2471,6 +2495,21 @@ window.__ModuleLoader__.load({
       },
       nativeRowLast: { borderBottom: 'none' },
       sectionHint: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.5 },
+    }
+
+    /**
+     * Style for one import-dialog segment.
+     *
+     * Kept as a function (and exposed through `boardState`) so the Node test can
+     * assert the border invariant without a browser: the base `segBtn` carries
+     * `borderColor` as a longhand, so the active -> inactive transition cannot
+     * drop the colour and fall back to `currentColor`.
+     *
+     * @param selected - whether this segment is the active one.
+     * @returns the merged button style.
+     */
+    function segmentTabStyle(selected) {
+      return { ...SX.segBtn, ...(selected ? SX.segActive : null) }
     }
 
     // ------------------------------------------------------------------ panel
@@ -5892,14 +5931,9 @@ window.__ModuleLoader__.load({
                 type: 'button',
                 role: 'tab',
                 'aria-selected': seg === key ? 'true' : 'false',
-                style: { ...SX.segBtn, ...(seg === key ? SX.segActive : null) },
+                style: segmentTabStyle(seg === key),
                 disabled: busy,
-                onClick: (event) => {
-                  // Blur explicitly: a focused button keeps whatever ring the
-                  // environment draws, and the user reads it as a stuck border.
-                  event.currentTarget.blur()
-                  setSeg(key)
-                },
+                onClick: () => setSeg(key),
               },
               label,
             ),
@@ -5936,6 +5970,7 @@ window.__ModuleLoader__.load({
         activationWarningOf,
         mergeActivationWarning,
         dismissActivationWarning,
+        segmentTabStyle,
       },
       apply(ctx) {
         ctx.slots.inject('settings.section', () =>
