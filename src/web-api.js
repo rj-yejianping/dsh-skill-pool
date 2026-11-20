@@ -19,19 +19,34 @@
 
 import {
   applySettingsPatch,
+  cleanDescription,
+  clearMcpToolConfig,
+  DESCRIPTION_LIMIT,
+  DISCLOSURE_MODES,
   excludeSourceSkill,
+  MCP_TOOL_KEY_LIMIT,
   newId,
   normalizeItemName,
   normalizePath,
   removeItem,
   removeSource,
+  setMcpConfig,
+  setMcpToolConfig,
   StateReadError,
   upsertGroup,
   upsertItem,
   upsertSource,
 } from './store.js'
 import { buildInventory } from './inventory.js'
-import { effectiveEnabled, effectiveScope, groupKeyOfSource, groupOfMember, resolvePool } from './rules.js'
+import {
+  effectiveEnabled,
+  effectiveScope,
+  groupKeyOfSource,
+  groupOfMember,
+  isAmbiguousMcpToolName,
+  mcpServerOf,
+  resolvePool,
+} from './rules.js'
 import { DEFAULT_PROBE_INTERVAL_MS, DEFAULT_PROBE_TIMEOUT_MS, mountServer } from './mount.js'
 import {
   buildMcpConfig,
@@ -59,6 +74,9 @@ const GIT_TOKEN_PREFIX = 'RESOURCE_POOL_GIT_'
 /** Body cap for panel writes. */
 // 64MB archive cap in base64 plus JSON overhead; see library.MAX_ARCHIVE_BYTES.
 const MAX_BODY_BYTES = 96 * 1024 * 1024
+
+/** Maximum characters of one tool description copied into a panel summary. */
+const SUMMARY_LIMIT = 200
 
 /** JSON response helper. */
 function json(value, status = 200) {
@@ -102,22 +120,61 @@ async function readBody(request) {
 }
 
 /**
+ * Condense one registered tool description into a panel summary.
+ * @param {unknown} description - registered tool description.
+ * @returns {string} single-line summary of at most {@link SUMMARY_LIMIT} characters.
+ */
+function summaryOf(description) {
+  if (typeof description !== 'string') return ''
+  return description.replace(/\s+/g, ' ').trim().slice(0, SUMMARY_LIMIT)
+}
+
+/**
+ * Project one stored per-tool configuration, copying its string lists.
+ * @param {unknown} raw - stored tool config.
+ * @returns {{enabled: boolean, modes: string[], workspaces: string[]}} browser-safe config.
+ */
+function publicToolConfig(raw) {
+  const source = isObject(raw) ? raw : {}
+  return {
+    enabled: source.enabled !== false,
+    modes: Array.isArray(source.modes) ? [...source.modes] : [],
+    workspaces: Array.isArray(source.workspaces) ? [...source.workspaces] : [],
+  }
+}
+
+/**
+ * Project one member's per-tool configuration map (deep copy).
+ * @param {unknown} raw - stored `tools` map.
+ * @returns {Record<string, {enabled: boolean, modes: string[], workspaces: string[]}>} browser-safe map.
+ */
+function publicMcpTools(raw) {
+  const source = isObject(raw) ? raw : {}
+  const out = {}
+  for (const [name, config] of Object.entries(source)) out[name] = publicToolConfig(config)
+  return out
+}
+
+/**
  * Project one MCP member onto the fields the Settings page may see.
  *
  * `definition` carries URLs, commands, headers and environment variables —
  * including `Authorization` tokens — and never belongs in a browser response.
- * An explicit allow-list (activation scope only) also keeps any future
- * connection field from leaking by accident.
+ * An explicit allow-list (display configuration, activation scope and per-tool
+ * switches) also keeps any future connection field from leaking by accident.
  *
  * @param {unknown} member - stored MCP member.
  * @returns {object} browser-safe member.
  */
-function publicMcpMember(member) {
+export function publicMcpMember(member) {
   const source = isObject(member) ? member : {}
   const out = {
     enabled: source.enabled !== false,
     modes: Array.isArray(source.modes) ? [...source.modes] : [],
     workspaces: Array.isArray(source.workspaces) ? [...source.workspaces] : [],
+    description: typeof source.description === 'string' ? source.description : '',
+    disclosure: DISCLOSURE_MODES.includes(source.disclosure) ? source.disclosure : 'full',
+    tools: publicMcpTools(source.tools),
   }
   if (typeof source.installedAt === 'string' && source.installedAt.length > 0) out.installedAt = source.installedAt
   return out
@@ -819,6 +876,174 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     }
   }
 
+  /** Read the global tool schemas, or `null` when the service is unavailable. */
+  const toolSchemas = () => {
+    const tools = ctx.get('tools')
+    if (tools === undefined || tools === null || typeof tools.schemas !== 'function') return null
+    try {
+      const schemas = tools.schemas()
+      return Array.isArray(schemas) ? schemas : null
+    } catch {
+      return null
+    }
+  }
+
+  /** Report one unknown MCP member as a 404 instead of silently saving nothing. */
+  const unknownServer = (server) =>
+    Object.assign(new Error(`服务 ${server} 不存在`), { code: 'resource-pool/unknown-server', status: 404 })
+
+  /**
+   * Translate a route-thrown error into the panel's failure response: the
+   * explicit code/status win, everything else is an unclassified save failure.
+   */
+  const saveFailure = (error, fallbackCode = 'resource-pool/save-failed') => {
+    const code = typeof error?.code === 'string' ? error.code : fallbackCode
+    const status = error?.status === 404 ? 404 : error?.status === 400 ? 400 : 500
+    return failure(code, error instanceof Error ? error.message : String(error), status)
+  }
+
+  /**
+   * POST /dsh-skill-pool/mcp/config — save the panel description and/or the
+   * disclosure mode of one member.
+   *
+   * Only those two fields are touched: the connection definition, the member
+   * scope and `installedAt` survive the serialized read-modify-write. Invalid
+   * input is rejected here rather than sanitized, because the store's lenient
+   * normalizer would otherwise drop a bad value and silently keep the old one.
+   */
+  const mcpConfigRoute = async (request) => {
+    const body = await readBody(request)
+    const server = textOf(body.server)
+    if (server.length === 0) return failure('resource-pool/bad-server', '缺少 server')
+    const patch = {}
+    if (body.description !== undefined) {
+      if (typeof body.description !== 'string') {
+        return failure('resource-pool/bad-description', 'description 必须是字符串')
+      }
+      if (body.description.length > DESCRIPTION_LIMIT || /[\u0000-\u001f\u007f]/.test(body.description)) {
+        return failure(
+          'resource-pool/bad-description',
+          `description 必须是 ${DESCRIPTION_LIMIT} 字符以内的纯文本`,
+        )
+      }
+      patch.description = cleanDescription(body.description)
+    }
+    if (body.disclosure !== undefined) {
+      if (!DISCLOSURE_MODES.includes(body.disclosure)) {
+        return failure('resource-pool/bad-disclosure', "disclosure 必须是 'full' 或 'progressive'")
+      }
+      patch.disclosure = body.disclosure
+    }
+    try {
+      const state = await store.update((current) => {
+        if (!isObject(current.mcp?.[server])) throw unknownServer(server)
+        return setMcpConfig(current, server, patch)
+      })
+      return committed(state)
+    } catch (error) {
+      return saveFailure(error)
+    }
+  }
+
+  /**
+   * POST /dsh-skill-pool/mcp/tool — save or clear one tool's configuration.
+   *
+   * A new key must be a public name that can be attributed to exactly one
+   * service (`mcp__<server>__*`, unambiguous). A key that is already stored is
+   * accepted even while its tool is unregistered: a temporarily missing tool
+   * must keep its settings so they apply again when it comes back.
+   */
+  const mcpToolRoute = async (request) => {
+    const body = await readBody(request)
+    const server = textOf(body.server)
+    if (server.length === 0) return failure('resource-pool/bad-server', '缺少 server')
+    const tool = textOf(body.tool)
+    if (tool.length === 0) return failure('resource-pool/bad-tool', '缺少 tool')
+    if (tool.length > MCP_TOOL_KEY_LIMIT) {
+      return failure('resource-pool/bad-tool', `tool 长度不能超过 ${MCP_TOOL_KEY_LIMIT}`)
+    }
+    const clear = body.clear === true
+    const patch = {}
+    if (!clear) {
+      if (body.enabled !== undefined) {
+        if (typeof body.enabled !== 'boolean') return failure('resource-pool/bad-scope', 'enabled 必须是布尔值')
+        patch.enabled = body.enabled
+      }
+      try {
+        if (body.modes !== undefined) patch.modes = strictModes(body.modes, 'modes')
+        if (body.workspaces !== undefined) patch.workspaces = strictWorkspaces(body.workspaces, 'workspaces')
+      } catch (error) {
+        return failure('resource-pool/bad-scope', error instanceof Error ? error.message : String(error))
+      }
+    }
+    try {
+      const state = await store.update((current) => {
+        const member = isObject(current.mcp?.[server]) ? current.mcp[server] : undefined
+        if (member === undefined) throw unknownServer(server)
+        if (clear) return clearMcpToolConfig(current, server, tool)
+        const tools = isObject(member.tools) ? member.tools : {}
+        const known = Object.hasOwn(tools, tool)
+        if (!known && !(mcpServerOf(tool) === server && !isAmbiguousMcpToolName(tool))) {
+          throw Object.assign(new Error(`工具 ${tool} 无法唯一归属到服务 ${server}`), {
+            code: 'resource-pool/bad-tool',
+            status: 400,
+          })
+        }
+        return setMcpToolConfig(current, server, tool, patch)
+      })
+      return committed(state)
+    } catch (error) {
+      return saveFailure(error)
+    }
+  }
+
+  /**
+   * GET /dsh-skill-pool/mcp/tools?server= — the registered tools of one service
+   * plus the configuration preserved for tools that are currently absent.
+   *
+   * Only public names and description summaries are returned; the connection
+   * definition never appears here.
+   */
+  const mcpToolsRoute = async (request) => {
+    const server = textOf(new URL(request.url).searchParams.get('server'))
+    if (server.length === 0) return failure('resource-pool/bad-server', '缺少 server')
+    const state = await readState()
+    const member = isObject(state.mcp?.[server]) ? state.mcp[server] : undefined
+    if (member === undefined) return failure('resource-pool/unknown-server', `服务 ${server} 不存在`, 404)
+    const schemas = toolSchemas()
+    if (schemas === null) return failure('resource-pool/tools-unavailable', '无法读取 MCP 工具列表', 500)
+
+    // Register order wins: the first schema seen for a name is the one shown.
+    const registered = new Map()
+    for (const schema of schemas) {
+      if (!isObject(schema) || typeof schema.name !== 'string') continue
+      if (mcpServerOf(schema.name) !== server) continue
+      if (!registered.has(schema.name)) registered.set(schema.name, schema.description)
+    }
+    const configs = publicMcpTools(member.tools)
+    const names = new Set(registered.keys())
+    for (const name of Object.keys(configs)) {
+      // History is only listed for tools that belong (or belonged) to this
+      // service; a foreign key is never shown as this service's tool.
+      if (mcpServerOf(name) === server) names.add(name)
+    }
+
+    const tools = [...names].sort().map((name) => ({
+      name,
+      summary: registered.has(name) ? summaryOf(registered.get(name)) : '',
+      registered: registered.has(name),
+      config: Object.hasOwn(configs, name) ? configs[name] : null,
+      ambiguous: isAmbiguousMcpToolName(name),
+    }))
+    return json({
+      ok: true,
+      server,
+      description: typeof member.description === 'string' ? member.description : '',
+      disclosure: DISCLOSURE_MODES.includes(member.disclosure) ? member.disclosure : 'full',
+      tools,
+    })
+  }
+
   /** POST /dsh-skill-pool/skill/upload — install skill bundles from plain files. */
   const skillUploadRoute = async (request) => {
     const body = await readBody(request)
@@ -1237,6 +1462,9 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     ['/source/delete', ['POST'], guarded(sourceDeleteRoute)],
     ['/mcp/import', ['POST'], guarded(mcpImportRoute)],
     ['/mcp/remove', ['POST'], guarded(mcpRemoveRoute)],
+    ['/mcp/config', ['POST'], guarded(mcpConfigRoute)],
+    ['/mcp/tool', ['POST'], guarded(mcpToolRoute)],
+    ['/mcp/tools', ['GET'], guarded(mcpToolsRoute)],
     ['/mounts', ['GET'], guarded(mountsRoute)],
   ]
 
@@ -1376,6 +1604,10 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
     debug(`registered ${routes.length} resource pool routes under ${ROUTE_PREFIX} (exact fetch)`)
   }
 
-  // Host-independent seam for scope-preservation tests; production ignores it.
-  return { testHooks: { captureEffectiveScopes, installItems } }
+  // Host-independent seams for tests; production ignores them.
+  //
+  // `routes` is the same array the transport registers, so a Node test can call
+  // one handler directly without a web server. `testHooks` keeps the previous
+  // scope-preservation seam working; existing callers ignore the whole object.
+  return { routes, testHooks: { captureEffectiveScopes, installItems } }
 }
