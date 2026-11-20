@@ -100,8 +100,12 @@ $DSH_HOME/resource-pool/library/skills/<name>/SKILL.md
   - 可选**分支**、**子目录**、**访问令牌**（私有仓库，GitLab 用 `PRIVATE-TOKEN`、GitHub 用 `Bearer`）。
   - 仓库类型默认**自动识别**（含 `/-/tree/` 判定为 GitLab，未知域名默认按 GitLab 处理）；
     GitHub Enterprise 可在导入对话框里显式选 `GitHub / GHE`（走 `/api/v3`）。
-  - 走 tarball 下载 + `tar` 解包，**不依赖 `git` 二进制**。
-  - 若实例**禁用了归档接口**（对 `/repository/archive.*` 返回 406，常见于加固过的内网 GitLab），
+  - GitHub 来源优先走**稀疏检出**：`git clone --depth 1 --filter=blob:none --sparse` 后只检出该来源的
+    **子目录**，只拉这个目录的 blob（一个技能通常几十 KB），不再为每个来源下载整包 tarball。
+    提交号取自克隆本身，省掉一次 commits API 调用（也避开它的频率限制）。
+  - 没有 `git`（或 `DSH_SKILL_POOL_GIT` 指向的路径不可用）、Git 端点被代理拦截、或实例拒绝部分克隆时，
+    自动回退到 **tarball 下载 + `tar` 解包**；因此**不强制依赖 `git` 二进制**。
+  - GitLab（含内网实例）走 tarball；若实例**禁用了归档接口**（对 `/repository/archive.*` 返回 406，常见于加固过的内网 GitLab），
     自动改走 `tree` + 逐文件 `raw` 接口重建同一份目录树，导入结果一致（代价是请求数变多）。
 - **重新导入/更新已有技能**：若成员原先继承仓库组条件，导入会先把当前**生效的**
   `enabled`/`modes`/`workspaces` 保留下来；新来源没有可解析组时落成 `self`，不会把空列表

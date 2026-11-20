@@ -5,10 +5,16 @@
  * - No external binaries for ZIP: the parser below reads the End Of Central
  *   Directory, walks the central directory, and inflates method-8 entries with
  *   `zlib.inflateRawSync`. Method-0 (stored) entries are copied verbatim.
- * - No `git` binary: GitHub/GitLab tarball endpoints are fetched with `fetch`,
- *   then unpacked with the system `tar` (present on this platform). Self-hosted
- *   GitLab and GitHub Enterprise installs are supported through the same paths,
- *   derived from the pasted URL instead of a hard-coded host.
+ * - GitHub sources use a sparse checkout: `git clone --depth 1
+ *   --filter=blob:none --sparse` plus `sparse-checkout set <subdir>` pulls only
+ *   the blobs the source installs, instead of the whole tarball every source of
+ *   the same repository would otherwise re-download. The commit id comes from
+ *   the clone, so the commits API stays out of the update path.
+ * - No mandatory `git` binary: when git is absent, refuses a partial clone, or
+ *   the endpoint is blocked, GitHub/GitLab tarball endpoints are fetched with
+ *   `fetch` and unpacked with the system `tar` (present on this platform).
+ *   Self-hosted GitLab and GitHub Enterprise installs are supported through the
+ *   same paths, derived from the pasted URL instead of a hard-coded host.
  * - Everything lands in `$DSH_HOME/resource-pool/library/skills/<name>/`, which
  *   is deliberately NOT `$DSH_HOME/skills`: the resource pool owns its own store
  *   and serves it through its own skill provider (`./provider.js`), so imported
@@ -38,6 +44,10 @@ const MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 const MAX_ENTRIES = 20_000
 /** Timeout for one Git fetch. */
 const GIT_TIMEOUT_MS = 45_000
+/** Timeout for one sparse-clone process (clone plus lazy blob fetch). */
+const GIT_CLONE_TIMEOUT_MS = 180_000
+/** `git` binary; overridable for hosts that keep it off PATH. */
+const GIT_BINARY = process.env.DSH_SKILL_POOL_GIT || 'git'
 
 /**
  * Directory holding every skill the resource pool owns.
@@ -787,16 +797,175 @@ async function resolveRemoteSha({ repo, branch, token }) {
   throw new Error(`查询提交失败：响应缺少 ${repo.provider === 'github' ? 'sha' : 'id'}`)
 }
 
+/** Cached answer of {@link gitAvailable}; `undefined` until the first probe. */
+let gitAvailableCache
+
+/**
+ * Whether a usable `git` binary is on PATH. Probed once per process: a missing
+ * binary must cost one failed `spawn`, not one per source.
+ *
+ * @returns {Promise<boolean>} true when `git --version` succeeds.
+ */
+async function gitAvailable() {
+  if (gitAvailableCache === undefined) {
+    try {
+      await execFileAsync(GIT_BINARY, ['--version'], { timeout: 10_000 })
+      gitAvailableCache = true
+    } catch {
+      gitAvailableCache = false
+    }
+  }
+  return gitAvailableCache
+}
+
+/**
+ * Human-readable name of the git subcommand an argument list runs. Skips the
+ * global options (`-c key=value`, `-C dir`) that precede it.
+ * @param {string[]} args - git arguments.
+ * @returns {string} subcommand name.
+ */
+function gitCommandLabel(args) {
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index]
+    if (arg === '-c' || arg === '-C') {
+      index += 1
+      continue
+    }
+    if (!arg.startsWith('-')) return arg
+  }
+  return args[0] ?? 'git'
+}
+
+/**
+ * Run one git command.
+ * @param {string[]} args - git arguments.
+ * @param {{cwd?: string, env?: Record<string, string>}} [options] - process options.
+ * @returns {Promise<string>} standard output.
+ */
+async function runGit(args, { cwd, env } = {}) {
+  try {
+    const { stdout } = await execFileAsync(GIT_BINARY, args, {
+      cwd,
+      env,
+      timeout: GIT_CLONE_TIMEOUT_MS,
+      maxBuffer: 16 * 1024 * 1024,
+    })
+    return stdout
+  } catch (error) {
+    const stderr = typeof error?.stderr === 'string' ? error.stderr.trim() : ''
+    const detail = stderr.length > 0 ? stderr : error instanceof Error ? error.message : String(error)
+    throw new Error(`git ${gitCommandLabel(args)} 失败：${detail.split('\n').slice(-3).join(' ')}`)
+  }
+}
+
+/**
+ * Clone URL for one repository. The token never travels in the URL, so it
+ * cannot leak through `ps` or an error message.
+ * @param {object} repo - `parseRepoUrl` result.
+ * @returns {string} https clone URL.
+ */
+function cloneUrlOf(repo) {
+  return `${repo.origin}/${repo.project}.git`
+}
+
+/**
+ * Environment for one git command: no interactive credential prompt, and the
+ * token handed over through `GIT_CONFIG_*` instead of argv.
+ * @param {string} token - access token.
+ * @returns {NodeJS.ProcessEnv} child environment.
+ */
+function gitEnv(token) {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' }
+  if (typeof token === 'string' && token.length > 0) {
+    env.GIT_CONFIG_COUNT = '1'
+    env.GIT_CONFIG_KEY_0 = 'http.extraHeader'
+    env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${Buffer.from(`x-access-token:${token}`).toString('base64')}`
+  }
+  return env
+}
+
+/**
+ * Fetch one repository through a shallow, blob-less, sparse checkout.
+ *
+ * A source installs exactly one directory, so only that directory's blobs are
+ * downloaded: kilobytes instead of the multi-megabyte archive codeload serves
+ * for every source of the same repo. The commit id comes from the clone itself,
+ * which also keeps the commits API (and its rate limit) out of the update path.
+ *
+ * @param {object} options - clone options.
+ * @param {object} options.repo - `parseRepoUrl` result.
+ * @param {string} options.branch - branch or tag name.
+ * @param {string} [options.subdir] - directory the source installs from.
+ * @param {string} [options.token] - access token.
+ * @param {string} options.workDir - temporary directory owned by the caller.
+ * @returns {Promise<{extractDir: string, sha: string, digest: string, files: number}>} tree location and identity.
+ */
+export async function sparseCloneRepo({ repo, branch, subdir = '', token = '', workDir } = {}) {
+  if (typeof repo !== 'object' || repo === null) throw new Error('缺少仓库信息')
+  if (typeof workDir !== 'string' || workDir.length === 0) throw new Error('缺少临时目录')
+  if (typeof branch !== 'string' || branch.length === 0) throw new Error('缺少分支名')
+  const wanted = typeof subdir === 'string' ? subdir.trim() : ''
+  const sparse = wanted.length > 0 && wanted !== '.'
+  const cloneDir = join(workDir, 'clone')
+  const extractDir = join(workDir, 'tree')
+  const env = gitEnv(token)
+  // A stalled transfer must fail fast instead of burning the wall-clock timeout:
+  // git aborts once throughput stays under 1 KB/s for 20 s.
+  const args = [
+    '-c', 'http.lowSpeedLimit=1000',
+    '-c', 'http.lowSpeedTime=20',
+    'clone', '--depth', '1', '--filter=blob:none', '--branch', branch, '--quiet',
+  ]
+  if (sparse) args.push('--sparse')
+  args.push(cloneUrlOf(repo), cloneDir)
+  await runGit(args, { cwd: workDir, env })
+  if (sparse) {
+    const checkout = ['-C', cloneDir, 'sparse-checkout', 'set']
+    // Cone mode rejects `*?[]\` in a directory name unless the check is skipped,
+    // and a repository may legitimately hold such a name.
+    if (/[*?[\]\\]/.test(wanted)) checkout.push('--skip-checks')
+    checkout.push('--', wanted)
+    await runGit(checkout, { env })
+  }
+  const sha = (await runGit(['-C', cloneDir, 'rev-parse', 'HEAD'], { env })).trim()
+  const target = join(extractDir, repo.project.split('/').pop())
+  await mkdir(extractDir, { recursive: true })
+  await rename(cloneDir, target)
+  await rm(join(target, '.git'), { recursive: true, force: true })
+  const files = await readTree(target)
+  return { extractDir, sha, digest: bundleDigest(files), files: files.length }
+}
+
 /**
  * Download and unpack one repository into a temporary directory.
  *
- * The archive endpoint is the fast path. When the instance refuses archives
- * (406 on hardened self-hosted GitLab), the same tree is reconstructed through
- * the API and materialised on disk, so the install path downstream does not
- * care which route produced it.
+ * GitHub sources take the sparse checkout first: the pool installs one folder,
+ * so pulling the whole archive is both slow and, on a throttled link, a
+ * guaranteed timeout. The archive endpoint stays as the fallback (no git
+ * binary, older git, a host that refuses partial clones), and when a GitLab
+ * instance refuses archives (406) the tree is rebuilt through its API, so the
+ * install path downstream does not care which route produced it.
+ *
+ * @param {object} options - download options.
+ * @param {object} options.repo - `parseRepoUrl` result.
+ * @param {string} options.branch - branch name.
+ * @param {string} [options.subdir] - directory the source installs from.
+ * @param {string} [options.token] - access token.
+ * @returns {Promise<{workDir: string, extractDir: string, sha: string, digest: string, files: number, sparse: boolean}>} unpacked tree.
  */
-async function downloadRepo({ repo, branch, token }) {
+export async function downloadRepo({ repo, branch, subdir = '', token = '' } = {}) {
   const workDir = await mkdtemp(join(tmpdir(), 'rp-git-'))
+  if (repo.provider === 'github' && await gitAvailable()) {
+    try {
+      const cloned = await sparseCloneRepo({ repo, branch, subdir, token, workDir })
+      return { workDir, ...cloned, sparse: true }
+    } catch {
+      // Fall back to the archive path: no git, a partial-clone refusal, or a
+      // proxy that blocks the git endpoint all land here.
+      await rm(join(workDir, 'clone'), { recursive: true, force: true })
+      await rm(join(workDir, 'tree'), { recursive: true, force: true })
+    }
+  }
   const extractDir = join(workDir, 'tree')
   await mkdir(extractDir, { recursive: true })
   let files = []
@@ -833,7 +1002,7 @@ async function downloadRepo({ repo, branch, token }) {
     // A missing commit API must not block an install; fall back to a content hash.
     sha = `archive:${createHash('sha256').update(archiveDigest).digest('hex').slice(0, 16)}`
   }
-  return { workDir, extractDir, sha, digest: archiveDigest, files: files.length }
+  return { workDir, extractDir, sha, digest: archiveDigest, files: files.length, sparse: false }
 }
 
 /** Read every file under one directory into a flat list. */
@@ -954,7 +1123,7 @@ export async function installFromGit({ url, branch, subdir, token = '', label, p
   // caller left the fields alone.
   const wantedBranch = typeof branch === 'string' && branch.trim().length > 0 ? branch.trim() : repo.branchHint || 'main'
   const wantedSubdir = typeof subdir === 'string' && subdir.length > 0 ? subdir : repo.subdirHint
-  const { workDir, extractDir, sha, digest } = await downloadRepo({ repo, branch: wantedBranch, token })
+  const { workDir, extractDir, sha, digest } = await downloadRepo({ repo, branch: wantedBranch, subdir: wantedSubdir, token })
   try {
     const { installed, failures, digests } = await installFromTree({ extractDir, subdir: wantedSubdir, overwrite, root })
     const now = new Date().toISOString()
@@ -997,7 +1166,7 @@ export async function updateGitSource({ source, token = '', root, exclude, force
   const repo = parseRepoUrl(source.url)
   const branch = source.branch ?? 'main'
   const blocked = Array.isArray(exclude) ? exclude : Array.isArray(source.excluded) ? source.excluded : []
-  const { workDir, extractDir, sha, digest } = await downloadRepo({ repo, branch, token })
+  const { workDir, extractDir, sha, digest } = await downloadRepo({ repo, branch, subdir: source.subdir ?? '', token })
   try {
     // `force` reinstalls even when the commit is unchanged: that is what
     // "恢复已排除" needs, since nothing upstream moved.
