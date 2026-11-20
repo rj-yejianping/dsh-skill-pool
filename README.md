@@ -316,6 +316,10 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
   关闭设置页时会把还在去抖窗口里的描述、注入模式、逐接口改动先发出去，
   不会因为赶在 320ms 内关页面而丢字。
 
+| 工具列表默认折叠 | 点开后逐行继承服务作用范围 |
+|---|---|
+| ![工具列表默认折叠](docs/screenshots/v0.5.1-mcp-tools-folded.png) | ![逐行继承](docs/screenshots/v0.5.1-mcp-tool-inherit.png) |
+
 ### 已知边界
 
 1. 渐进只覆盖**工具 Schema 与调用**；MCP resources、server instructions 与服务端自身的其他访问路径
