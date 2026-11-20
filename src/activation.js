@@ -14,6 +14,14 @@
  *    names of servers the pool did not activate. There is no layered equivalent
  *    for tools, so this remains a restriction.
  *
+ * That MCP restriction carries a reason per tool: out-of-pool (`'pool'`), a
+ * per-tool switch or scope (`'tool'`), and "progressive service not expanded
+ * yet" (`'progressive'`). Each deny layer also names its service, so expansion
+ * can lift exactly the progressive layers of one server while the `'pool'` and
+ * `'tool'` layers stay in force. A plugin-wide `tools.guard` reads the per-Agent
+ * record as a dispatch-time backstop for the windows a deny snapshot cannot
+ * cover (a tool registered between generations, a plugin reload).
+ *
  * A system-prompt section then states the mode, workspace and what is active, so
  * the model neither guesses nor tries to recall a resource it cannot reach.
  *
@@ -26,8 +34,9 @@
  */
 
 import { librarySkillsRoot } from './library.js'
+import { mcpGuardReason } from './mcp-guard.js'
 import { createLibraryProvider } from './provider.js'
-import { isAmbiguousMcpToolName, mcpServerOf, MCP_TOOL_PREFIX, resolvePool } from './rules.js'
+import { isAmbiguousMcpToolName, mcpServerOf, MCP_TOOL_PREFIX, resolvePool, toolActive } from './rules.js'
 
 /** Labels of effects that restrict the MCP tool surface (normal or fallback). */
 const RESTRICT_LABELS = new Set(['mcp-restrict', 'mcp-restrict-fallback'])
@@ -102,11 +111,50 @@ export function workspaceOf(agent) {
  * @param {(fresh?: boolean) => Promise<object>} options.getState - read the current document.
  * @param {{ debug?: Function, warn?: Function }} [options.logger] - logger.
  * @param {() => string} [options.libraryRoot] - library skills root override.
- * @returns {object} manager with applyToAgent/reapplyAll/disposeAgent/disposeAll.
+ * @returns {{applyToAgent: Function, reapplyAll: Function, disposeAgent: Function,
+ *   disposeAll: Function, recordOf: (agent: any) => object|undefined,
+ *   expandService: (agent: any, server: string) => {ok: true}|{ok: false, error: string},
+ *   progressiveAvailable: boolean}} manager.
  */
 export function createActivation({ ctx, getState, logger, libraryRoot = () => librarySkillsRoot() }) {
-  /** @type {WeakMap<object, {disposers: {dispose: Function, label: string}[], signature: string, activated: boolean, chain: Promise<void>}>} */
+  /** @type {WeakMap<object, {disposers: {dispose: Function, label: string, reason?: string, service?: string}[], signature: string, activated: boolean, chain: Promise<void>}>} */
   const agents = new WeakMap()
+
+  /**
+   * Whether progressive disclosure may be offered at all.
+   *
+   * It depends on the global guard: hiding a schema while being unable to refuse
+   * its call would be a fail-open. A missing guard therefore degrades this
+   * plugin load to full injection (the documented fallback), never to hidden
+   * schemas without a backstop.
+   */
+  let progressiveAvailable = false
+  try {
+    const guardTools = ctx.get('tools')
+    if (guardTools === undefined || typeof guardTools.guard !== 'function') {
+      throw new Error('the global tools service does not expose guard()')
+    }
+    // One plugin-wide guard: it reads the live per-Agent record on every
+    // dispatch, which also covers the reload window where old deny layers are
+    // released and `reapplyAll()` has not finished yet.
+    ctx.effect(
+      () =>
+        guardTools.guard((exec) =>
+          mcpGuardReason({
+            name: exec?.name,
+            hasAgent: exec?.agent !== undefined && exec?.agent !== null,
+            record: agents.get(exec?.agent),
+          }),
+        ),
+      'resource-pool.mcp-guard',
+    )
+    progressiveAvailable = true
+  } catch (error) {
+    progressiveAvailable = false
+    logger?.warn?.(
+      `[resource-pool] global MCP guard unavailable; progressive disclosure disabled: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
 
   /** Dispose one recorded registration, tolerating an already-disposed effect. */
   const disposeEntry = (entry) => {
@@ -132,7 +180,7 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
   }
 
   /** Signature of a decision, used to skip no-op re-applications. */
-  const signatureOf = (pool, allowed, libraryNames) =>
+  const signatureOf = (pool, allowed, libraryNames, state, expanded) =>
     JSON.stringify({
       gated: pool.gated,
       skills: allowed,
@@ -140,6 +188,16 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
       gs: pool.gateSkills,
       gm: pool.gateMcp,
       lib: libraryNames,
+      // Disclosure mode and per-tool switches change what is hidden without
+      // changing the member list, so they invalidate the signature too.
+      disc: pool.mcpServers.map((name) => [
+        name,
+        state?.mcp?.[name]?.disclosure ?? 'full',
+        state?.mcp?.[name]?.tools ?? {},
+      ]),
+      // Expansion removes progressive layers for one service: a re-apply must
+      // reproduce the expanded surface rather than hide that service again.
+      expanded: [...expanded].sort(),
     })
 
   /**
@@ -163,6 +221,15 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
         degraded: false,
         underRestricted: false,
         mcpGateActive: false,
+        // The guard reads this snapshot for every dispatch. Until the first
+        // successful apply overwrites it, fail closed: an Agent whose only
+        // activation was the conservative deny must not have its MCP calls
+        // allowed by the guard.
+        gateMcp: true,
+        allowedServers: new Set(),
+        progressiveServers: new Set(),
+        expandedServers: new Set(),
+        toolDenied: new Set(),
         chain: Promise.resolve(),
       }
       agents.set(agent, record)
@@ -479,7 +546,25 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
     // which for a per-Agent provider means "admit the whole library".
     const libraryNames = Object.keys(state.skills ?? {}).sort()
     const allowed = settings.enabled === false ? libraryNames : pool.skills
-    const signature = `${signatureOf(pool, allowed, libraryNames)}|${mode}|${cwd}`
+
+    // ---- MCP gate facts snapshotted into the record for the global guard.
+    // The record, not the live document, decides every dispatch: it must stay
+    // readable while the state file is unreadable or a tools/change is in flight.
+    const allowedServers = new Set(pool.mcpServers)
+    // Progressive is an addition on top of the gate: without a global guard it
+    // cannot be offered (fail closed to full injection, never to a bare hide).
+    const progressiveServers = progressiveAvailable
+      ? new Set(pool.mcpServers.filter((name) => state.mcp?.[name]?.disclosure === 'progressive'))
+      : new Set()
+    // Expansion is a per-Agent, in-memory fact. Keep it only for services that
+    // are still progressive in this Agent's pool.
+    const expandedServers = new Set(
+      [...(record.expandedServers instanceof Set ? record.expandedServers : [])].filter((name) =>
+        progressiveServers.has(name),
+      ),
+    )
+
+    const signature = `${signatureOf(pool, allowed, libraryNames, state, expandedServers)}|${mode}|${cwd}`
     if (!force && record.signature === signature) return
 
     const tools = ctx.get('tools')
@@ -487,7 +572,10 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
 
     // ---- Compute the whole next activation before touching the live one.
     const allowedSkills = new Set(allowed)
+    /** @type {{name: string, reason: 'pool'|'progressive'|'tool', service: string}[]} */
+    const denyPlan = []
     let denyMcp = []
+    let toolDenied = new Set()
     let observedMcp = 0
     const visibleMcpNames = []
     if (pool.gateMcp) {
@@ -504,7 +592,6 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
         throw new Error('MCP gate is required but the global tool list could not be read', { cause: error })
       }
       if (!Array.isArray(schemas)) throw new Error('MCP gate is required but the global tool list is not an array')
-      const allowedServers = new Set(pool.mcpServers)
       let ambiguous = 0
       for (const schema of schemas) {
         const name = schema?.name
@@ -515,11 +602,30 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
           // The public name cannot be attributed to one server; deny rather than
           // allow by a prefix that an external server could share.
           ambiguous += 1
-          denyMcp.push(name)
+          denyPlan.push({ name, reason: 'pool', service: mcpServerOf(name) })
           continue
         }
-        if (!allowedServers.has(mcpServerOf(name))) denyMcp.push(name)
+        const server = mcpServerOf(name)
+        if (!allowedServers.has(server)) {
+          denyPlan.push({ name, reason: 'pool', service: server })
+          continue
+        }
+        // A per-tool switch or scope is a user decision and applies in both
+        // disclosure modes, so it is evaluated before the progressive layer.
+        // A configured tool that is both switched off and unexpanded keeps the
+        // `'tool'` reason: expansion must never lift a user's explicit refusal.
+        const toolConfig = state.mcp?.[server]?.tools?.[name]
+        if (toolConfig !== undefined && toolActive(toolConfig, { mode, cwd }) === false) {
+          denyPlan.push({ name, reason: 'tool', service: server })
+          continue
+        }
+        // A progressive service stays hidden until this Agent expands it.
+        if (progressiveServers.has(server) && !expandedServers.has(server)) {
+          denyPlan.push({ name, reason: 'progressive', service: server })
+        }
       }
+      denyMcp = denyPlan.map((entry) => entry.name)
+      toolDenied = new Set(denyPlan.filter((entry) => entry.reason === 'tool').map((entry) => entry.name))
       if (ambiguous > 0) {
         logger?.warn?.(`[resource-pool] denied ${ambiguous} ambiguous MCP tool name${ambiguous === 1 ? '' : 's'} to avoid cross-server prefix allow`)
       }
@@ -576,23 +682,25 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
       const newEntries = []
       let restrictFailures = 0
       if (pool.gateMcp && observedMcp > 0) {
-        for (const name of denyMcp) {
-          if (retainedCoverage.has(name)) continue
+        for (const plan of denyPlan) {
+          if (retainedCoverage.has(plan.name)) continue
           try {
             const dispose = agent.ctx.effect(
-              () => agent.ctx.tools.restrict({ deny: [name] }),
+              () => agent.ctx.tools.restrict({ deny: [plan.name] }),
               'resource-pool.mcp-restrict',
             )
             const entry = {
               dispose: typeof dispose === 'function' ? dispose : () => {},
               label: 'mcp-restrict',
-              deny: [name],
+              reason: plan.reason,
+              service: plan.service,
+              deny: [plan.name],
             }
             pending.push(entry)
             newEntries.push(entry)
           } catch (error) {
             restrictFailures += 1
-            failedNames.push(name)
+            failedNames.push(plan.name)
             incomplete = true
             logger?.warn?.(
               `[resource-pool] one MCP restrict layer could not be registered (retaining old layers): ${error instanceof Error ? error.message : String(error)}`,
@@ -681,6 +789,15 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
 
       record.activated = true
       record.mcpGateActive = pool.gateMcp
+      // Snapshot the gate facts the global guard answers from. They are Sets so
+      // a malformed record can never be mistaken for an empty (allowing) one.
+      record.gateMcp = pool.gateMcp
+      record.allowedServers = allowedServers
+      record.progressiveServers = progressiveServers
+      record.expandedServers = expandedServers
+      // Gate off installs no per-tool layers, so the guard must not remember an
+      // old per-tool refusal either: the whole MCP surface is ungated then.
+      record.toolDenied = pool.gateMcp ? toolDenied : new Set()
       // Any retained layer covering a currently invisible name means the last
       // safe activation could not be reconstructed exactly. Keep conservative
       // semantics so a later state failure refreshes coverage for new tools.
@@ -755,6 +872,43 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
     }
   }
 
+  /**
+   * Lift the progressive deny layers of one service for one Agent.
+   *
+   * Only `reason === 'progressive'` layers of that service are disposed; the
+   * `'pool'` and `'tool'` layers stay installed, so expansion grants no extra
+   * permission. Expansion is remembered per Agent (never persisted) and is
+   * re-evaluated by the next apply, which keeps it only while the service is
+   * still progressive in this Agent's pool.
+   *
+   * @param {any} agent - live Agent.
+   * @param {string} server - pool service name.
+   * @returns {{ok: true}|{ok: false, error: string}} outcome.
+   */
+  const expandService = (agent, server) => {
+    try {
+      const record = agents.get(agent)
+      if (record === undefined || record.activated !== true) return { ok: false, error: 'not-activated' }
+      if (!(record.progressiveServers instanceof Set) || !record.progressiveServers.has(server)) {
+        return { ok: false, error: 'not-in-pool' }
+      }
+      const keep = []
+      for (const entry of record.disposers) {
+        if (entry.label === 'mcp-restrict' && entry.reason === 'progressive' && entry.service === server) {
+          disposeEntry(entry)
+        } else {
+          keep.push(entry)
+        }
+      }
+      record.disposers = keep
+      if (!(record.expandedServers instanceof Set)) record.expandedServers = new Set()
+      record.expandedServers.add(server)
+      return { ok: true }
+    } catch {
+      return { ok: false, error: 'expand-failed' }
+    }
+  }
+
   /** Release one Agent's registrations. */
   const disposeAgent = (agent) => {
     release(agent)
@@ -768,5 +922,13 @@ export function createActivation({ ctx, getState, logger, libraryRoot = () => li
     for (const agent of live) disposeAgent(agent)
   }
 
-  return { applyToAgent, reapplyAll, disposeAgent, disposeAll }
+  return {
+    applyToAgent,
+    reapplyAll,
+    disposeAgent,
+    disposeAll,
+    recordOf: (agent) => agents.get(agent),
+    expandService,
+    progressiveAvailable,
+  }
 }
