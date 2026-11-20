@@ -68,9 +68,12 @@
 3. **渐进披露生效（`src/activation.js` / `src/disclosure.js`）**：
    - `disclosure:"progressive"` 且 `settings.mcpGate !== false`、成员在当前 Agent 池内时，该服务的
      `mcp__<server>__*` 业务工具在当前步被 progressive deny 层隐藏；每服务注册一个全局
-     `<server>_discover` 工具，`when({agent})` 只对**已激活且非保守**的 per-Agent 记录为真。
+     `<server>_discover` 工具，`when({agent})` 只对**已激活且非「状态不可读」回退**的 per-Agent
+     记录为真（`conservative` 是成功 apply 保留旧层时的刷新标记，不影响 discover 的可见性）。
    - discover 名字派生固定：服务名小写、`[^a-z0-9_]+` 折叠为 `_`、去首尾 `_`、追加 `_discover`；
      结果为空、以数字开头或超过 64 字符时不注册并记警告，**不静默改名**；与已有工具冲突时同样跳过。
+     失败原因是稳定机器码（`name-conflict` / `invalid-name` / `tools-unavailable` / `register-failed`），
+     经 `GET /mcp/tools` 的 `discover` 字段供面板显示，不含工具名或连接定义。
    - discover 调用成功返回
      `{ok:true, service, description, expanded:true, tools:[{name,summary}], hidden:{total,disabled,outOfScope,ambiguous}, nextStep}`；
      返回体只含公共名与摘要，**不含**工具定义、URL、命令、headers/env。失败码是闭集：
@@ -84,10 +87,12 @@
    原因闭集：`pool-not-activated`（无记录/未激活）、`tool-disabled`（逐接口关闭或作用域不匹配）、
    `server-not-in-pool`（池外服务或歧义公共名）、`server-not-expanded`（progressive 未展开）、
    `guard-error`（记录形状非法，fail-closed）。无 Agent 的调用不拦（没有记录可依）；`mcpGate:false`
-   只关池级与渐进层，逐接口拒绝仍然生效。guard 覆盖 `tools/change`/重连后新注册的公共名：在
-   deny 层按新工具清单重算之前，Schema 可能短时出现在下一步，但直接调用会被拒；下一次显式重放
-   （保存、preset 重放、插件重载）补齐 deny。它不覆盖 MCP resources、server instructions 或程序化
-   scoped 注册，不构成强安全边界。
+   只关池级与渐进层，逐接口拒绝仍然生效。逐接口拒绝以**配置事实**（而非当前可见工具）进入
+   guard 快照：工具暂未注册时同样生效。guard 覆盖 `tools/change`/重连后新注册的公共名：在
+   deny 层按新工具清单重算之前，Schema 可能短时出现在下一步，但直接调用会被拒；插件订阅
+   `tools/change`，对「观察到的 MCP 名字集发生变化」的存活 Agent 去抖重放（合并突发、防同步
+   重入、有轮次上限）补齐 deny，失败或超限时下一次显式重放（保存、preset 重放、插件重载）再对齐。
+   它不覆盖 MCP resources、server instructions 或程序化 scoped 注册，不构成强安全边界。
 
 5. **新增路由（4 条，前缀 `/dsh-skill-pool`）**。写路由与既有写路由一致：先原子落盘、再
    `reapplyAll()` 并同步 discover 注册，返回 200 + 公开 `state` + 可选脱敏 `warning`（已提交的写不回滚）；
@@ -97,7 +102,7 @@
    |---|---|---|---|
    | POST | `/mcp/config` | `{server, description?, disclosure?}` | `{ok,state,warning?}`；400 `resource-pool/bad-server` / `bad-description` / `bad-disclosure`；404 `resource-pool/unknown-server`。只改这两个字段，连接定义与 scope 保留。 |
    | POST | `/mcp/tool` | `{server, tool, enabled?, modes?, workspaces?, clear?}` | `{ok,state,warning?}`；400 `resource-pool/bad-server` / `bad-tool` / `bad-scope`；404 `unknown-server`。新键必须能由 `mcp__<server>__*` 唯一归属（歧义/跨服务拒绝）；已存键允许工具暂时不在线时继续修改；`clear:true` 删除该键并恢复默认（其余字段忽略）。 |
-   | GET | `/mcp/tools?server=` | — | `{ok, server, description, disclosure, tools:[{name,summary,registered,config,ambiguous}]}`；404 `unknown-server`；500 `resource-pool/tools-unavailable`。`config` 为 `null` 或 `{enabled,modes,workspaces}`；已保存但当前不在线的历史条目也会列出（`registered:false`），只列可归属该服务的名字。 |
+   | GET | `/mcp/tools?server=` | — | `{ok, server, description, disclosure, discover, tools:[{name,summary,registered,config,ambiguous}]}`；404 `unknown-server`；500 `resource-pool/tools-unavailable`。`config` 为 `null` 或 `{enabled,modes,workspaces}`；已保存但当前不在线的历史条目也会列出（`registered:false`），只列可归属该服务的名字。`discover` 对渐进成员为注册结果 `{ok:true}` 或 `{ok:false, reason}`（`name-conflict` / `invalid-name` / `tools-unavailable` / `register-failed` / `unavailable`）；对仍是完整注入的成员为只读预检结果（不注册、不缓存）；门控关闭、成员禁用或未提供状态通道时为 `null`。 |
    | POST | `/mcp/describe` | `{server, language?: 'zh'\|'en'}` | 成功 `{ok:true, description}`（**草稿，不落盘**，用户通过 `/mcp/config` 确认）；失败是**扁平** `{ok:false, error:<code>, message}`：`bad-server` 400、`unknown-server` 404、`offline` 503、`tools-unavailable` 500、`no-tools` 400、`no-default-model` 503、`no-llm` 503、`timeout` 504、`generate-failed` 502。输入只含可归属该服务的公共名与描述摘要；不发送 `definition`/凭据。 |
 
 

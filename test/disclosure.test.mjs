@@ -467,17 +467,72 @@ test('the discover registration is visible only to an activated, gated, progress
   assert.equal(when({ agent: { id: 'a1' } }), false)
 })
 
-test('a conservative record hides the entry and answers state-unavailable', async () => {
+test('an unreadable-state fallback record hides the entry and answers state-unavailable', async () => {
   const h = makeHarness()
   h.controller.sync(h.state)
   // The conservative activation keeps activated/gateMcp/snapshots but denies
   // every visible tool because the document was unreadable.
   h.record.conservative = true
+  h.record.stateUnreadable = true
   h.record.toolDenied = new Set(['mcp__alpha__search', 'mcp__alpha__read'])
   assert.equal(h.registered.get('alpha_discover').when({ agent: { id: 'a1' } }), false)
   const payload = await h.registered.get('alpha_discover').execute({}, { agent: {} })
   assert.deepEqual(payload, { ok: false, error: 'state-unavailable' })
   assert.deepEqual(h.expanded, [])
+})
+
+test('a successful apply that merely retained an invisible layer still offers discover', async () => {
+  const h = makeHarness()
+  h.controller.sync(h.state)
+  // A successful apply can set `conservative` for its refresh semantics (an old
+  // layer covers a currently invisible name) without the document being
+  // unreadable. That must not hide the discover entry.
+  h.record.conservative = true
+  assert.equal(h.record.stateUnreadable, undefined)
+  assert.equal(h.registered.get('alpha_discover').when({ agent: { id: 'a1' } }), true)
+  const payload = await h.registered.get('alpha_discover').execute({}, { agent: {} })
+  assert.equal(payload.ok, true)
+  assert.equal(payload.service, 'alpha')
+  assert.deepEqual(h.expanded, ['alpha'])
+})
+
+test('the controller reports per-server discover registration failures without leaking names', () => {
+  const conflict = makeHarness({
+    state: {
+      settings: { enabled: true, mcpGate: true },
+      mcp: { 'open viking': { enabled: true, disclosure: 'progressive' } },
+    },
+    schemas: [{ name: 'open_viking_discover', description: 'taken' }],
+  })
+  conflict.controller.sync(conflict.state)
+  assert.deepEqual(conflict.controller.statusOf('open viking'), { ok: false, reason: 'name-conflict' })
+  const reported = JSON.stringify(conflict.controller.statusOf('open viking'))
+  assert.equal(reported.includes('open_viking_discover'), false, 'the conflicting name is not echoed')
+
+  const invalid = makeHarness({
+    state: {
+      settings: { enabled: true, mcpGate: true },
+      mcp: { '9lives': { enabled: true, disclosure: 'progressive' } },
+    },
+    schemas: [],
+  })
+  invalid.controller.sync(invalid.state)
+  assert.deepEqual(invalid.controller.statusOf('9lives'), { ok: false, reason: 'invalid-name' })
+
+  const unreadable = makeHarness({ schemasThrows: true })
+  unreadable.controller.sync(unreadable.state)
+  assert.deepEqual(unreadable.controller.statusOf('alpha'), { ok: false, reason: 'tools-unavailable' })
+})
+
+test('the controller reports a registered entry as available and drops the status when it leaves progressive', () => {
+  const h = makeHarness()
+  h.controller.sync(h.state)
+  assert.deepEqual(h.controller.statusOf('alpha'), { ok: true })
+  assert.equal(h.controller.statusOf('beta'), null, 'a full-injection service has no discover entry')
+  assert.equal(h.controller.statusOf('ghost'), null)
+  h.state.mcp.alpha.disclosure = 'full'
+  h.controller.sync(h.state)
+  assert.equal(h.controller.statusOf('alpha'), null)
 })
 
 test('dispose releases every registration', () => {
@@ -486,4 +541,25 @@ test('dispose releases every registration', () => {
   assert.equal(h.registered.size, 1)
   h.controller.dispose()
   assert.equal(h.registered.size, 0)
+})
+
+test('preflight answers whether a service could register its discover entry without registering it', () => {
+  const h = makeHarness()
+  h.controller.sync(h.state)
+  // `alpha` is the registered progressive service; our own registration is not
+  // a conflict. `beta` is fully injected and its name is free.
+  assert.deepEqual(h.controller.preflightOf('alpha'), { ok: true })
+  assert.deepEqual(h.controller.preflightOf('beta'), { ok: true })
+
+  const conflict = makeHarness({ schemas: [{ name: 'beta_discover', description: 'taken' }] })
+  conflict.controller.sync(conflict.state)
+  assert.deepEqual(conflict.controller.preflightOf('beta'), { ok: false, reason: 'name-conflict' })
+
+  const invalid = makeHarness({ schemas: [] })
+  invalid.controller.sync(invalid.state)
+  assert.deepEqual(invalid.controller.preflightOf('9lives'), { ok: false, reason: 'invalid-name' })
+
+  const unreadable = makeHarness({ schemasThrows: true })
+  unreadable.controller.sync(unreadable.state)
+  assert.deepEqual(unreadable.controller.preflightOf('beta'), { ok: false, reason: 'tools-unavailable' })
 })

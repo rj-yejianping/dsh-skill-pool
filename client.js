@@ -125,6 +125,13 @@ window.__ModuleLoader__.load({
         mcpToolClear: '清除配置',
         mcpScopeHint: '逐接口作用域与成员作用域是 AND。',
         mcpHint: '渐进注入只隐藏工具 Schema；MCP resources 与 server instructions 不受影响；展开状态每个会话独立，重启/重连后重新发现；逐接口作用域与成员作用域是 AND。',
+        mcpDiscoverUnavailable: '发现入口不可用：{reason}',
+        mcpDiscoverReasonConflict: '名称冲突',
+        mcpDiscoverReasonInvalidName: '名称不合法',
+        mcpDiscoverReasonToolsUnavailable: '工具列表不可读',
+        mcpDiscoverReasonRegisterFailed: '注册失败',
+        mcpDiscoverReasonUnavailable: '渐进注入当前不可用',
+        mcpDiscoverBlocked: '发现入口不可用时不能切到渐进注入；请先解决名称冲突或工具列表读取失败。',
         emptyTitle: '还没有资源',
         emptyHint: '用右上角的「导入资源」上传技能文件、ZIP 包、从 Git 导入，或粘贴 MCP JSON。导入后立即成为技能池成员，条件在资源行上单独设置。',
         systemSkillsTitle: '系统技能',
@@ -348,6 +355,13 @@ window.__ModuleLoader__.load({
         mcpToolClear: 'Clear config',
         mcpScopeHint: 'Per-tool scope and member scope are combined with AND.',
         mcpHint: 'Progressive injection hides tool schemas only; MCP resources and server instructions are unaffected. Expansion is per session and is rediscovered after a restart/reconnect. Per-tool scope and member scope are combined with AND.',
+        mcpDiscoverUnavailable: 'Discover entry unavailable: {reason}',
+        mcpDiscoverReasonConflict: 'name conflict',
+        mcpDiscoverReasonInvalidName: 'invalid name',
+        mcpDiscoverReasonToolsUnavailable: 'tool list unreadable',
+        mcpDiscoverReasonRegisterFailed: 'registration failed',
+        mcpDiscoverReasonUnavailable: 'progressive injection is currently unavailable',
+        mcpDiscoverBlocked: 'Progressive injection cannot be selected while the discover entry is unavailable; resolve the name conflict or the unreadable tool list first.',
         emptyTitle: 'No resources yet',
         emptyHint: 'Use “Import” in the top-right corner to upload skill files, a ZIP archive, import from Git, or paste MCP JSON. Everything you import joins the pool immediately; conditions are set on its row.',
         systemSkillsTitle: 'System skills',
@@ -662,6 +676,27 @@ window.__ModuleLoader__.load({
       return asString(raw)
         .replace(/[\u0000-\u001f\u007f]/g, '')
         .slice(0, MCP_DESCRIPTION_LIMIT)
+    }
+
+    /**
+     * Human-readable reason for a discover registration failure.
+     *
+     * The Host sends only a stable machine reason (never a tool name or a
+     * definition), so the map is closed; an unknown reason falls back to a
+     * generic "currently unavailable" instead of echoing raw text.
+     */
+    function discoverUnavailableText(discover) {
+      if (!discover || typeof discover !== 'object' || discover.ok !== false) return ''
+      const reasons = {
+        'name-conflict': t('mcpDiscoverReasonConflict'),
+        'invalid-name': t('mcpDiscoverReasonInvalidName'),
+        'tools-unavailable': t('mcpDiscoverReasonToolsUnavailable'),
+        'register-failed': t('mcpDiscoverReasonRegisterFailed'),
+      }
+      const reason = typeof discover.reason === 'string' ? discover.reason : ''
+      return tf('mcpDiscoverUnavailable', {
+        reason: Object.hasOwn(reasons, reason) ? reasons[reason] : t('mcpDiscoverReasonUnavailable'),
+      })
     }
 
     /** Normalize one per-tool scope, defaulting to enabled/unrestricted. */
@@ -2461,6 +2496,9 @@ window.__ModuleLoader__.load({
       // Per-server `GET /mcp/tools` result. Kept outside the board because it is
       // a derived catalog: the Host remains the authority for the board state.
       const [mcpToolCatalog, setMcpToolCatalog] = useState({})
+      // Set right after `loadMcpTools` exists; a disclosure save uses it to
+      // refresh the card's discover status (the callback is defined earlier).
+      const loadMcpToolsRef = useRef(null)
       const mounted = useRef(true)
       const loadingRef = useRef(false)
       const pendingRef = useRef(new Map())
@@ -2738,6 +2776,10 @@ window.__ModuleLoader__.load({
                   return { ...current, state: withEntry(current.state, MCP, server, next) }
                 })
               }
+              // Reconcile this member's discover status immediately: switching
+              // to progressive may have failed (already taken name, unreadable
+              // list) or an earlier failure may just have been repaired.
+              if (patch.disclosure !== undefined) void loadMcpToolsRef.current?.(server)
               if (!configQueueRef.current.has(server)) clearRowError(`mcp-config:${server}`)
             } catch (cause) {
               // Keep the optimistic value and its draft: an inline error means the
@@ -3142,7 +3184,7 @@ window.__ModuleLoader__.load({
         if (name.length === 0) return
         setMcpToolCatalog((current) => ({
           ...current,
-          [name]: { status: 'loading', error: '', tools: [] },
+          [name]: { status: 'loading', error: '', tools: [], discover: null },
         }))
         try {
           const payload = await request(`${API}/mcp/tools?server=${encodeURIComponent(name)}`, { method: 'GET' })
@@ -3159,9 +3201,13 @@ window.__ModuleLoader__.load({
               ambiguous: item.ambiguous === true,
             })
           }
+          const discoverRaw = asObject(payload.discover)
+          const discover = typeof discoverRaw.ok === 'boolean'
+            ? { ok: discoverRaw.ok, reason: asString(discoverRaw.reason) }
+            : null
           setMcpToolCatalog((current) => ({
             ...current,
-            [name]: { status: 'ready', error: '', tools },
+            [name]: { status: 'ready', error: '', tools, discover },
           }))
         } catch (cause) {
           // A catalog failure is shown in the card; there is no fake switch
@@ -3169,10 +3215,12 @@ window.__ModuleLoader__.load({
           if (!mounted.current) return
           setMcpToolCatalog((current) => ({
             ...current,
-            [name]: { status: 'error', error: messageOf(cause), tools: [] },
+            [name]: { status: 'error', error: messageOf(cause), tools: [], discover: null },
           }))
         }
       }, [])
+
+      loadMcpToolsRef.current = loadMcpTools
 
       const toolOpenServers = useMemo(
         () => mcpNames.filter((server) => expanded[`mcp-tools:${server}`] !== false),
@@ -4278,6 +4326,17 @@ window.__ModuleLoader__.load({
       function renderMcpConfig(server, entry) {
         const description = cleanPanelDescription(entry.description)
         const progressive = entry.disclosure === 'progressive'
+        const catalog = mcpToolCatalog[server] || { status: 'idle', error: '', tools: [], discover: null }
+        const discoverFailure =
+          catalog.status === 'ready' && catalog.discover !== null && catalog.discover !== undefined
+            && catalog.discover.ok === false
+            ? catalog.discover
+            : null
+        const discoverNotice = discoverUnavailableText(discoverFailure)
+        // Turning progressive on cannot work while its discover entry cannot
+        // register, so that direction is disabled. Switching an already
+        // progressive member back to full stays possible.
+        const discoverBlocksProgressive = discoverFailure !== null && !progressive
         const describeBusy = isBusy('mcp-describe:' + server)
         const describeError = rowErrors[`mcp-describe:${server}`]
         const configError = rowErrors[`mcp-config:${server}`]
@@ -4321,14 +4380,20 @@ window.__ModuleLoader__.load({
           // other when they happen close together.
           describeError ? h('div', { style: SX.inlineError, role: 'alert' }, describeError) : null,
           configError ? h('div', { style: SX.inlineError, role: 'alert' }, configError) : null,
+          discoverNotice ? h('div', { style: SX.inlineError, role: 'alert' }, discoverNotice) : null,
           h(
             'div',
             { style: SX.mcpConfigActions },
             h('span', { style: S.switchLabel }, `${TEXT.mcpInjectMode}: ${modeLabel}`),
             h(Toggle, {
               checked: progressive,
+              disabled: discoverBlocksProgressive,
               label: TEXT.mcpInjectMode,
-              title: progressive ? TEXT.mcpInjectProgressiveHint : TEXT.mcpInjectFullHint,
+              title: discoverBlocksProgressive
+                ? `${discoverNotice} ${TEXT.mcpDiscoverBlocked}`
+                : progressive
+                  ? TEXT.mcpInjectProgressiveHint
+                  : TEXT.mcpInjectFullHint,
               onChange: (value) =>
                 updateMcpConfig(server, { disclosure: value ? 'progressive' : 'full' }, { immediate: true }),
             }),
@@ -5735,6 +5800,7 @@ window.__ModuleLoader__.load({
         normalizeEntry,
         normalizeMcpTools,
         buildToolSaveBody,
+        discoverUnavailableText,
         rowDraftOf,
         configDraftAfterSave,
         failureTextOf,

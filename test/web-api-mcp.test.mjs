@@ -68,7 +68,7 @@ function fixtureSchemas() {
  * `registerWebApi` returns its internal `routes` array so a Node test can call
  * one handler directly, without a web server or a connection service.
  */
-async function apiHarness({ toolsUnavailable = false } = {}) {
+async function apiHarness({ toolsUnavailable = false, discoverStatus, discoverPreflight } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'skill-pool-web-api-mcp-'))
   const file = join(dir, 'state.json')
   const store = new StateStore({ file })
@@ -80,7 +80,15 @@ async function apiHarness({ toolsUnavailable = false } = {}) {
       callback({ get: (name) => services[name], effect: (register) => register() }),
     effect: (register) => register(),
   }
-  const registry = registerWebApi({ ctx, store, meta: { file, version: 'test' }, onChanged: async () => {}, logger: {} })
+  const registry = registerWebApi({
+    ctx,
+    store,
+    meta: { file, version: 'test' },
+    onChanged: async () => {},
+    logger: {},
+    discoverStatus,
+    discoverPreflight,
+  })
   assert.ok(Array.isArray(registry.routes), 'registerWebApi returns its routes array')
 
   const invoke = async (method, target, body) => {
@@ -294,5 +302,54 @@ test('POST /mcp/config validates disclosure and description', async () => {
     assert.equal(cleared.state.mcp.alpha.description, '')
   } finally {
     await api.dispose()
+  }
+})
+
+test('GET /mcp/tools reports why the discover entry is unavailable for a progressive service', async () => {
+  const api = await apiHarness({ discoverStatus: () => ({ ok: false, reason: 'name-conflict' }) })
+  try {
+    await api.store.update((current) => ({
+      ...current,
+      mcp: { ...current.mcp, alpha: { ...current.mcp.alpha, disclosure: 'progressive' } },
+    }))
+    const payload = await api.call('GET', '/mcp/tools?server=alpha')
+    assert.equal(payload.ok, true)
+    assert.deepEqual(payload.discover, { ok: false, reason: 'name-conflict' })
+    assert.equal(JSON.stringify(payload.discover).includes('mcp__'), false)
+  } finally {
+    await api.dispose()
+  }
+
+  // A full-injection member reports the read-only preflight result, so the
+  // panel can disable a switch that would fail.
+  const full = await apiHarness({ discoverPreflight: () => ({ ok: false, reason: 'name-conflict' }) })
+  try {
+    const payload = await full.call('GET', '/mcp/tools?server=alpha')
+    assert.deepEqual(payload.discover, { ok: false, reason: 'name-conflict' })
+  } finally {
+    await full.dispose()
+  }
+
+  // Without a preflight channel there is nothing to explain for a full member.
+  const plain = await apiHarness({ discoverStatus: () => ({ ok: false, reason: 'name-conflict' }) })
+  try {
+    const payload = await plain.call('GET', '/mcp/tools?server=alpha')
+    assert.equal(payload.discover, null)
+  } finally {
+    await plain.dispose()
+  }
+
+  // A progressive member whose disclosure layer has not reported yet must not
+  // be shown as working: an unknown status is unavailable.
+  const unknown = await apiHarness({ discoverStatus: () => null })
+  try {
+    await unknown.store.update((current) => ({
+      ...current,
+      mcp: { ...current.mcp, alpha: { ...current.mcp.alpha, disclosure: 'progressive' } },
+    }))
+    const payload = await unknown.call('GET', '/mcp/tools?server=alpha')
+    assert.deepEqual(payload.discover, { ok: false, reason: 'unavailable' })
+  } finally {
+    await unknown.dispose()
   }
 })

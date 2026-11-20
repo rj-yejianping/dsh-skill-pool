@@ -26,6 +26,8 @@ await import('../client.js')
 
 /** Board fixture injected into Panel's first `useState` (the board). */
 let boardSeed = null
+/** Extra seeded `useState` value for one hook index (the MCP tool catalog). */
+let hookSeed = null
 /** Hook call counter for one Panel() invocation (reset by each test). */
 let hookIndex = 0
 
@@ -47,6 +49,7 @@ const React = {
   useState: (initial) => {
     const index = hookIndex++
     if (index === 0) return [boardSeed, () => {}]
+    if (hookSeed !== null && hookSeed.index === index) return [hookSeed.value, () => {}]
     return [typeof initial === 'function' ? initial() : initial, () => {}]
   },
   useEffect: () => {},
@@ -83,7 +86,7 @@ function mcpBoard(options = {}) {
     modes: [],
     workspaces: [],
     description: '知识库检索',
-    disclosure: 'progressive',
+    disclosure: options.disclosure === 'full' ? 'full' : 'progressive',
     tools: {
       'mcp__kb__search': { enabled: false, modes: ['standard'], workspaces: ['/w'] },
       'mcp__kb__gone': { enabled: true, modes: [], workspaces: [] },
@@ -147,4 +150,54 @@ test('the MCP row warns when the MCP gate is off', () => {
   boardSeed = mcpBoard({ mcpGate: false })
   const html = renderPanel()
   assert.ok(html.includes('MCP gate is off, progressive injection has no effect'), html)
+})
+
+/** Return the first element (walking the tree) whose props match `match`. */
+function findElement(node, match) {
+  if (node === null || node === undefined || typeof node !== 'object') return undefined
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findElement(child, match)
+      if (found !== undefined) return found
+    }
+    return undefined
+  }
+  if (node.props && match(node.props)) return node
+  for (const child of node.children || []) {
+    const found = findElement(child, match)
+    if (found !== undefined) return found
+  }
+  return undefined
+}
+
+/** The injection switch element of the MCP member card (a function component). */
+function injectionSwitch() {
+  hookIndex = 0
+  return findElement(Panel(), (props) => props.label === 'Tool injection')
+}
+
+test('the MCP card explains an unavailable discover entry', () => {
+  boardSeed = mcpBoard()
+  hookSeed = {
+    index: 19,
+    value: { kb: { status: 'ready', error: '', tools: [], discover: { ok: false, reason: 'name-conflict' } } },
+  }
+  const html = renderPanel()
+  assert.ok(html.includes('Discover entry unavailable: name conflict'), html)
+  // The member is already progressive: switching back to full must stay possible.
+  assert.equal(injectionSwitch()?.props.disabled, false)
+  hookSeed = null
+})
+
+test('a full-injection member whose discover entry cannot register cannot be switched to progressive', () => {
+  boardSeed = mcpBoard({ disclosure: 'full' })
+  hookSeed = {
+    index: 19,
+    value: { kb: { status: 'ready', error: '', tools: [], discover: { ok: false, reason: 'invalid-name' } } },
+  }
+  renderPanel()
+  const toggle = injectionSwitch()
+  assert.ok(toggle, 'the injection switch renders')
+  assert.equal(toggle.props.disabled, true, 'the switch would not work, so it is disabled')
+  hookSeed = null
 })

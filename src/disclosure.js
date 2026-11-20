@@ -162,7 +162,9 @@ export function mcpServerOffline(ctx, server) {
  * @param {(agent: any) => string} [options.workspaceOf] - read one Agent's workspace.
  * @param {() => boolean} [options.enabled] - whether progressive disclosure is available at all.
  * @param {(def: object) => object} [options.defineTool] - host `defineTool`, identity when absent.
- * @returns {{sync: (state: object) => void, dispose: () => void}} controller.
+ * @returns {{sync: (state: object) => void, dispose: () => void,
+ *   statusOf: (server: string) => {ok: true}|{ok: false, reason: string}|null,
+ *   preflightOf: (server: string) => {ok: true}|{ok: false, reason: string}}} controller.
  */
 export function createMcpDisclosure({
   ctx,
@@ -178,6 +180,16 @@ export function createMcpDisclosure({
   const make = typeof defineTool === 'function' ? defineTool : (def) => def
   /** @type {Map<string, {name: string, description: string, dispose: Function}>} */
   const entries = new Map()
+  /**
+   * Per-server registration failures of the last sync, keyed by service name.
+   * Only stable machine reasons are kept here: never a tool name, a service
+   * name of another member, a connection definition or a secret. A service
+   * that registered successfully has no entry.
+   * @type {Map<string, {ok: false, reason: string}>}
+   */
+  const failures = new Map()
+  /** Services the last sync treated as progressive targets (enabled, gate on). */
+  let knownTargets = new Set()
   /** Whether a sync pass is running (guards synchronous `tools/change` re-entry). */
   let syncing = false
 
@@ -268,6 +280,28 @@ export function createMcpDisclosure({
     return targets
   }
 
+  /**
+   * Record the target set of the pass that is starting.
+   *
+   * Anything that left the set loses its status (a stale failure must not be
+   * shown for a member that is no longer progressive), and every current
+   * target is re-derived below, so an old failure cannot outlive its cause.
+   *
+   * @param {Map<string, object>} targets - current progressive targets.
+   */
+  const markTargets = (targets) => {
+    knownTargets = new Set(targets.keys())
+    for (const server of [...failures.keys()]) {
+      if (!knownTargets.has(server)) failures.delete(server)
+    }
+    for (const server of knownTargets) failures.delete(server)
+  }
+
+  /** Mark every current target with the same failure reason. */
+  const failTargets = (reason) => {
+    for (const server of knownTargets) failures.set(server, { ok: false, reason })
+  }
+
   /** Release one server's registration. */
   const release = (server) => {
     const entry = entries.get(server)
@@ -284,11 +318,10 @@ export function createMcpDisclosure({
    * The synchronous visibility predicate of one discover entry.
    *
    * It answers from the per-Agent record only: a missing or not-yet-activated
-   * record, a record built by the conservative fallback (the document was
-   * unreadable, so the record cannot prove what the pool holds), a gate-off
-   * record and a service the pool no longer treats as progressive all yield
-   * `false`. It is synchronous and side-effect free, as the tool registry
-   * requires.
+   * record, a record built by the unreadable-state fallback (it cannot prove
+   * what the pool holds), a gate-off record and a service the pool no longer
+   * treats as progressive all yield `false`. It is synchronous and
+   * side-effect free, as the tool registry requires.
    */
   const whenOf = (server) => (context) => {
     try {
@@ -296,10 +329,12 @@ export function createMcpDisclosure({
       if (agent === undefined || agent === null) return false
       const record = typeof recordOf === 'function' ? recordOf(agent) : undefined
       if (record === undefined || record === null || record.activated !== true) return false
-      // A conservative record is a deny-all snapshot taken while the state was
-      // unreadable. It cannot say which services are progressive, so the entry
-      // stays invisible instead of guessing (spec §2/§7).
-      if (record.conservative === true) return false
+      // `stateUnreadable` is the dedicated fallback flag: a record built while
+      // the document could not be read cannot say which services are
+      // progressive, so the entry stays invisible instead of guessing (spec
+      // §2/§7). `conservative` is a different signal (a successful apply that
+      // retained an invisible layer) and must not hide the entry.
+      if (record.stateUnreadable === true) return false
       if (record.gateMcp !== true) return false
       return record.progressiveServers instanceof Set && record.progressiveServers.has(server)
     } catch {
@@ -352,8 +387,8 @@ export function createMcpDisclosure({
    *
    * Returned codes are exactly this closed set; upstream strings are never
    * passed through to the model:
-   * - `state-unavailable` — no activation record, an unfinished activation, a
-   *   conservative (deny-all) record, an unreadable document, or a malformed
+   * - `state-unavailable` — no activation record, an unfinished activation, an
+   *   unreadable-state fallback record, an unreadable document, or a malformed
    *   per-tool snapshot;
    * - `not-in-pool` — the gate is off, the service left this Agent's pool, the
    *   document now says disabled/full, or the record is malformed;
@@ -377,10 +412,10 @@ export function createMcpDisclosure({
       if (record === undefined || record === null || record.activated !== true) {
         return { ok: false, error: 'state-unavailable' }
       }
-      // A conservative record denies every tool at dispatch because the state
-      // was unreadable when it was built. It cannot bound a catalog, so the
-      // answer stays `state-unavailable` even if the file is readable again.
-      if (record.conservative === true) return { ok: false, error: 'state-unavailable' }
+      // A fallback record denies every tool at dispatch because the state was
+      // unreadable when it was built. It cannot bound a catalog, so the answer
+      // stays `state-unavailable` even if the file is readable again.
+      if (record.stateUnreadable === true) return { ok: false, error: 'state-unavailable' }
       if (record.gateMcp !== true) return notInPool()
       if (!(record.progressiveServers instanceof Set) || !record.progressiveServers.has(server)) {
         return notInPool()
@@ -509,9 +544,11 @@ export function createMcpDisclosure({
     syncing = true
     try {
       const targets = progressiveEnabled() ? targetsOf(state) : new Map()
+      markTargets(targets)
       const tools = toolsOf()
       if (tools === undefined || typeof tools.register !== 'function') {
         for (const server of [...entries.keys()]) release(server)
+        failTargets('tools-unavailable')
         if (targets.size > 0) warn('discover entries are unavailable: the global tools service is not exposed')
         return
       }
@@ -528,6 +565,7 @@ export function createMcpDisclosure({
         // out without it. Entries for still-targeted services are kept; their
         // `when` and `execute` read the live record and document, so they stay
         // invisible and unreachable while the service is not progressive.
+        failTargets('tools-unavailable')
         warn(`discover additions skipped: ${listed.error}`)
         return
       }
@@ -546,10 +584,12 @@ export function createMcpDisclosure({
       for (const server of [...targets.keys()].sort()) {
         const derived = deriveDiscoverName(server)
         if (derived.error !== '') {
+          failures.set(server, { ok: false, reason: 'invalid-name' })
           warn(`discover entry for "${server}" is unavailable: ${derived.error} name`)
           continue
         }
         if (taken.has(derived.name)) {
+          failures.set(server, { ok: false, reason: 'name-conflict' })
           warn(`discover entry for "${server}" is unavailable: the name "${derived.name}" is already taken`)
           continue
         }
@@ -599,6 +639,7 @@ export function createMcpDisclosure({
             dispose: typeof dispose === 'function' ? dispose : () => {},
           })
         } catch (error) {
+          failures.set(server, { ok: false, reason: 'register-failed' })
           warn(`discover entry for "${server}" could not be registered: ${messageOf(error)}`)
         }
       }
@@ -611,10 +652,64 @@ export function createMcpDisclosure({
     }
   }
 
+  /**
+   * Report why one service's discover entry is unavailable.
+   *
+   * Returns `null` when the service is not a current progressive target (fully
+   * injected, disabled, gate off, or the document was unreadable at sync time):
+   * there is no entry to explain, so the panel keeps its normal controls. A
+   * target answers `{ok:true}` when its entry is registered, otherwise a stable
+   * machine reason — `name-conflict`, `invalid-name`, `tools-unavailable` or
+   * `register-failed`. The reason never carries a tool name, a definition or a
+   * secret.
+   *
+   * @param {string} server - MCP service name.
+   * @returns {{ok: true}|{ok: false, reason: string}|null} registration status.
+   */
+  const statusOf = (server) => {
+    try {
+      if (typeof server !== 'string' || !knownTargets.has(server)) return null
+      const failure = failures.get(server)
+      return failure === undefined ? { ok: true } : { ok: false, reason: failure.reason }
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Read-only answer to "would this service's discover entry register now?".
+   *
+   * Used for a member that is still fully injected, so the panel can explain a
+   * name conflict and disable the switch before it fails. Nothing is registered
+   * and nothing is cached: the answer follows the live registry and our own
+   * registrations, which are not conflicts. It never echoes a tool name.
+   *
+   * @param {string} server - MCP service name.
+   * @returns {{ok: true}|{ok: false, reason: string}} prospective status.
+   */
+  const preflightOf = (server) => {
+    try {
+      const derived = deriveDiscoverName(server)
+      if (derived.error !== '') return { ok: false, reason: 'invalid-name' }
+      const listed = readSchemas()
+      if (listed.ok !== true) return { ok: false, reason: 'tools-unavailable' }
+      const own = new Set([...entries.values()].map((entry) => entry.name))
+      for (const schema of listed.schemas) {
+        const name = schema?.name
+        if (typeof name !== 'string' || own.has(name)) continue
+        if (name === derived.name) return { ok: false, reason: 'name-conflict' }
+      }
+      return { ok: true }
+    } catch {
+      return { ok: false, reason: 'tools-unavailable' }
+    }
+  }
+
   /** Release every registration (plugin unload). */
   const dispose = () => {
     for (const server of [...entries.keys()]) release(server)
+    knownTargets = new Set()
   }
 
-  return { sync, dispose }
+  return { sync, dispose, statusOf, preflightOf }
 }

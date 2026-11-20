@@ -195,6 +195,10 @@ export function apply(ctx, config = {}) {
     mounts,
     meta,
     logger,
+    // Per-server discover registration status: the panel must be able to say
+    // "发现入口不可用：名称冲突" instead of offering a switch that cannot work.
+    discoverStatus: (server) => disclosure.statusOf(server),
+    discoverPreflight: (server) => disclosure.preflightOf(server),
     // The panel's counts describe the activation result, so the discover registry
     // is reconciled only after every live Agent was re-applied, with the document
     // that re-apply just used (the panel's own request already committed it).

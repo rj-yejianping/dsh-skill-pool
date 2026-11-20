@@ -262,8 +262,23 @@ export function publicState(state) {
  * @param {{ timeoutMs?: number, intervalMs?: number }} [options.mountProbe] - MCP readiness window.
  * @param {object} [options.mounts] - shared mount tracker (boot re-mounts land here too).
  * @param {number} [options.describeTimeoutMs] - override the description-generation deadline (tests).
+ * @param {(server: string) => ({ok: true}|{ok: false, reason: string}|null)|undefined} [options.discoverStatus] -
+ *   read the discover registration status of one progressive service (null when it has no entry).
+ * @param {(server: string) => ({ok: true}|{ok: false, reason: string})|undefined} [options.discoverPreflight] -
+ *   ask, without registering, whether a fully injected service's discover entry could register.
  */
-export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe, mounts = createMountTracker(), describeTimeoutMs } = {}) {
+export function registerWebApi({
+  ctx,
+  store,
+  meta,
+  onChanged,
+  logger,
+  mountProbe,
+  mounts = createMountTracker(),
+  describeTimeoutMs,
+  discoverStatus,
+  discoverPreflight,
+} = {}) {
   const debug = logger?.debug ?? (() => {})
   // "ready" means the server's tools are actually registered, not merely that a
   // Loader row exists: an unreachable server creates the row and never connects.
@@ -1089,11 +1104,30 @@ export function registerWebApi({ ctx, store, meta, onChanged, logger, mountProbe
       config: Object.hasOwn(configs, name) ? configs[name] : null,
       ambiguous: isAmbiguousMcpToolName(name),
     }))
+    // A progressive member cannot work without its discover entry: the panel
+    // must be able to explain a name conflict or an unreadable tool list
+    // instead of offering an injection switch that cannot take effect. The
+    // status carries a machine reason only (never a tool name or a definition).
+    const progressive = member.disclosure === 'progressive'
+    const gateOn = state.settings?.enabled !== false && state.settings?.mcpGate !== false
+    let discover = null
+    if (gateOn && member.enabled !== false) {
+      if (progressive) {
+        discover = typeof discoverStatus === 'function'
+          ? discoverStatus(server) ?? { ok: false, reason: 'unavailable' }
+          : null
+      } else if (typeof discoverPreflight === 'function') {
+        // Still fully injected: the panel needs to know whether switching to
+        // progressive could register its discover entry at all.
+        discover = discoverPreflight(server) ?? { ok: false, reason: 'unavailable' }
+      }
+    }
     return json({
       ok: true,
       server,
       description: typeof member.description === 'string' ? member.description : '',
       disclosure: DISCLOSURE_MODES.includes(member.disclosure) ? member.disclosure : 'full',
+      discover,
       tools,
     })
   }

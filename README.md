@@ -312,7 +312,10 @@ Loader 行本身只存在于运行时，重启即消失；插件激活后会按 
    本插件不持久化展开状态。
 3. 动态注册窗口：连接/重连或 `tools/change` 后新出现的工具，在本次 deny 层重算之前**可能短时
    出现在下一步的 Schema 里**（本仓库不声称“Schema 从未出现”）；期间直接调用由全局 guard 拒绝。
-   下一次显式重放（保存、preset 重放、插件重载）会按当时的工具清单补齐 deny。
+   插件订阅 `tools/change`，在事件后的下一次定时重放里只对“观察到的 MCP 名字集发生变化”的存活
+   Agent 重新 apply（合并突发、防同步重入、有轮次上限），为未展开渐进服务补 `progressive` 层、
+   为配置关闭/作用域不匹配的工具补 `tool` 层；重放失败或达到上限时仍由 guard 兜底，下一次显式
+   重放（保存、preset 重放、插件重载）再对齐。
 4. 离线服务的残留旧 Schema 不会被当成在线目录（有 `mcpManager` 时优先判离线）；本插件不清理
    残留 Schema，也不把旧目录当成功。
 5. 面板与 discover 都不暴露 `definition`（URL/命令/headers/env）；MCP 仍不是强安全边界，详见「已知限制」。
@@ -323,7 +326,8 @@ Progressive disclosure exposes only one `<server>_discover` entry per MCP servic
 calling it reveals that service's original tool names on the *next* step. Per-tool switches and scopes
 (`tools`) apply in both full and progressive modes and are never lifted by expansion. A global
 dispatch-time guard refuses direct calls to out-of-pool, unexpanded, switched-off or out-of-scope
-tools, including a tool registered through `tools/change` until the next re-apply. Only tool schemas
+tools, including a tool registered through `tools/change` until the debounced re-apply installs its deny
+layer (the guard refuses the call throughout). Only tool schemas
 and calls are hidden: MCP resources and server instructions are unaffected. Expansion is per-Agent,
 in-memory, and lost on restart/reload, so the Agent must discover again. This repository claims no
 token or latency savings; its probes verify behaviour only.
@@ -331,16 +335,16 @@ token or latency savings; its probes verify behaviour only.
 ## MCP 可行性验证（发布门禁）
 
 MCP 工具披露、渐进注入与逐接口开关所依赖的宿主能力**不由普通单测证明**。普通套件
-（`npm test`，239 个可移植测试）不需要安装 DSH；两个宿主探针直接驱动**已安装**的 DSH
+（`npm test`，251 个可移植测试）不需要安装 DSH；两个宿主探针直接驱动**已安装**的 DSH
 （默认 `/opt/dsh/lib/node_modules/@deepseek-ai/dsh`，**硬性要求 `0.2.2-rc.3`**；可用
 `DSH_FEASIBILITY_ROOT` 指向别的安装树）：
 
 - `test/mcp-feasibility.probe.mjs`：21 项 MCP 身份/作用域/关机/披露通道能力；
-- `test/mcp-progressive.probe.mjs`：7 项渐进注入/逐接口/guard/动态注册/重载行为。
+- `test/mcp-progressive.probe.mjs`：8 项渐进注入/逐接口/guard/动态注册/重连/重载行为。
 
 | 命令 | 作用 | 结果 |
 |---|---|---|
-| `npm test` | 可移植单测，**不含**宿主探针 | 239/239；不代表宿主能力已验证 |
+| `npm test` | 可移植单测，**不含**宿主探针 | 251/251；不代表宿主能力已验证 |
 | `npm run test:lifecycle` | `index.js` 生命周期/恢复探针（需要已安装 DSH） | 当前环境 10/10；不是宿主能力门禁 |
 | `npm run test:naming` | 真实 `publicToolName` 命名/歧义探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |
 | `npm run test:restrict` | 真实 `tools.restrict` 注册/交集/卸载/重注册探针（需要已安装 DSH） | 当前环境 1/1；不是宿主能力门禁 |

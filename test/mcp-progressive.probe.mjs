@@ -834,12 +834,11 @@ hostTest('dynamic registration: a tool added through tools/change stays refused 
   assert.equal(h.guardReason(newName, b), 'server-not-expanded')
   assert.equal(await h.callEvents(NEW_TOOL), 0, 'the refused call never reached the MCP server')
 
-  // A real re-apply recomputes the deny layers from the live surface, so the
-  // window closes for the unexpanded Agent.
-  await requestPresetReapply(h, b)
+  // The plugin subscribes to `tools/change` and re-applies the affected live
+  // Agents, so the window closes without an explicit preset replay.
   await waitFor(
     async () => !(await h.stepNames(b)).includes(newName),
-    'the re-applied deny to cover the dynamically registered tool',
+    'the tools/change re-apply to cover the dynamically registered tool',
   )
   const afterReapply = await h.stepNames(b)
   assert.equal(afterReapply.includes(newName), false)
@@ -847,6 +846,51 @@ hostTest('dynamic registration: a tool added through tools/change stays refused 
   assert.equal(refusedAgain.isError, true)
   assert.match(textOf(refusedAgain), /server-not-expanded/)
   assert.equal(await h.callEvents(NEW_TOOL), 0)
+})
+
+hostTest('reconnect: a tool configured off before it registers is denied once it connects', async (t) => {
+  const h = await createHarness(t, { disclosure: 'progressive', registerAgents: true })
+  const a = h.agents.a.agent
+  const newName = publicName('alpha', NEW_TOOL)
+
+  // A expands alpha, so only the per-tool switch — not the progressive layer —
+  // can hide the tool that reconnects below.
+  const before = await h.step(a)
+  const opened = await h.call('alpha_discover', {}, { agent: a, toolSet: before.set })
+  before.set.dispose()
+  assert.equal(opened.isError, false)
+
+  // The user switches the still-unregistered tool off. Saving the document
+  // re-applies every live Agent, which records the refusal as a dispatch fact.
+  const document = JSON.parse(await readFile(h.file, 'utf8'))
+  document.mcp.alpha.tools[newName] = { enabled: false, modes: [], workspaces: [] }
+  await writeFile(h.file, JSON.stringify(document, null, 2))
+  await requestPresetReapply(h, a)
+  await waitFor(
+    () => h.guardReason(newName, a) === 'tool-disabled',
+    'the configured refusal to enter the guard snapshot',
+  )
+
+  // Reconnect replays the fixture's tool list: the new tool registers and the
+  // host emits tools/change synchronously.
+  const changed = await h.call(publicName('alpha', 'change_tools'), {})
+  assert.equal(changed.isError, false)
+  await waitFor(
+    () => h.root.tools.definitions().some((definition) => definition.name === newName),
+    'the reconnecting service to register the configured-off tool',
+  )
+
+  // The tools/change re-apply installs its `reason: 'tool'` deny layer, so the
+  // expanded Agent does not see it and the guard refuses the direct call.
+  await waitFor(
+    async () => !(await h.stepNames(a)).includes(newName),
+    'the tools/change re-apply to deny the configured-off tool',
+  )
+  assert.equal(h.guardReason(newName, a), 'tool-disabled')
+  const refused = await h.call(newName, {}, { agent: a })
+  assert.equal(refused.isError, true)
+  assert.match(textOf(refused), /tool-disabled/)
+  assert.equal(await h.callEvents(NEW_TOOL), 0, 'the refused call never reached the MCP server')
 })
 
 hostTest('reload: a plugin remount forgets expansions and requires a fresh discover', async (t) => {
